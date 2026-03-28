@@ -1,35 +1,61 @@
-# RAG-everything (Eva)
+# Transcendence Memory Server
 
-统一部署在 Eva 的 RAG 服务，供 iMac/Eva/Aliyun 共用。Aliyun 不本地安装。
+> Private server-side implementation layer for the transcendence-memory system.
 
-## 服务地址
-- HTTPS: https://rag.zweiteng.tk
-- 内部反代: 127.0.0.1:8711
+## Positioning
 
-## 鉴权
-- Header: `X-API-KEY: <RAG_API_KEY>`
-- 或 `Authorization: Bearer <RAG_API_KEY>`
+This repository is the **private server implementation** behind the broader transcendence-memory platform.
 
-RAG_API_KEY 存放于：`~/.openclaw/.env`
+It should be understood as:
+- the hosted memory service runtime
+- the private indexing / retrieval / ingestion backend
+- the place for server-side deployment-facing implementation
 
-## 主要端点
-- POST /search {container, query, topk}
-- POST /build-manifest {container}
-- POST /ingest-memory {container, memory_dir?, archive_dir?}
-- POST /embed {container}
+It should **not** be treated as:
+- the entire product abstraction
+- the client enhancer skill
+- the long-running workspace control plane
 
-## Nginx 反代
-- 配置文件：`docs/nginx-rag.zweiteng.tk.conf`
+## Relationship to the wider system
 
-## 证书
-- certbot 已申请并自动续期
-- 证书路径：/etc/letsencrypt/live/rag.zweiteng.tk
+- **Workspace control plane**: `transcendence-memory-workspace`
+- **Private server implementation**: this repo (`transcendence-memory-server`)
+- **Private skill artifact repo**: `skills-hub`
+- **Future public abstraction layer**: `transcendence-memory`
 
-## 启动与日志
-- 启动脚本：`~/.openclaw/workspace/scripts/run_task_rag_server.sh`
-- 日志：`~/.openclaw/workspace/logs/task_rag_server.log`
+## Current scope
 
-## 容器隔离
-- tasks/rag/containers/{imac,eva,aliyun}
+The current server provides a lightweight task/memory retrieval service centered on:
+- search
+- embed
+- manifest building
+- memory ingestion
 
-> 注意：不要提交密钥到仓库。
+Current implementation artifacts include:
+- `scripts/task_rag_server.py`
+- `scripts/task_rag_search.py`
+- `scripts/task_rag_embed.py`
+- `scripts/task_rag_build_manifest.py`
+- `scripts/task_rag_ingest_memory_refs.py`
+- `tasks_rag/`
+
+## Current runtime model
+
+Primary deployment target today:
+- hosted on Eva
+- exposed behind `https://rag.zweiteng.tk`
+
+## Documentation entry points
+
+- `docs/server-boundary.md`
+- `docs/api-contract.md`
+- `docs/development-bootstrap.md`
+- `docs/nginx-rag.zweiteng.tk.conf`
+
+## Notes on naming
+
+The local folder name may still be `rag-everything` in some workspaces for continuity, but the remote/server role is now aligned to **transcendence-memory-server**.
+
+## Security
+
+Do not commit tokens, secrets, or private keys into this repository.
