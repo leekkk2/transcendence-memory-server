@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
+from fastapi.testclient import TestClient
 
 
 def main() -> int:
@@ -56,29 +57,38 @@ def main() -> int:
         embed_mod.embed_text = fake_embed_text
         search_mod.embed_text = fake_embed_text
 
-        ingest_resp = server.ingest_objects(
-            server.ClientIngestReq(
-                container=args.container,
-                objects=[
-                    server.IngestObject(
-                        id='obj-alpha',
-                        title='Alpha memory',
-                        text='alpha memory survives roundtrip search',
-                        source='smoke-test',
-                        tags=['alpha', 'memory'],
-                        metadata={'project': 'transcendence-memory', 'status': 'active'},
-                    ),
-                    server.IngestObject(
-                        id='obj-beta',
-                        title='Beta memory',
-                        text='beta note for contrast only',
-                        source='smoke-test',
-                        tags=['beta'],
-                        metadata={'project': 'transcendence-memory', 'status': 'active'},
-                    ),
+        client = TestClient(server.app)
+        ingest_response = client.post(
+            '/ingest-memory/objects',
+            headers={'X-API-KEY': os.environ['RAG_API_KEY']},
+            json={
+                'container': args.container,
+                'objects': [
+                    {
+                        'id': 'obj-alpha',
+                        'title': 'Alpha memory',
+                        'text': 'alpha memory survives roundtrip search',
+                        'source': 'smoke-test',
+                        'tags': ['alpha', 'memory'],
+                        'metadata': {'project': 'transcendence-memory', 'status': 'active'},
+                    },
+                    {
+                        'id': 'obj-beta',
+                        'title': 'Beta memory',
+                        'text': 'beta note for contrast only',
+                        'source': 'smoke-test',
+                        'tags': ['beta'],
+                        'metadata': {'project': 'transcendence-memory', 'status': 'active'},
+                    },
                 ],
-            )
+            },
         )
+        if ingest_response.status_code != 200:
+            raise AssertionError(
+                f"expected POST /ingest-memory/objects to succeed, "
+                f"got {ingest_response.status_code}: {ingest_response.text}"
+            )
+        ingest_resp = ingest_response.json()
         if ingest_resp['accepted'] != 2:
             raise AssertionError(f"expected 2 accepted objects, got {ingest_resp['accepted']}")
 
