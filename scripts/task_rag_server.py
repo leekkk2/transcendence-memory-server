@@ -64,6 +64,18 @@ class IngestReq(BaseModel):
     archive_dir: str | None = Field(default=None, description='Optional override path for archive source.')
 
 
+class EmbedRequest(ContainerReq):
+    pass
+
+
+class BuildManifestRequest(ContainerReq):
+    pass
+
+
+class IngestMemoryRequest(IngestReq):
+    pass
+
+
 class IngestObject(BaseModel):
     id: str = Field(..., min_length=1, description='Client-provided stable object identifier.')
     text: str = Field(..., min_length=1, description='Primary retrievable text payload.')
@@ -113,6 +125,18 @@ class CommandResult(BaseModel):
     code: int
     stdout: str
     stderr: str
+
+
+class EmbedResponse(CommandResult):
+    pass
+
+
+class BuildManifestResponse(CommandResult):
+    pass
+
+
+class IngestMemoryResponse(CommandResult):
+    pass
 
 
 class SearchHit(BaseModel):
@@ -334,24 +358,27 @@ def search(req: SearchReq) -> SearchResponse:
     )
 
 
-@app.post('/embed', response_model=CommandResult)
-def embed(req: ContainerReq) -> CommandResult:
-    return run([str(SCRIPTS/'task_rag_embed.py'), '--container', req.container], timeout_s=req.timeout_s)
+@app.post('/embed', response_model=EmbedResponse)
+def embed(req: EmbedRequest) -> EmbedResponse:
+    result = run([str(SCRIPTS/'task_rag_embed.py'), '--container', req.container], timeout_s=req.timeout_s)
+    return EmbedResponse(**result.model_dump())
 
 
-@app.post('/build-manifest', response_model=CommandResult)
-def build_manifest(req: ContainerReq) -> CommandResult:
-    return run([str(SCRIPTS/'task_rag_build_manifest.py'), '--container', req.container], timeout_s=req.timeout_s)
+@app.post('/build-manifest', response_model=BuildManifestResponse)
+def build_manifest(req: BuildManifestRequest) -> BuildManifestResponse:
+    result = run([str(SCRIPTS/'task_rag_build_manifest.py'), '--container', req.container], timeout_s=req.timeout_s)
+    return BuildManifestResponse(**result.model_dump())
 
 
-@app.post('/ingest-memory', response_model=CommandResult)
-def ingest(req: IngestReq) -> CommandResult:
+@app.post('/ingest-memory', response_model=IngestMemoryResponse)
+def ingest(req: IngestMemoryRequest) -> IngestMemoryResponse:
     cmd = [str(SCRIPTS/'task_rag_ingest_memory_refs.py'), '--container', req.container]
     if req.memory_dir:
         cmd += ['--memory-dir', req.memory_dir]
     if req.archive_dir:
         cmd += ['--archive-dir', req.archive_dir]
-    return run(cmd, timeout_s=req.timeout_s)
+    result = run(cmd, timeout_s=req.timeout_s)
+    return IngestMemoryResponse(**result.model_dump())
 
 
 @app.get('/ingest-memory/contract', response_model=IngestContractResponse)
