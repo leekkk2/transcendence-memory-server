@@ -2,6 +2,11 @@
 
 This directory is reserved for task retrieval augmentation.
 
+## Current Repo Note
+
+The runtime scripts in this repo still read and write from `tasks/rag/...` under `WORKSPACE`.
+`tasks_rag/` currently serves as a reference/documentation directory inside the repo, not the live runtime root.
+
 ## Layout (containers)
 - `containers/imac/` — iMac task memory
 - `containers/eva/` — Eva task memory
