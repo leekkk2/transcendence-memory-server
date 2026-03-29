@@ -1,36 +1,44 @@
 # Server Boundary
 
-## Purpose
+## Position
 
-Clarify what this repository owns as the private server layer of transcendence-memory.
+`transcendence-memory-server` is the private server-side repository in the broader Transcendence Memory system.
+The local directory still remains `rag-everything/`, but the repo should now be understood by its server role rather than the old project name.
 
 ## This repo owns
-- retrieval service endpoints
-- indexing / embedding / ingest execution
-- server-side storage behavior
-- runtime scripts and service wrappers
-- server deployment-facing implementation details
+
+- authenticated HTTP endpoints
+- manifest build, memory ingest, embedding, and retrieval execution
+- runtime scripts and server wrappers
+- server-facing storage/index behavior
+- private deployment-facing documentation and configuration
 
 ## This repo does not own
-- the whole workspace orchestration story
-- all agent/client integration behavior
-- the final public abstraction layer
-- the skill packaging and distribution model
+
+- workspace-level planning, handoff, and long-running orchestration
+- agent/client enhancer prompts, hooks, and packaging
+- the future public abstraction layer in `transcendence-memory`
+- broad cross-repo product governance
 
 ## Practical separation
 
 ### Belongs here
+
 - server runtime code
 - API behavior
-- storage/index/search implementation
-- server deployment configuration
-- server troubleshooting docs
+- storage, index, and search implementation
+- deployment configuration
+- server troubleshooting and bootstrap notes
 
 ### Belongs elsewhere
-- long-running cross-repo planning → `transcendence-memory-workspace`
-- enhancer instructions for agents → `skills-hub`
-- sanitized public abstractions → `transcendence-memory`
 
-## Current implementation focus
+- cross-repo planning and program state → `transcendence-memory-workspace`
+- agent-side enhancer behavior → `skills-hub`
+- sanitized reusable abstractions → `transcendence-memory`
 
-The current codebase is still centered on the earlier task-RAG implementation. The immediate goal is not a destructive rewrite, but to evolve this codebase into a clearer private server home for the broader memory system.
+## Current boundary constraints
+
+- keep the historical `task_rag_*` script names for now
+- keep the current local directory layout unchanged in this bootstrap pass
+- use `transcendence-memory-server` in documentation to describe repo identity
+- treat this repo as the private server home, not as the entire memory platform
