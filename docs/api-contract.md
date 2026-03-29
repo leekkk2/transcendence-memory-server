@@ -155,6 +155,22 @@ Request:
 }
 ```
 
+Current response shape:
+```json
+{
+  "command": ["/path/to/task_rag_embed.py", "--container", "imac"],
+  "code": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
+
+Response fields:
+- `command`: wrapper-executed script argv preserved for observability and compatibility
+- `code`: wrapper subprocess exit code (`124` means timeout, `127` means the script entrypoint is missing)
+- `stdout`: raw stdout from the underlying script
+- `stderr`: raw stderr from the underlying script
+
 ### `POST /build-manifest`
 Build or rebuild manifest material for a container.
 
@@ -165,6 +181,22 @@ Request:
   "timeout_s": 120
 }
 ```
+
+Current response shape:
+```json
+{
+  "command": ["/path/to/task_rag_build_manifest.py", "--container", "imac"],
+  "code": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
+
+Response fields:
+- `command`: wrapper-executed script argv preserved for observability and compatibility
+- `code`: wrapper subprocess exit code (`124` means timeout, `127` means the script entrypoint is missing)
+- `stdout`: raw stdout from the underlying script
+- `stderr`: raw stderr from the underlying script
 
 ### `POST /ingest-memory`
 Ingest memory references for a container.
@@ -178,6 +210,22 @@ Request:
   "archive_dir": null
 }
 ```
+
+Current response shape:
+```json
+{
+  "command": ["/path/to/task_rag_ingest_memory_refs.py", "--container", "imac"],
+  "code": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
+
+Response fields:
+- `command`: wrapper-executed script argv preserved for observability and compatibility; optional directory flags also appear here when supplied
+- `code`: wrapper subprocess exit code (`124` means timeout, `127` means the script entrypoint is missing)
+- `stdout`: raw stdout from the underlying script
+- `stderr`: raw stderr from the underlying script
 
 ### `GET /ingest-memory/contract`
 Expose the current ingest semantic boundary explicitly.
