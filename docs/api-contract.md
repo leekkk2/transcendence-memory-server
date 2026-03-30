@@ -1,85 +1,151 @@
 # API Contract Draft
 
 ## Status
-Draft — initial server-side contract framing.
+
+Draft — consolidated mainline contract after branch unification.
 
 ## Goal
-Provide a minimal contract surface for the current private memory server while leaving room for later expansion beyond task-only retrieval.
+
+Provide one canonical private server contract for Transcendence Memory server-side retrieval.
+
+## Authentication
 
 Requests should provide either:
-- `X-API-Key: <RAG_API_KEY>`
-- or `Authorization: Bearer <RAG_API_KEY>`
+
+- `X-API-KEY: <RAG_API_KEY>`
+- `Authorization: Bearer <RAG_API_KEY>`
+
+## Canonical architecture
+
+- Retrieval is server-side only
+- Backend indexing is `LanceDB-only`
+- Canonical source types are:
+  - task cards under `tasks/active` and `tasks/archived`
+  - markdown memory under configured memory directories
+  - typed client objects persisted in `memory_objects.jsonl`
+  - structured JSON-like payloads ingested through `POST /ingest-structured`
 
 ## Current endpoints
 
-Unless otherwise noted, the current FastAPI wrapper endpoints return the same subprocess envelope:
+### `GET /health`
 
-```json
-{
-  "code": 0,
-  "stdout": "...script output...",
-  "stderr": ""
-}
-```
+Anonymous health probe for runtime verification.
+
+Current response highlights:
+
+- `architecture: "lancedb-only"`
+- `auth_configured`
+- `embedding_configured`
+- `lancedb_available`
+- `scripts_present`
+- `runtime_ready`
+- `available_containers`
+- `warnings`
 
 ### `POST /search`
+
 Search indexed memory for a container.
 
 Request:
+
 ```json
 {
   "query": "string",
   "topk": 5,
-  "container": "imac"
+  "container": "imac",
+  "timeout_s": 120
+}
+```
+
+Response shape:
+
+```json
+{
+  "status": "ok",
+  "command": ["python3", "/path/to/task_rag_search.py", "..."],
+  "code": 0,
+  "query": "string",
+  "topk": 5,
+  "container": "imac",
+  "initialized": true,
+  "message": null,
+  "results": [
+    {
+      "score": 0.12,
+      "taskId": "TASK-20260329-004",
+      "docType": "client_ingest",
+      "sourcePath": "tasks/rag/containers/imac/memory_objects.jsonl",
+      "text": "..."
+    }
+  ],
+  "stdout": "{...raw search payload...}",
+  "stderr": ""
 }
 ```
 
 ### `POST /embed`
-Trigger embedding/index refresh for a container.
+
+Rebuild canonical task-card, markdown-memory, and typed-object rows for a container into LanceDB.
 
 Request:
+
 ```json
 {
-  "container": "imac"
+  "container": "imac",
+  "timeout_s": 120,
+  "background": false,
+  "wait": true
 }
 ```
 
-### `POST /build-manifest`
-Build or rebuild manifest material for a container.
+Notes:
 
-Current implementation writes `tasks/rag/containers/<container>/manifest.jsonl` and merges:
-- task-card section chunks
-- persisted memory-object records from server-side memory object ingest storage
-
-Request:
-```json
-{
-  "container": "imac"
-}
-```
+- This is the canonical rebuild entrypoint
+- Existing structured-ingest rows are retained during rebuild
 
 ### `POST /ingest-memory`
-Ingest memory references for a container.
 
-Legacy status:
-- This endpoint is still a legacy filesystem ingest entry.
-- Current repository memory-object proofs no longer use it as the primary path.
+Run canonical LanceDB rebuild with optional explicit memory/archive source directories.
 
 Request:
+
 ```json
 {
   "container": "imac",
   "memory_dir": null,
-  "archive_dir": null
+  "archive_dir": null,
+  "timeout_s": 120,
+  "background": false,
+  "wait": true
+}
+```
+
+### `GET /ingest-memory/contract`
+
+Expose the current ingest semantic boundary explicitly.
+
+Current response shape:
+
+```json
+{
+  "mode": "lancedb-only",
+  "content_source": "server-side-canonical-sources",
+  "storage_location": "Canonical LanceDB rows live under WORKSPACE/tasks/rag/containers/<container>/lancedb.",
+  "retrieval_scope": "Retrieval runs server-side against LanceDB only.",
+  "notes": [
+    "Use /ingest-memory/objects to persist typed objects into canonical server-side storage.",
+    "Use /embed to rebuild task-card, markdown-memory, and typed-object rows into LanceDB.",
+    "Use /ingest-structured for direct structured JSON-like ingest into LanceDB."
+  ]
 }
 ```
 
 ### `POST /ingest-memory/objects`
-Persist memory objects for a container.
 
-Current implementation is **typed-first** for client-provided objects. Filesystem-based ingest for markdown memory refs stays on the separate legacy endpoint `POST /ingest-memory`; `POST /ingest-memory/objects` no longer accepts `memory_dir/archive_dir` fallback input.
+Persist typed client objects into canonical server-side storage for a container.
 
-Typed-first request:
+Request:
+
 ```json
 {
   "container": "imac",
@@ -94,69 +160,57 @@ Typed-first request:
         "project": "transcendence-memory"
       }
     }
-  ],
-  "timeout_s": 120
+  ]
 }
 ```
 
-Typed response when `objects` is provided:
+Response shape:
+
 ```json
 {
   "container": "imac",
   "accepted": 1,
-  "stored_path": ".../client-ingest-...jsonl",
-  "stored_paths": [".../client-ingest-...jsonl"],
-  "index_hint": "Run /build-manifest and /embed for this container to make newly stored objects searchable."
+  "stored_path": "/workspace/tasks/rag/containers/imac/memory_objects.jsonl",
+  "stored_paths": ["/workspace/tasks/rag/containers/imac/memory_objects.jsonl"],
+  "index_hint": "Run /embed for this container to refresh LanceDB after storing new objects."
 }
 ```
 
-Compatibility note:
-- Filesystem ingest remains available only through the separate legacy endpoint `POST /ingest-memory`.
-- `POST /ingest-memory/objects` now requires typed `objects` input and should be treated as the target client-ingest contract.
+### `POST /ingest-structured`
 
-Repository evidence from the current tree:
-- `tests/test_task_rag_server_memory_objects.py` covers typed `objects: [...]` ingest, manifest merge, and `/embed -> /search` retrieval.
-- `scripts/smoke_test_client_ingest_search.py` posts typed `objects` to `/ingest-memory/objects` and checks the full ingest/build-manifest/embed/search loop.
-- `scripts/smoke_test_client_ingest_wrapper_flow.py` calls `ingest_objects(ClientIngestReq(objects=[...]))` and checks the wrapper path on top of typed ingest.
-- `docs/development-bootstrap.md` documents the typed-object smoke flow and does not document a `memory_dir/archive_dir` call for `/ingest-memory/objects`.
-- A repository-wide search currently finds no test, smoke script, or doc example that sends `memory_dir` or `archive_dir` to `/ingest-memory/objects`.
+Parse JSON-like payloads into semantic chunks and upsert them into LanceDB.
 
-Current legacy entry that still remains:
-- `POST /ingest-memory`
+Request:
 
-## Memory object status
+```json
+{
+  "container": "eva",
+  "input_path": "/path/to/bookmarks.json",
+  "doc_type": "structured_json",
+  "doc_id": "chrome-bookmarks",
+  "timeout_s": 120,
+  "background": false,
+  "wait": true
+}
+```
 
-Current code already supports a lightweight memory-object flow:
-- `POST /ingest-memory/objects` persists client-provided typed objects into server-side container storage
-- `POST /build-manifest` merges those records into container `manifest.jsonl` as `client_ingest` entries
-- `POST /embed` followed by `POST /search` can retrieve those ingested objects
+### `POST /build-manifest`
 
-Current repository-level test coverage proves:
-- typed `objects: [...]` ingest + manifest merge for client-ingested records
-- a minimal `/embed -> /search` retrieval proof for typed client-ingested objects
+Deprecated no-op retained only to make the exit from the old manifest phase explicit.
 
-Both checks currently live in `tests/test_task_rag_server_memory_objects.py`.
+Response shape:
 
-What is still missing is a fully typed service surface across the whole server. Some endpoints still expose subprocess-wrapper responses rather than explicit JSON domain models.
+```json
+{
+  "command": [],
+  "code": 0,
+  "status": "deprecated",
+  "note": "build-manifest was removed in LanceDB-only mode; use /embed."
+}
+```
 
-## Longer-term direction
+## Repository evidence
 
-Longer-term, the server should evolve beyond task-only chunks toward first-class memory objects such as:
-- task_state
-- decision
-- conversation_summary
-- project_fact
-- user_preference
-- design_note
-- deployment_note
-
-A future contract should expose typed objects and retrieval results rather than only script-wrapped command output.
-
-## Near-term improvement target
-
-The next contract cleanup should move from raw script subprocess envelopes toward a typed service response with:
-- `results`
-- `errors`
-- `meta`
-
-Repository-level tests now include a minimal end-to-end proof that ingested memory objects become searchable through `/search` after manifest rebuild and embedding refresh.
+- `tests/test_task_rag_server_memory_objects.py` covers typed object persistence plus `/embed -> /search` retrieval on the LanceDB-only path
+- `scripts/smoke_test_client_ingest_search.py` verifies typed client objects persist to canonical `memory_objects.jsonl`
+- `docs/evolution/*` records how the repo moved from early manifest/FAISS stages to the current mainline

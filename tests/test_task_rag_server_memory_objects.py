@@ -6,7 +6,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+
+
+pytest.importorskip("lancedb")
 
 
 API_KEY = "test-rag-key"
@@ -17,16 +21,15 @@ PROOF_TEXT = "月海罗盘对象证据，可用于 feat-004 检索证明。"
 QUERY_TEXT = "月海罗盘对象证据"
 
 
-def load_server_module(
-    workspace: Path,
-    monkeypatch,
-    extra_env: dict[str, str] | None = None,
-):
+def load_server_module(workspace: Path, monkeypatch, extra_env: dict[str, str] | None = None):
     monkeypatch.setenv("WORKSPACE", str(workspace))
     monkeypatch.setenv("RAG_API_KEY", API_KEY)
     for key, value in (extra_env or {}).items():
         monkeypatch.setenv(key, value)
 
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     module_name = "scripts.task_rag_server"
     sys.modules.pop(module_name, None)
     return importlib.import_module(module_name)
@@ -56,31 +59,20 @@ def create_proof_workspace(tmp_path: Path) -> Path:
     return workspace
 
 
-def post_ok(client: TestClient, path: str, payload: dict[str, object]) -> dict[str, object]:
-    response = client.post(path, headers={"X-API-KEY": API_KEY}, json=payload)
-    assert response.status_code == 200
-    body = response.json()
-    assert body["code"] == 0, body
-    return body
-
-
-def embedding_vector(text: str) -> list[float]:
-    if "月海罗盘" in text:
-        return [1.0, 0.0, 0.0]
-    if TASK_SUMMARY in text:
-        return [0.0, 1.0, 0.0]
-    return [0.0, 0.0, 1.0]
-
-
 @contextlib.contextmanager
 def fake_embedding_server():
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length))
-            response = {
-                "data": [{"embedding": embedding_vector(payload["input"])}]
-            }
+            text = payload["input"]
+            if "月海罗盘" in text:
+                vector = [1.0, 0.0, 0.0]
+            elif TASK_SUMMARY in text:
+                vector = [0.0, 1.0, 0.0]
+            else:
+                vector = [0.0, 0.0, 1.0]
+            response = {"data": [{"embedding": vector}]}
             raw = json.dumps(response).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -102,12 +94,12 @@ def fake_embedding_server():
         server.server_close()
 
 
-def test_ingest_memory_objects_are_merged_into_manifest(tmp_path: Path, monkeypatch):
+def test_ingest_memory_objects_persist_to_canonical_jsonl(tmp_path: Path, monkeypatch):
     workspace = create_proof_workspace(tmp_path)
     server = load_server_module(workspace, monkeypatch)
     client = TestClient(server.app)
 
-    ingest_response = client.post(
+    response = client.post(
         "/ingest-memory/objects",
         headers={"X-API-KEY": API_KEY},
         json={
@@ -124,31 +116,18 @@ def test_ingest_memory_objects_are_merged_into_manifest(tmp_path: Path, monkeypa
             ],
         },
     )
-    assert ingest_response.status_code == 200
-    ingest_body = ingest_response.json()
-    assert ingest_body["accepted"] == 1
-    assert ingest_body["stored_paths"]
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] == 1
 
-    post_ok(client, "/build-manifest", {"container": CONTAINER})
-
-    manifest_path = workspace / "tasks" / "rag" / "containers" / CONTAINER / "manifest.jsonl"
-    entries = [
-        json.loads(line)
-        for line in manifest_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-    assert any(
-        entry["docType"] == "client_ingest"
-        and entry.get("metadata", {}).get("taskId") == TASK_ID
-        and PROOF_TEXT in entry["text"]
-        for entry in entries
-    )
+    objects_path = workspace / "tasks" / "rag" / "containers" / CONTAINER / "memory_objects.jsonl"
+    rows = [json.loads(line) for line in objects_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert rows[0]["id"] == TASK_ID
+    assert rows[0]["text"] == PROOF_TEXT
 
 
-def test_memory_objects_are_searchable_after_manifest_and_embed(tmp_path: Path, monkeypatch):
+def test_memory_objects_are_searchable_after_embed(tmp_path: Path, monkeypatch):
     workspace = create_proof_workspace(tmp_path)
-
     with fake_embedding_server() as base_url:
         server = load_server_module(
             workspace,
@@ -178,19 +157,25 @@ def test_memory_objects_are_searchable_after_manifest_and_embed(tmp_path: Path, 
             },
         )
         assert ingest_response.status_code == 200
-        ingest_body = ingest_response.json()
-        assert ingest_body["accepted"] == 1
-        assert ingest_body["stored_paths"]
 
-        post_ok(client, "/build-manifest", {"container": CONTAINER})
-        post_ok(client, "/embed", {"container": CONTAINER})
-        search_response = post_ok(
-            client,
-            "/search",
-            {"container": CONTAINER, "query": QUERY_TEXT, "topk": 1},
+        embed_response = client.post(
+            "/embed",
+            headers={"X-API-KEY": API_KEY},
+            json={"container": CONTAINER, "wait": True},
         )
+        assert embed_response.status_code == 200
+        assert embed_response.json()["code"] == 0, embed_response.json()
 
-    assert search_response["results"]
-    assert search_response["results"][0]["docType"] == "client_ingest"
-    assert search_response["results"][0]["metadata"]["taskId"] == TASK_ID
-    assert PROOF_TEXT in search_response["results"][0]["text"]
+        search_response = client.post(
+            "/search",
+            headers={"X-API-KEY": API_KEY},
+            json={"container": CONTAINER, "query": QUERY_TEXT, "topk": 1},
+        )
+        assert search_response.status_code == 200
+        body = search_response.json()
+        assert body["code"] == 0, body
+        assert body["initialized"] is True
+        assert body["results"]
+        assert body["results"][0]["docType"] == "client_ingest"
+        assert body["results"][0]["taskId"] == TASK_ID
+        assert PROOF_TEXT in body["results"][0]["text"]

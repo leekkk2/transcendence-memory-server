@@ -3,12 +3,12 @@
 ## Position
 
 `transcendence-memory-server` is the private server-side repository in the broader Transcendence Memory system.
-The local directory still remains `rag-everything/`, but the repo should now be understood by its server role rather than the old project name.
 
 ## This repo owns
 
 - authenticated HTTP endpoints
-- manifest build, memory ingest, embedding, and retrieval execution
+- LanceDB-only ingest and retrieval behavior
+- typed object persistence and structured ingest
 - runtime scripts and server wrappers
 - server-facing storage/index behavior
 - private deployment-facing documentation and configuration
@@ -38,7 +38,8 @@ The local directory still remains `rag-everything/`, but the repo should now be 
 
 ## Current boundary constraints
 
-- keep the historical `task_rag_*` script names for now
-- keep the current local directory layout unchanged in this bootstrap pass
-- use `transcendence-memory-server` in documentation to describe repo identity
+- keep the historical `task_rag_*` naming family for runtime entrypoints that remain in use
+- keep one canonical backend design: `LanceDB-only`
+- treat typed client objects as first-class server-side persisted sources
+- treat structured ingest as a server-side capability, not as a client enhancer concern
 - treat this repo as the private server home, not as the entire memory platform

@@ -1,24 +1,19 @@
 # Task RAG Store
 
-This directory is reserved for task retrieval augmentation.
+This directory is a documentation/reference directory inside the repo.
+Live runtime data still lives under `WORKSPACE/tasks/rag/...`.
 
-## Current Repo Note
+## Canonical runtime layout
 
-The runtime scripts in this repo still read and write from `tasks/rag/...` under `WORKSPACE`.
-`tasks_rag/` currently serves as a reference/documentation directory inside the repo, not the live runtime root.
+Each runtime container under `tasks/rag/containers/<container>/` can hold:
 
-## Layout (containers)
-- `containers/imac/` — iMac task memory
-- `containers/eva/` — Eva task memory
-- `containers/aliyun/` — Aliyun task memory
-
-Each container can hold:
-- `manifest.jsonl`
-- `embeddings/` (faiss.index + sqlite + meta)
+- `lancedb/` — canonical retrieval store
+- `memory_objects.jsonl` — canonical typed client-object store
 - `evidence/`
 - `retrieval_logs/`
 
 ## Notes
-- Embeddings use `gemini-embedding-001`
+
+- Mainline retrieval is `LanceDB-only`
 - Do not store secrets here
-- iMac/Aliyun should call Eva service; avoid local RAG-Anything installs
+- iMac/Aliyun should call Eva service; avoid local duplicate deployments
