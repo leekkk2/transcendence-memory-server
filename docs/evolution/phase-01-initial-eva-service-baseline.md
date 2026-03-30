@@ -1,8 +1,8 @@
 # Phase 01 — 初始 Eva 中心化服务基线
 
-这一阶段对应仓库最早可见基线（`init rag-everything`）及其明确目标：
+这一阶段对应当前服务最早可见基线（仓库初始提交 `init rag-everything`）及其明确目标：
 
-- RAG-everything 统一部署在 Eva
+- 服务统一部署在 Eva
 - iMac / Eva / Aliyun 共用
 - Aliyun 不本地安装
 - 对外服务入口：`https://rag.zweiteng.tk`
@@ -25,4 +25,4 @@
 
 ## 备注
 
-这个阶段是 RAG-everything 的可运行起点，但还不是后来的 LanceDB-only 正式形态。
+这个阶段是当前服务的历史可运行起点，但还不是后来的 LanceDB-only 正式形态。

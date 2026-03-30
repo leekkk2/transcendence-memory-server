@@ -6,7 +6,7 @@
 
 后端不再只是独立服务，也被接入 OpenClaw 工作流：
 
-- 安装并接入 `rag-everything-enhancer`
+- 安装并接入 memory enhancer skill
 - 对齐 `tools/rag-config.json`
 - 修复 `load_rag_config.sh`，正确导出：
   - `RAG_ENDPOINT`
@@ -38,7 +38,7 @@
 
 ## 阶段意义
 
-RAG-everything 从“记忆文件增强检索”继续演化为：
+当前服务从“记忆文件增强检索”继续演化为：
 
 - 面向多设备统一使用的 Eva 中心化 RAG 服务
 - 面向技能工作流的增强层

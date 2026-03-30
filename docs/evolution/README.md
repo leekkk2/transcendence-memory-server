@@ -1,6 +1,6 @@
-# RAG-everything 演进整理说明
+# Transcendence Memory Server 演进整理说明
 
-这个目录用于补录 **仓库之外发生、但真实存在于 Eva 工作区 / 文档 / 技能 / 运行环境中的演进过程**。
+这个目录用于补录 **当前 `transcendence-memory-server` 在仓库之外真实发生过的演进过程**。
 
 目标不是伪造原始历史，而是：
 

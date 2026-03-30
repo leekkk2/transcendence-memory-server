@@ -1,6 +1,6 @@
-# RAG-everything 演变审计（截至 2026-03-25）
+# Transcendence Memory Server 演变审计（截至 2026-03-25）
 
-> 目的：把 **git 仓库未完整记录**、但已实际发生在 Eva / OpenClaw 工作区 / 相关会话中的 RAG-everything 演进过程，补整理到一个可审阅的新分支里，方便回看“它是怎么一步步变成现在这个版本的”。
+> 目的：把 **git 仓库未完整记录**、但已实际发生在 Eva / OpenClaw 工作区 / 相关会话中的服务端演进过程补整理出来，方便回看它是怎么一步步收敛到当前 `transcendence-memory-server` 形态的。
 
 ## 0. 审计范围
 
