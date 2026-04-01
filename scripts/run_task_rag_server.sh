@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "${WORKSPACE:-$HOME/.openclaw/workspace}"
-export WORKSPACE="${WORKSPACE:-$PWD}"
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SERVER_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+DEFAULT_WORKSPACE="$SERVER_ROOT"
+WORKSPACE_VALUE="${WORKSPACE:-$DEFAULT_WORKSPACE}"
+cd "$SERVER_ROOT"
+export WORKSPACE="$WORKSPACE_VALUE"
 
 # load env
 set -a

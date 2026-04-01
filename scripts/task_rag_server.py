@@ -43,13 +43,18 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
 
 
 WS = Path(os.environ.get('WORKSPACE', '/home/ubuntu/.openclaw/workspace'))
-SCRIPTS = WS / 'scripts'
+SERVER_SCRIPTS = Path(__file__).resolve().parent
+WORKSPACE_SCRIPTS = WS / 'scripts'
 RAG_API_KEY = os.environ.get('RAG_API_KEY', '')
 SERVER_STARTED_AT = time.time()
 
 
 def script_path(name: str) -> Path:
-    return SCRIPTS / name
+    workspace_candidate = WORKSPACE_SCRIPTS / name
+    server_candidate = SERVER_SCRIPTS / name
+    if workspace_candidate.exists():
+        return workspace_candidate
+    return server_candidate
 
 
 def container_root(container: str) -> Path:
@@ -81,13 +86,20 @@ def verify_auth(
 app = FastAPI()
 
 
+def child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if env.get('EMBEDDING_BASE_URL') and not env.get('EMBEDDINGS_BASE_URL'):
+        env['EMBEDDINGS_BASE_URL'] = env['EMBEDDING_BASE_URL']
+    return env
+
+
 def run(cmd: list[str], timeout_s: int) -> CommandResponse:
     script = Path(cmd[0])
     if not script.exists():
         return CommandResponse(command=cmd, code=127, stderr=f'script not found: {script}')
     real_cmd = [sys.executable, *cmd] if cmd[0].endswith('.py') else cmd
     try:
-        completed = subprocess.run(real_cmd, capture_output=True, text=True, timeout=timeout_s)
+        completed = subprocess.run(real_cmd, capture_output=True, text=True, timeout=timeout_s, env=child_env())
         return CommandResponse(command=real_cmd, code=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
     except subprocess.TimeoutExpired as exc:
         return CommandResponse(
@@ -106,7 +118,7 @@ def run_or_start(cmd: list[str], timeout_s: int, background: bool | None, wait: 
     real_cmd = [sys.executable, *cmd] if cmd[0].endswith('.py') else cmd
     run_in_background = background if background is not None else not wait
     if run_in_background:
-        process = subprocess.Popen(real_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(real_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env())
         return CommandResponse(
             command=real_cmd,
             code=0,
@@ -172,6 +184,8 @@ def search(req: SearchReq) -> SearchResponse:
     except json.JSONDecodeError:
         payload = {}
     raw_results = payload.get('results') if isinstance(payload, dict) else []
+    if not isinstance(raw_results, list):
+        raw_results = []
     parsed = [SearchHit(**item) for item in raw_results if isinstance(item, dict)]
     return SearchResponse(
         status='ok' if result.code == 0 else 'error',
