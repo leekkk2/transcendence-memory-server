@@ -15,6 +15,23 @@ Requests should provide either:
 - `X-API-KEY: <RAG_API_KEY>`
 - `Authorization: Bearer <RAG_API_KEY>`
 
+## Runtime assumptions
+
+Current documented runtime assumes:
+
+- `WORKSPACE` points at the active runtime root that contains `tasks/`, `memory/`, and `memory_archive/`
+- `RAG_API_KEY` is set for protected endpoints
+- `EMBEDDING_API_KEY` is set for embedding-backed endpoints
+- embedding provider base URL currently resolves with `EMBEDDING_BASE_URL` first, then `EMBEDDINGS_BASE_URL`, then the built-in default
+- to avoid shell-state ambiguity during local debugging, prefer setting both `EMBEDDING_BASE_URL` and `EMBEDDINGS_BASE_URL` to the same value
+
+Minimal documented local startup path:
+
+```bash
+./scripts/bootstrap_dev.sh
+uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
+```
+
 ## Canonical architecture
 
 - Retrieval is server-side only

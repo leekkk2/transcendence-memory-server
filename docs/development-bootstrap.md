@@ -6,7 +6,9 @@
 
 ## 前置依赖
 
-- Python 3.11+
+- Python 3.11+（当前测试文件使用 `dict[str, str] | None` 等 3.10+ 语法，建议直接使用 3.11）
+- `pytest`
+- `httpx`
 - `fastapi`
 - `uvicorn`
 - `requests`
@@ -14,22 +16,47 @@
 - `lancedb`
 - `pyarrow`
 
-示例安装：
+推荐先跑项目内 bootstrap：
 
 ```bash
-python3 -m pip install fastapi uvicorn requests numpy lancedb pyarrow
+./scripts/bootstrap_dev.sh
+```
+
+如本机默认 `python3` 仍是 3.9，可显式指定：
+
+```bash
+PYTHON_BIN=python3.11 ./scripts/bootstrap_dev.sh
+```
+
+它会：
+
+- 创建/复用 `.venv-task-rag-server`
+- 默认优先使用 `python3.11`（可通过 `PYTHON_BIN` 覆盖）
+- 安装 `pytest` 与当前最小开发依赖
+- 让 `scripts/run_task_rag_server.sh` 与 `python -m pytest ...` 共用同一虚拟环境
+
+如果只想手动安装，等价命令为：
+
+```bash
+python3 -m pip install pytest httpx fastapi uvicorn requests numpy lancedb pyarrow
 ```
 
 ## 必要环境变量
+
+当前文档默认你就在 `transcendence-memory-server/` 仓库根目录内执行命令，因此：
 
 ```bash
 export WORKSPACE="$PWD"
 export RAG_API_KEY="replace-me"
 export EMBEDDING_API_KEY="replace-me"
 export EMBEDDING_MODEL="gemini-embedding-001"
-export EMBEDDINGS_BASE_URL="https://newapi.zweiteng.tk/v1"
+export EMBEDDING_BASE_URL="https://newapi.zweiteng.tk/v1"    # runtime 当前优先读取
+export EMBEDDINGS_BASE_URL="https://newapi.zweiteng.tk/v1"   # canonical 名称，建议同时设置保持一致
 export GOOGLE_EMBEDDING_BASE_URL="https://generativelanguage.googleapis.com/v1beta/models"
 ```
+
+> 注意：当前 runtime 的实际解析顺序是 `EMBEDDING_BASE_URL` → `EMBEDDINGS_BASE_URL` → 默认值。
+> 如果你的 shell 环境里预先存在旧值，单独设置 `EMBEDDINGS_BASE_URL` 可能不会覆盖它；本地调试时最稳妥做法是两个变量一起显式设置为同一个 endpoint。
 
 ## 运行时目录
 

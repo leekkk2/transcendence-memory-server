@@ -14,7 +14,11 @@ TASKS = WS / 'tasks'
 
 API_KEY = os.getenv('EMBEDDING_API_KEY', '')
 MODEL = os.getenv('EMBEDDING_MODEL', 'gemini-embedding-001')
-EMBEDDINGS_BASE_URL = os.getenv('EMBEDDINGS_BASE_URL', 'https://newapi.zweiteng.tk/v1')
+EMBEDDINGS_BASE_URL = (
+    os.getenv('EMBEDDING_BASE_URL')
+    or os.getenv('EMBEDDINGS_BASE_URL')
+    or 'https://newapi.zweiteng.tk/v1'
+)
 GOOGLE_BASE_URL = os.getenv('GOOGLE_EMBEDDING_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/models')
 
 
