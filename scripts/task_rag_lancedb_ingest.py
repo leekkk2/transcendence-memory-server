@@ -187,7 +187,7 @@ def load_existing_rows(container: str) -> list[dict[str, Any]]:
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
-    for row in table.to_list():
+    for row in table.to_arrow().to_pylist():
         item = dict(row)
         item.pop('_distance', None)
         rows.append(item)
