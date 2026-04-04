@@ -28,6 +28,8 @@ python -m pip install \
   requests \
   numpy \
   lancedb \
-  pyarrow
+  pyarrow \
+  raganything \
+  lightrag-hku
 
 echo "[bootstrap] ready: source $ROOT_DIR/$VENV_DIR/bin/activate"
