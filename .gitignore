@@ -19,3 +19,8 @@ memory_archive/
 
 # Environment
 .env
+
+# Build artifacts
+dist/
+*.egg-info/
+src/*.egg-info/

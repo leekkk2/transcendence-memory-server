@@ -1,102 +1,111 @@
-# transcendence-memory-server
+# Transcendence Memory Server
 
-Transcendence Memory 体系的**私有服务端实现**。负责 ingest、storage、retrieval 与部署。
+自托管的多模态 RAG 记忆服务。为 AI agent 提供集中式云端存储、记忆检索和知识图谱能力。
 
-## Quick Navigation
+## 特性
 
-| 主题 | 文档 |
-|------|------|
-| **快速部署** | [docs/deployment/quickstart.md](docs/deployment/quickstart.md) |
-| **Docker ���署** | [docs/deployment/docker-deployment.md](docs/deployment/docker-deployment.md) |
-| **systemd 部署** | [docs/deployment/systemd-deployment.md](docs/deployment/systemd-deployment.md) |
-| **反向代理** | [docs/deployment/reverse-proxy.md](docs/deployment/reverse-proxy.md) |
-| **环境变量参考** | [docs/deployment/environment-reference.md](docs/deployment/environment-reference.md) |
-| **健康检查** | [docs/operations/health-check.md](docs/operations/health-check.md) |
-| **服务端排障** | [docs/operations/troubleshooting.md](docs/operations/troubleshooting.md) |
-| **备份恢复** | [docs/operations/backup-restore.md](docs/operations/backup-restore.md) |
-| **升级迁移** | [docs/operations/upgrade-migration.md](docs/operations/upgrade-migration.md) |
-| **API Contract** | [docs/api-contract.md](docs/api-contract.md) |
-| **开发 Bootstrap** | [docs/development-bootstrap.md](docs/development-bootstrap.md) |
-| **Server Boundary** | [docs/server-boundary.md](docs/server-boundary.md) |
+- **文本记忆 CRUD** — 增删改查，支持 typed object 与结构化写入
+- **多模态 RAG** — PDF / 图片 / 表格文档理解（基于 RAG-Anything）
+- **知识图谱** — LightRAG 驱动的实体关系抽取与混合检索
+- **容器隔离** — 多 agent / 多项目独立存储空间
+- **Connection Token** — 一键生成鉴权令牌，客户端即插即用
+- **LanceDB 向量存储** — 零外部依赖的嵌入式向量数据库
 
-## For LLM Agents
+## 快速部署
 
-直接抓取部署指南：
+### Docker（推荐）
 
 ```bash
-curl -s <raw-url>/docs/deployment/quickstart.md
+cp .env.example .env
+# 编辑 .env，填入 API Key
+docker compose up -d
+curl http://localhost:8711/health
 ```
 
-## For Humans
-
-从 [快速部署](docs/deployment/quickstart.md) 开始，按需查阅其他文档。
-
-## Shortest Start
+### pip
 
 ```bash
-cd transcendence-memory-server
+pip install -e "."
+# 设置环境变量（或创建 .env）
+export WORKSPACE="$PWD" RAG_API_KEY="your-key" EMBEDDING_API_KEY="your-key"
+mkdir -p tasks/active tasks/archived tasks/rag/containers memory memory_archive
+tm-server start
+```
+
+### 从源码运行
+
+```bash
 ./scripts/bootstrap_dev.sh
-export WORKSPACE="$PWD" RAG_API_KEY="replace-me" EMBEDDING_API_KEY="replace-me"
-mkdir -p tasks/active tasks/archived tasks/rag/containers/imac memory memory_archive
+export WORKSPACE="$PWD" RAG_API_KEY="your-key" EMBEDDING_API_KEY="your-key"
+mkdir -p tasks/active tasks/archived tasks/rag/containers memory memory_archive
 ./scripts/run_task_rag_server.sh
-curl -sS http://127.0.0.1:8711/health
 ```
 
-## HTTP API
+## CLI
+
+```bash
+tm-server start              # 启动服务（默认 0.0.0.0:8711）
+tm-server start --port 9000  # 自定义端口
+tm-server health             # 健康检查
+tm-server export-token       # 导出 connection token
+```
+
+## 配套客户端技能
+
+```bash
+# Claude Code
+claude mcp add transcendence-memory
+```
+
+客户端仓库：[transcendence-memory](https://zweiteng.tk/server/transcendence-memory)
+
+## API
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/health` | GET | 健康检查（匿名） |
-| `/search` | POST | 检索 |
-| `/embed` | POST | 索引重建 |
-| `/ingest-memory` | POST | LanceDB 重建 |
-| `/ingest-memory/contract` | GET | Ingest 语义边界 |
+| `/search` | POST | 语义检索 |
+| `/embed` | POST | 向量索引重建 |
+| `/ingest-memory` | POST | LanceDB 记忆写入 |
 | `/ingest-memory/objects` | POST | Typed object 写入 |
-| `/ingest-structured` | POST | 结构化 JSON ingest |
-| `/build-manifest` | POST | Deprecated no-op |
+| `/ingest-structured` | POST | 结构化 JSON 写入 |
+| `/export-connection-token` | GET | 导出连接令牌 |
 
-详见 [API Contract](docs/api-contract.md)���
+认证方式：`X-API-KEY: <RAG_API_KEY>` 或 `Authorization: Bearer <RAG_API_KEY>`
 
-## Authentication
+详见 [API Contract](docs/api-contract.md)。
 
-- `X-API-KEY: <RAG_API_KEY>`
-- `Authorization: Bearer <RAG_API_KEY>`
+## 配置
 
-## Architecture
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `RAG_API_KEY` | 服务端 API 密钥 | （必填） |
+| `EMBEDDING_BASE_URL` | Embedding API 地址 | `https://newapi.zweiteng.tk/v1` |
+| `EMBEDDING_API_KEY` | Embedding API 密钥 | （必填） |
+| `EMBEDDING_MODEL` | Embedding 模型名 | `gemini-embedding-001` |
+| `EMBEDDING_DIM` | 向量维度 | `3072` |
+| `LLM_MODEL` | 知识图谱构建用 LLM | `gemini-2.5-flash` |
+| `LLM_BASE_URL` | LLM API 地址 | `https://newapi.zweiteng.tk/v1` |
+| `LLM_API_KEY` | LLM API 密钥 | （必填） |
+| `VLM_MODEL` | 视觉语言模型 | `qwen3-vl-plus` |
+| `RAG_ADVERTISED_ENDPOINT` | 对外 endpoint | `http://localhost:8711` |
+| `WORKSPACE` | 数据存储目录 | `/data`（Docker） |
 
-- 主链：**LanceDB-only**
-- 默认端口：`8711`
-- 详见 [Server Boundary](docs/server-boundary.md)
+完整说明见 [.env.example](.env.example) 和 [环境变量参考](docs/deployment/environment-reference.md)。
 
-## This Repo Owns
+## 文档
 
-- 认证 HTTP 端点
-- LanceDB ingest 与 retrieval
-- Typed object 持久化与结构化 ingest
-- 运行时脚本与服务包装
-- **所有服务端部署、运维文档**
+| 主题 | 链接 |
+|------|------|
+| 快速部署 | [docs/deployment/quickstart.md](docs/deployment/quickstart.md) |
+| Docker 部署 | [docs/deployment/docker-deployment.md](docs/deployment/docker-deployment.md) |
+| systemd 部署 | [docs/deployment/systemd-deployment.md](docs/deployment/systemd-deployment.md) |
+| 反向代理 | [docs/deployment/reverse-proxy.md](docs/deployment/reverse-proxy.md) |
+| 健康检查 | [docs/operations/health-check.md](docs/operations/health-check.md) |
+| 备份恢复 | [docs/operations/backup-restore.md](docs/operations/backup-restore.md) |
+| 开发 Bootstrap | [docs/development-bootstrap.md](docs/development-bootstrap.md) |
+| Server Boundary | [docs/server-boundary.md](docs/server-boundary.md) |
 
-## This Repo Does Not Own
+## License
 
-- 客户端技能包 → `transcendence-memory`
-- Workspace 级规划与编排 → `transcendence-memory-workspace`
-- Agent/client enhancer → `skills-hub`
-
-## Client Skill
-
-客户端使用与连接请参考 [`transcendence-memory`](https://zweiteng.tk/server/transcendence-memory) 仓库。
-
-## Development
-
-详见 [Development Bootstrap](docs/development-bootstrap.md)。
-
-## Docs Index
-
-- [docs/README.md](docs/README.md)
-- [docs/server-boundary.md](docs/server-boundary.md)
-- [docs/api-contract.md](docs/api-contract.md)
-- [docs/development-bootstrap.md](docs/development-bootstrap.md)
-- [docs/deployment/](docs/deployment/) — 部署文档
-- [docs/operations/](docs/operations/) — 运维文档
-- [docs/identity/](docs/identity/) — 身份文档
-- [docs/evolution/](docs/evolution/) — 演进记录
+MIT

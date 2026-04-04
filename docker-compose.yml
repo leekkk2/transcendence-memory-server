@@ -4,24 +4,24 @@ services:
   rag-server:
     build: .
     ports:
-      - "8711:8711"
+      - "${TM_PORT:-8711}:8711"
     volumes:
       - tm-data:/data
+    env_file:
+      - .env
     environment:
       - WORKSPACE=/data
-      - RAG_API_KEY=${RAG_API_KEY}
-      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-https://newapi.zweiteng.tk/v1}
-      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-gemini-embedding-001}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
-      - LLM_MODEL=${LLM_MODEL:-gemini-2.5-flash}
-      - LLM_BASE_URL=${LLM_BASE_URL:-https://newapi.zweiteng.tk/v1}
-      - LLM_API_KEY=${LLM_API_KEY}
-      - VLM_MODEL=${VLM_MODEL:-qwen3-vl-plus}
-      - VLM_BASE_URL=${VLM_BASE_URL:-https://newapi.zweiteng.tk/v1}
-      - VLM_API_KEY=${VLM_API_KEY}
-      - RAG_ADVERTISED_ENDPOINT=${RAG_ADVERTISED_ENDPOINT:-http://localhost:8711}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8711/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   tm-data:

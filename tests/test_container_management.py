@@ -21,7 +21,13 @@ def test_list_containers(tmp_path: Path, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["count"] == 3
-    assert body["containers"] == ["alpha", "beta", "gamma"]
+    names = [c["name"] for c in body["containers"]]
+    assert names == ["alpha", "beta", "gamma"]
+    # 每个容器应包含详细信息
+    for c in body["containers"]:
+        assert "objects" in c
+        assert "indexed" in c
+        assert "last_modified" in c
 
 
 def test_delete_container(tmp_path: Path, monkeypatch):
