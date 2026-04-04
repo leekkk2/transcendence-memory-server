@@ -1,105 +1,102 @@
 # transcendence-memory-server
 
-`transcendence-memory-server` 是 Transcendence Memory 体系里的私有 server 实现入口，负责统一的服务端 ingest、storage、retrieval 与私有部署接入。
+Transcendence Memory 体系的**私有服务端实现**。负责 ingest、storage、retrieval 与部署。
 
-## 当前职责
+## Quick Navigation
 
-- 暴露私有 HTTP API
-- 统一用 LanceDB 承载服务端检索主链
-- 重建 task cards、markdown memory、typed client objects 的服务端索引
-- 提供结构化 JSON-like 数据入库能力
-- 维护服务端运行约束与私有部署入口
+| 主题 | 文档 |
+|------|------|
+| **快速部署** | [docs/deployment/quickstart.md](docs/deployment/quickstart.md) |
+| **Docker ���署** | [docs/deployment/docker-deployment.md](docs/deployment/docker-deployment.md) |
+| **systemd 部署** | [docs/deployment/systemd-deployment.md](docs/deployment/systemd-deployment.md) |
+| **反向代理** | [docs/deployment/reverse-proxy.md](docs/deployment/reverse-proxy.md) |
+| **环境变量参考** | [docs/deployment/environment-reference.md](docs/deployment/environment-reference.md) |
+| **健康检查** | [docs/operations/health-check.md](docs/operations/health-check.md) |
+| **服务端排障** | [docs/operations/troubleshooting.md](docs/operations/troubleshooting.md) |
+| **备份恢复** | [docs/operations/backup-restore.md](docs/operations/backup-restore.md) |
+| **升级迁移** | [docs/operations/upgrade-migration.md](docs/operations/upgrade-migration.md) |
+| **API Contract** | [docs/api-contract.md](docs/api-contract.md) |
+| **开发 Bootstrap** | [docs/development-bootstrap.md](docs/development-bootstrap.md) |
+| **Server Boundary** | [docs/server-boundary.md](docs/server-boundary.md) |
 
-当前不负责：
+## For LLM Agents
 
-- agent / client enhancer 适配
-- workspace 级规划、handoff 与多项目编排
-- 未来开源抽象层的稳定公共接口承诺
+直接抓取部署指南：
 
-详见 [docs/server-boundary.md](docs/server-boundary.md)。
+```bash
+curl -s <raw-url>/docs/deployment/quickstart.md
+```
 
-## 当前实现概览
+## For Humans
 
-- Server entry: `scripts/task_rag_server.py`
-- Shared runtime: `scripts/task_rag_runtime.py`
-- Canonical LanceDB ingest: `scripts/task_rag_lancedb_ingest.py`
-- Search pipeline: `scripts/task_rag_search.py`
-- Structured ingest: `scripts/task_rag_structured_ingest.py`
-- Ops helpers: `scripts/load_rag_config.sh`, `scripts/run_task_rag_server.sh`
-  - `load_rag_config.sh` 从 `~/.openclaw/workspace/tools/rag-config.json`（或 `RAG_CONFIG_FILE` 覆盖路径）导出 `RAG_ENDPOINT`、`RAG_AUTH_HEADER`、`RAG_API_KEY`、`RAG_DEFAULT_CONTAINER`
-  - `run_task_rag_server.sh` 默认切到当前 server 仓库根目录执行，并将 `WORKSPACE` 默认指向该仓库根；只有在明确需要 monorepo 根级运行时才覆盖 `WORKSPACE`
-- Nginx reference: `docs/nginx-rag.zweiteng.tk.conf`
+从 [快速部署](docs/deployment/quickstart.md) 开始，按需查阅其他文档。
+
+## Shortest Start
+
+```bash
+cd transcendence-memory-server
+./scripts/bootstrap_dev.sh
+export WORKSPACE="$PWD" RAG_API_KEY="replace-me" EMBEDDING_API_KEY="replace-me"
+mkdir -p tasks/active tasks/archived tasks/rag/containers/imac memory memory_archive
+./scripts/run_task_rag_server.sh
+curl -sS http://127.0.0.1:8711/health
+```
 
 ## HTTP API
 
-当前实现暴露以下端点：
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查（匿名） |
+| `/search` | POST | 检索 |
+| `/embed` | POST | 索引重建 |
+| `/ingest-memory` | POST | LanceDB 重建 |
+| `/ingest-memory/contract` | GET | Ingest 语义边界 |
+| `/ingest-memory/objects` | POST | Typed object 写入 |
+| `/ingest-structured` | POST | 结构化 JSON ingest |
+| `/build-manifest` | POST | Deprecated no-op |
 
-- `GET /health`
-- `POST /search`
-- `POST /embed`
-- `POST /ingest-memory`
-- `GET /ingest-memory/contract`
-- `POST /ingest-memory/objects`
-- `POST /ingest-structured`
-- `POST /build-manifest`（deprecated no-op）
+详见 [API Contract](docs/api-contract.md)���
 
-请求/响应草案见 [docs/api-contract.md](docs/api-contract.md)。
+## Authentication
 
-## Development Bootstrap
+- `X-API-KEY: <RAG_API_KEY>`
+- `Authorization: Bearer <RAG_API_KEY>`
 
-完整说明见 [docs/development-bootstrap.md](docs/development-bootstrap.md)。
+## Architecture
 
-最短启动路径：
-
-1. 将 `WORKSPACE` 指向当前仓库根目录（当前文档默认在 server 子仓库目录内执行，因此通常是 `export WORKSPACE="$PWD"`）
-2. 导出 `RAG_API_KEY`、`EMBEDDING_API_KEY`
-3. 如需自定义 embedding provider endpoint，当前 runtime **优先读取** `EMBEDDING_BASE_URL`，同时兼容 `EMBEDDINGS_BASE_URL`；为避免歧义，建议本地调试时两个变量同时设置为同一值
-4. 准备运行时目录：`tasks/active`、`tasks/archived`、`tasks/rag/containers/imac`、`memory`、`memory_archive`
-5. 运行项目内 bootstrap，准备 `.venv-task-rag-server` 与最小开发依赖（含 `pytest`、`httpx`，默认优先使用 `python3.11`）：
-
-```bash
-./scripts/bootstrap_dev.sh
-```
-
-6. 运行：
-
-```bash
-./scripts/run_task_rag_server.sh
-```
-
-如需先加载私有 RAG endpoint / auth 配置，再启动 server，可在同一 shell 中串联：
-
-```bash
-source ./scripts/load_rag_config.sh
-./scripts/run_task_rag_server.sh
-```
-
-等价手动命令：
-
-```bash
-uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
-```
-
-## Runtime Auth
-
-- Header: `X-API-KEY: <RAG_API_KEY>`
-- 或 `Authorization: Bearer <RAG_API_KEY>`
-
-## Runtime Notes
-
+- 主链：**LanceDB-only**
 - 默认端口：`8711`
-- `scripts/run_task_rag_server.sh` 当前默认在 `transcendence-memory-server/` 仓库根目录内启动 uvicorn；如需让 runtime 数据落在 monorepo 根级 `tasks/rag/...`，需显式覆盖 `WORKSPACE=/path/to/skills-workspace`
-- 私有部署链路当前口径：`rag.zweiteng.tk` → Nginx (`docs/nginx-rag.zweiteng.tk.conf`) → `127.0.0.1:8711` → `./scripts/run_task_rag_server.sh`
-- 当前生产目标机器：Eva
-- 现有 HTTPS 入口：`https://rag.zweiteng.tk`
-- 当前主链统一为 `LanceDB-only`
-- embedding provider endpoint 当前 runtime 解析顺序为：`EMBEDDING_BASE_URL` → `EMBEDDINGS_BASE_URL` → 默认值；因此文档与调用方都应显式意识到 legacy alias 目前具有更高优先级
-- `POST /build-manifest` 仅保留为 deprecated no-op，用于明确旧阶段已经退出主链
+- 详见 [Server Boundary](docs/server-boundary.md)
 
-## Docs
+## This Repo Owns
+
+- 认证 HTTP 端点
+- LanceDB ingest 与 retrieval
+- Typed object 持久化与结构化 ingest
+- 运行时脚本与服务包装
+- **所有服务端部署、运维文档**
+
+## This Repo Does Not Own
+
+- 客户端技能包 → `transcendence-memory`
+- Workspace 级规划与编排 → `transcendence-memory-workspace`
+- Agent/client enhancer → `skills-hub`
+
+## Client Skill
+
+客户端使用与连接请参考 [`transcendence-memory`](https://zweiteng.tk/server/transcendence-memory) 仓库。
+
+## Development
+
+详见 [Development Bootstrap](docs/development-bootstrap.md)。
+
+## Docs Index
 
 - [docs/README.md](docs/README.md)
 - [docs/server-boundary.md](docs/server-boundary.md)
 - [docs/api-contract.md](docs/api-contract.md)
 - [docs/development-bootstrap.md](docs/development-bootstrap.md)
-- [docs/evolution/README.md](docs/evolution/README.md)
+- [docs/deployment/](docs/deployment/) — 部署文档
+- [docs/operations/](docs/operations/) — 运维文档
+- [docs/identity/](docs/identity/) — 身份文档
+- [docs/evolution/](docs/evolution/) — 演进记录

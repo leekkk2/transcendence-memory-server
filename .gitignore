@@ -6,3 +6,16 @@ __pycache__/
 venv/
 scripts/__pycache__/
 tests/__pycache__/
+
+# LightRAG runtime data
+kv_store_*.json
+vdb_*.json
+graph_chunk_entity_relation.graphml
+
+# Runtime data
+tasks/rag/containers/
+memory/
+memory_archive/
+
+# Environment
+.env

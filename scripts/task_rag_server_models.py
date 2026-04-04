@@ -9,7 +9,7 @@ DEFAULT_CONTAINER = 'imac'
 
 
 class SearchReq(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1)
     topk: int = Field(default=5, ge=1, le=100)
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
     timeout_s: int = Field(default=120, ge=1, le=600)
@@ -110,3 +110,75 @@ class ClientIngestResponse(BaseModel):
     stored_path: str
     stored_paths: list[str]
     index_hint: str
+
+
+# --- 多模态 RAG 集成新增模型 ---
+
+
+class ConnectionTokenResponse(BaseModel):
+    token: str
+    endpoint: str
+    container: str
+    note: str
+
+
+class UpdateMemoryReq(BaseModel):
+    text: str | None = None
+    title: str | None = None
+    source: str | None = None
+    tags: list[str] | None = None
+    metadata: dict[str, str | int | float | bool | None] | None = None
+
+
+class MemoryDeleteResponse(BaseModel):
+    container: str
+    id: str
+    deleted: bool
+    message: str
+
+
+class MemoryUpdateResponse(BaseModel):
+    container: str
+    id: str
+    updated: bool
+    message: str
+    index_hint: str
+
+
+class ContainerListResponse(BaseModel):
+    containers: list[str]
+    count: int
+
+
+class ContainerDeleteResponse(BaseModel):
+    container: str
+    deleted: bool
+    message: str
+
+
+class JobStatusResponse(BaseModel):
+    pid: int
+    running: bool
+    exit_code: int | None = None
+    message: str
+
+
+class DocumentTextReq(BaseModel):
+    container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
+    text: str = Field(..., min_length=1)
+    description: str | None = None
+
+
+class QueryReq(BaseModel):
+    query: str = Field(..., min_length=1)
+    container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
+    mode: str = "hybrid"
+    top_k: int = Field(default=60, ge=1, le=500)
+
+
+class QueryResponse(BaseModel):
+    status: str
+    query: str
+    container: str
+    answer: str
+    mode: str
