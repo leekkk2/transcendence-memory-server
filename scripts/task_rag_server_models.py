@@ -12,12 +12,12 @@ class SearchReq(BaseModel):
     query: str = Field(..., min_length=1)
     topk: int = Field(default=5, ge=1, le=100)
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
-    timeout_s: int = Field(default=120, ge=1, le=600)
+    timeout_s: int = Field(default=600, ge=1, le=1800)
 
 
 class ContainerReq(BaseModel):
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
-    timeout_s: int = Field(default=120, ge=1, le=600)
+    timeout_s: int = Field(default=600, ge=1, le=1800)
     background: bool | None = None
     wait: bool = False
 
@@ -45,6 +45,7 @@ class IngestObject(BaseModel):
 class ClientIngestReq(BaseModel):
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
     objects: list[IngestObject] = Field(..., min_length=1)
+    auto_embed: bool = Field(default=True, description='Automatically trigger background embed after ingest')
 
 
 class CommandResponse(BaseModel):
@@ -147,6 +148,18 @@ class MemoryUpdateResponse(BaseModel):
 
 class ContainerListResponse(BaseModel):
     containers: list[str]
+    count: int
+
+
+class ContainerInfo(BaseModel):
+    name: str
+    objects: int
+    indexed: bool
+    last_modified: str | None = None
+
+
+class ContainerListDetailedResponse(BaseModel):
+    containers: list[ContainerInfo]
     count: int
 
 

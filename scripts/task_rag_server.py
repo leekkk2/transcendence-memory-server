@@ -277,12 +277,25 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
     with path.open('a', encoding='utf-8') as handle:
         for line in lines:
             handle.write(line + '\n')
+
+    # auto_embed: 自动在后台触发索引重建
+    if req.auto_embed:
+        embed_script = script_path('task_rag_lancedb_ingest.py')
+        if embed_script.exists():
+            run_or_start(
+                [str(embed_script), '--container', req.container],
+                timeout_s=600,
+                background=True,
+                wait=False,
+            )
+
+    index_hint = 'Auto-embed triggered in background.' if req.auto_embed else 'Run /embed for this container to refresh LanceDB after storing new objects.'
     return ClientIngestResponse(
         container=req.container,
         accepted=len(lines),
         stored_path=str(path),
         stored_paths=[str(path)],
-        index_hint='Run /embed for this container to refresh LanceDB after storing new objects.',
+        index_hint=index_hint,
     )
 
 
@@ -351,13 +364,32 @@ def export_connection_token(container: str = DEFAULT_CONTAINER) -> ConnectionTok
     )
 
 
-@app.get('/containers', response_model=ContainerListResponse, dependencies=[Depends(verify_auth)])
-def list_containers() -> ContainerListResponse:
+@app.get('/containers', dependencies=[Depends(verify_auth)])
+def list_containers():
     containers_dir = WS / 'tasks' / 'rag' / 'containers'
     if not containers_dir.exists():
-        return ContainerListResponse(containers=[], count=0)
-    names = sorted(p.name for p in containers_dir.iterdir() if p.is_dir())
-    return ContainerListResponse(containers=names, count=len(names))
+        return {'containers': [], 'count': 0}
+    result = []
+    for p in sorted(containers_dir.iterdir()):
+        if not p.is_dir():
+            continue
+        # 统计对象数
+        jsonl = p / 'memory_objects.jsonl'
+        obj_count = 0
+        last_mod = None
+        if jsonl.exists():
+            obj_count = sum(1 for line in jsonl.read_text(encoding='utf-8').splitlines() if line.strip())
+            last_mod = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(jsonl.stat().st_mtime))
+        # 检查索引
+        lancedb_dir = p / 'lancedb'
+        indexed = lancedb_dir.exists() and any(lancedb_dir.iterdir()) if lancedb_dir.exists() else False
+        result.append({
+            'name': p.name,
+            'objects': obj_count,
+            'indexed': indexed,
+            'last_modified': last_mod,
+        })
+    return {'containers': result, 'count': len(result)}
 
 
 @app.delete('/containers/{name}', response_model=ContainerDeleteResponse, dependencies=[Depends(verify_auth)])
