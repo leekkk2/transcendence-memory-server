@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CONFIG_FILE="${RAG_CONFIG_FILE:-$HOME/.openclaw/workspace/tools/rag-config.json}"
+CONFIG_FILE="${RAG_CONFIG_FILE:-$HOME/.config/transcendence-memory/rag-config.json}"
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "RAG config not found: $CONFIG_FILE" >&2
   exit 1

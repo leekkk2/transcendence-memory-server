@@ -83,7 +83,7 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.arch_detect import detect_architecture, reset_cache as reset_arch_cache
 
 
-WS = Path(os.environ.get('WORKSPACE', '/home/ubuntu/.openclaw/workspace'))
+WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 SERVER_SCRIPTS = Path(__file__).resolve().parent
 WORKSPACE_SCRIPTS = WS / 'scripts'
 RAG_API_KEY = os.environ.get('RAG_API_KEY', '')
