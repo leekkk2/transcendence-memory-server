@@ -9,6 +9,21 @@ description = "Self-hosted multimodal RAG memory service with LanceDB + RAG-Anyt
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "MIT"
+authors = [{name = "leekkk2"}]
+keywords = ["rag", "memory", "fastapi", "lancedb", "lightrag", "vector-database", "multimodal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/leekkk2/transcendence-memory-server"
+Repository = "https://github.com/leekkk2/transcendence-memory-server"
+Issues = "https://github.com/leekkk2/transcendence-memory-server/issues"
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
