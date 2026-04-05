@@ -46,3 +46,9 @@ coverage.xml
 !.env.example
 *.pem
 *.key
+
+# Local dev notes (never publish)
+.local/
+.notes/
+.drafts/
+DEPLOY_ISSUES_*.md
