@@ -89,6 +89,20 @@ class SearchResponse(BaseModel):
     stderr: str
 
 
+class ModuleStatusResponse(BaseModel):
+    enabled: bool
+    ready: bool
+    package_available: bool
+    required_keys: list[str] = Field(default_factory=list)
+    missing_keys: list[str] = Field(default_factory=list)
+
+
+class ConfigurationGuide(BaseModel):
+    configured: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    optional: list[str] = Field(default_factory=list)
+
+
 class HealthResponse(BaseModel):
     status: Literal['ok']
     service: str
@@ -103,6 +117,8 @@ class HealthResponse(BaseModel):
     available_containers: list[str]
     warnings: list[str]
     uptime_seconds: int
+    modules: dict[str, ModuleStatusResponse] | None = None
+    configuration_guide: ConfigurationGuide | None = None
 
 
 class ClientIngestResponse(BaseModel):
