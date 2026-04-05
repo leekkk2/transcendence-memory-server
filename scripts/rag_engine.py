@@ -14,7 +14,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # --- 环境变量配置 ---
-BASE_URL = os.environ.get("EMBEDDING_BASE_URL") or os.environ.get("EMBEDDINGS_BASE_URL") or "https://newapi.zweiteng.tk/v1"
+BASE_URL = os.environ.get("EMBEDDING_BASE_URL") or os.environ.get("EMBEDDINGS_BASE_URL") or "https://api.openai.com/v1"
 API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "gemini-embedding-001")
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "3072"))

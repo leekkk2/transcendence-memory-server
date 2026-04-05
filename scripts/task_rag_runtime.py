@@ -17,7 +17,7 @@ MODEL = os.getenv('EMBEDDING_MODEL', 'gemini-embedding-001')
 EMBEDDINGS_BASE_URL = (
     os.getenv('EMBEDDING_BASE_URL')
     or os.getenv('EMBEDDINGS_BASE_URL')
-    or 'https://newapi.zweiteng.tk/v1'
+    or 'https://api.openai.com/v1'
 )
 GOOGLE_BASE_URL = os.getenv('GOOGLE_EMBEDDING_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/models')
 
