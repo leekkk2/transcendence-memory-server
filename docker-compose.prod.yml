@@ -1,0 +1,17 @@
+# 生产环境 overlay — 配合 Nginx 反代使用
+# 用法：docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+services:
+  rag-server:
+    ports:
+      - "127.0.0.1:${TM_PORT:-8711}:8711"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8711/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

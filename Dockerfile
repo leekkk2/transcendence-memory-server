@@ -13,8 +13,9 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY scripts/ ./scripts/
 COPY src/ ./src/
+RUN chmod +x /app/scripts/entrypoint.sh
 RUN mkdir -p /data/tasks/active /data/tasks/archived /data/tasks/rag/containers /data/memory /data/memory_archive
 ENV WORKSPACE=/data
 EXPOSE 8711
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 CMD curl -f http://localhost:8711/health || exit 1
-CMD ["uvicorn", "task_rag_server:app", "--app-dir", "scripts", "--host", "0.0.0.0", "--port", "8711"]
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=15s CMD curl -f http://localhost:8711/health || exit 1
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -14,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 try:
@@ -21,6 +24,7 @@ try:
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
+        ConfigurationGuide,
         ConnectionTokenResponse,
         ContainerDeleteResponse,
         ContainerListResponse,
@@ -32,6 +36,7 @@ try:
         JobStatusResponse,
         MemoryDeleteResponse,
         MemoryUpdateResponse,
+        ModuleStatusResponse,
         QueryReq,
         QueryResponse,
         SearchHit,
@@ -45,6 +50,7 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
+        ConfigurationGuide,
         ConnectionTokenResponse,
         ContainerDeleteResponse,
         ContainerListResponse,
@@ -56,6 +62,7 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         JobStatusResponse,
         MemoryDeleteResponse,
         MemoryUpdateResponse,
+        ModuleStatusResponse,
         QueryReq,
         QueryResponse,
         SearchHit,
@@ -69,6 +76,11 @@ try:
     from rag_engine import get_rag, ensure_rag_initialized
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.rag_engine import get_rag, ensure_rag_initialized
+
+try:
+    from arch_detect import detect_architecture, reset_cache as reset_arch_cache
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.arch_detect import detect_architecture, reset_cache as reset_arch_cache
 
 
 WS = Path(os.environ.get('WORKSPACE', '/home/ubuntu/.openclaw/workspace'))
@@ -112,7 +124,45 @@ def verify_auth(
         raise HTTPException(status_code=401, detail='unauthorized')
 
 
-app = FastAPI()
+logger = logging.getLogger('transcendence-memory-server')
+
+
+def _startup_banner() -> None:
+    arch = detect_architecture()
+    lines = [
+        '',
+        '=' * 56,
+        '  Transcendence Memory Server',
+        f'  Architecture: {arch.name}',
+        '-' * 56,
+    ]
+    status_icons = {True: '[OK]', False: '[--]'}
+    for mod_name, mod in arch.modules.items():
+        icon = status_icons[mod.enabled]
+        detail = ''
+        if mod.missing_keys:
+            detail = f' (missing: {", ".join(mod.missing_keys)})'
+        elif not mod.package_available:
+            detail = ' (package not installed)'
+        lines.append(f'  {icon} {mod_name:<15} {"ready" if mod.ready else "disabled"}{detail}')
+    if arch.missing_keys:
+        lines.append('-' * 56)
+        lines.append('  To unlock full rag-everything:')
+        for key in arch.missing_keys:
+            lines.append(f'    - Set {key} in .env')
+    lines.append('=' * 56)
+    lines.append('')
+    for line in lines:
+        logger.info(line)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _startup_banner()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def child_env() -> dict[str, str]:
@@ -182,10 +232,31 @@ def health() -> HealthResponse:
         warnings.append('lancedb runtime is unavailable.')
     if not containers.exists():
         warnings.append('containers root does not exist yet; it will be created on first ingest.')
+
+    # 架构检测
+    arch = detect_architecture()
+
+    # 模块状态
+    modules_resp = {
+        name: ModuleStatusResponse(
+            enabled=mod.enabled,
+            ready=mod.ready,
+            package_available=mod.package_available,
+            required_keys=mod.required_keys,
+            missing_keys=mod.missing_keys,
+        )
+        for name, mod in arch.modules.items()
+    }
+    config_guide = ConfigurationGuide(
+        configured=arch.configured_keys,
+        missing=arch.missing_keys,
+        optional=arch.optional_keys,
+    )
+
     return HealthResponse(
         status='ok',
         service='transcendence-memory-server',
-        architecture='lancedb-only',
+        architecture=arch.name,
         workspace=str(WS),
         containers_root=str(containers),
         auth_configured=bool(RAG_API_KEY),
@@ -198,10 +269,14 @@ def health() -> HealthResponse:
             'ingest_memory': scripts_present['lancedb_ingest'] and embedding_configured and lancedb_available,
             'ingest_objects': True,
             'ingest_structured': scripts_present['structured_ingest'] and embedding_configured and lancedb_available,
+            'query': arch.modules['lightrag'].ready,
+            'documents_text': arch.modules['lightrag'].ready,
         },
         available_containers=sorted(path.name for path in containers.iterdir() if path.is_dir()) if containers.exists() else [],
         warnings=warnings,
         uptime_seconds=max(0, int(time.time() - SERVER_STARTED_AT)),
+        modules=modules_resp,
+        configuration_guide=config_guide,
     )
 
 
@@ -253,8 +328,9 @@ def ingest_memory(req: IngestMemoryReq) -> CommandResponse:
 
 @app.get('/ingest-memory/contract', dependencies=[Depends(verify_auth)])
 def ingest_contract() -> dict[str, object]:
+    arch = detect_architecture()
     return {
-        'mode': 'lancedb-only',
+        'mode': arch.name,
         'content_source': 'server-side-canonical-sources',
         'storage_location': 'Canonical LanceDB rows live under WORKSPACE/tasks/rag/containers/<container>/lancedb.',
         'retrieval_scope': 'Retrieval runs server-side against LanceDB only.',
@@ -472,6 +548,15 @@ def job_status(pid: int) -> JobStatusResponse:
 @app.post('/documents/text', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
     validate_container_name(req.container)
+    arch = detect_architecture()
+    if not arch.modules['lightrag'].ready:
+        missing = arch.modules['lightrag'].missing_keys
+        pkg = '' if arch.modules['lightrag'].package_available else ' lightrag/raganything package not installed.'
+        return QueryResponse(
+            status='error', query='', container=req.container,
+            answer=f'LightRAG not available.{pkg} Missing keys: {", ".join(missing)}' if missing else f'LightRAG not available.{pkg}',
+            mode='insert',
+        )
     try:
         rag = await ensure_rag_initialized(req.container)
         await rag.lightrag.ainsert(req.text)
@@ -495,6 +580,15 @@ async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
 @app.post('/query', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
+    arch = detect_architecture()
+    if not arch.modules['lightrag'].ready:
+        missing = arch.modules['lightrag'].missing_keys
+        pkg = '' if arch.modules['lightrag'].package_available else ' lightrag/raganything package not installed.'
+        return QueryResponse(
+            status='error', query=req.query, container=req.container,
+            answer=f'LightRAG not available.{pkg} Missing keys: {", ".join(missing)}' if missing else f'LightRAG not available.{pkg}',
+            mode=req.mode,
+        )
     try:
         rag = await ensure_rag_initialized(req.container)
         from lightrag import QueryParam

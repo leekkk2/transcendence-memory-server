@@ -31,6 +31,8 @@ def load_server(workspace: Path, monkeypatch, extra_env: dict[str, str] | None =
     sys.modules.pop("task_rag_server", None)
     sys.modules.pop("task_rag_server_models", None)
     sys.modules.pop("rag_engine", None)
+    sys.modules.pop("arch_detect", None)
+    sys.modules.pop("scripts.arch_detect", None)
 
     return importlib.import_module("scripts.task_rag_server")
 
