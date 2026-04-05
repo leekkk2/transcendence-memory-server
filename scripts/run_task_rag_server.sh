@@ -10,7 +10,7 @@ export WORKSPACE="$WORKSPACE_VALUE"
 
 # load env
 set -a
-[ -f "$HOME/.openclaw/.env" ] && source "$HOME/.openclaw/.env" || true
+[ -f "$SERVER_ROOT/.env" ] && source "$SERVER_ROOT/.env" || true
 set +a
 
 source .venv-task-rag-server/bin/activate

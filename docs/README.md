@@ -27,7 +27,4 @@
 - [Both Identity (Backend 阶段)](identity/identity-both.md)
 
 ## 参考配置
-- [Nginx 反代配置](nginx-rag.zweiteng.tk.conf)
-
-## 演进
-- [Evolution](evolution/README.md)
+- [反向代理模板](deployment/reverse-proxy.md)

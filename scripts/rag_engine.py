@@ -24,7 +24,7 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", API_KEY)
 VLM_MODEL = os.environ.get("VLM_MODEL", "qwen3-vl-plus")
 VLM_BASE_URL = os.environ.get("VLM_BASE_URL", BASE_URL)
 VLM_API_KEY = os.environ.get("VLM_API_KEY", API_KEY)
-WS = Path(os.environ.get("WORKSPACE", "/home/ubuntu/.openclaw/workspace"))
+WS = Path(os.environ.get("WORKSPACE", Path(__file__).resolve().parents[1]))
 RAG_SEARCH_MODE = os.environ.get("RAG_SEARCH_MODE", "hybrid")
 
 # --- Container -> RAGAnything 实例缓存 ---
