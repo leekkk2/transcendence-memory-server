@@ -22,5 +22,27 @@ memory_archive/
 
 # Build artifacts
 dist/
+build/
 *.egg-info/
 src/*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+htmlcov/
+.coverage
+coverage.xml
+
+# Secrets (defensive)
+.env.*
+!.env.example
+*.pem
+*.key
