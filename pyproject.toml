@@ -20,10 +20,6 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
-[project.urls]
-Homepage = "https://github.com/leekkk2/transcendence-memory-server"
-Repository = "https://github.com/leekkk2/transcendence-memory-server"
-Issues = "https://github.com/leekkk2/transcendence-memory-server/issues"
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
@@ -34,6 +30,11 @@ dependencies = [
     "pyarrow>=12.0.0",
     "lightrag-hku>=1.4.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/leekkk2/transcendence-memory-server"
+Repository = "https://github.com/leekkk2/transcendence-memory-server"
+Issues = "https://github.com/leekkk2/transcendence-memory-server/issues"
 
 [project.optional-dependencies]
 multimodal = ["raganything>=1.2.0"]
