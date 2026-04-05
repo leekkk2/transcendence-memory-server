@@ -16,32 +16,68 @@ Transcendence Memory Server 是一个自托管的、为 AI Agent 量身定制的
 
 ---
 
-## 🛠️ 快速开始
+## 🛠️ 快速部署
 
-### 1. 启动服务 (Docker)
+### Docker (推荐)
+
 ```bash
-cp .env.example .env  # 填入你的 LLM/Embedding API Key
-docker-compose up -d
+cp .env.example .env
+# 编辑 .env，填入 API Key 和 Endpoint
+docker compose up -d
+curl http://localhost:8711/health
 ```
 
-### 2. 生成连接令牌
+### 本地运行
+
 ```bash
-tm-server export-token
+./scripts/bootstrap_dev.sh
+# 导出环境变量
+export RAG_API_KEY="your-key" 
+export EMBEDDING_API_KEY="your-key"
+# 启动
+./scripts/run_task_rag_server.sh
 ```
-*复制输出的 Token，用于在 [transcendence-memory](../transcendence-memory/README.md) 中进行初始化配置。*
+
+---
+
+## 💻 CLI 指令
+
+```bash
+tm-server start              # 启动服务 (默认 0.0.0.0:8711)
+tm-server start --port 9000  # 自定义端口
+tm-server health             # 健康检查
+tm-server export-token       # 导出 connection token
+```
 
 ---
 
 ## 📡 API 概览
 
-| 端点 | 说明 | 核心用途 |
+| 端点 | 方法 | 说明 |
 | :--- | :--- | :--- |
-| `POST /search` | 语义检索 | Agent 查找历史背景、决策依据 |
-| `POST /embed` | 索引重建 | 将最新 Task/Docs 同步至向量库 |
-| `POST /ingest-memory/objects` | 强类型写入 | 存储结构化、可追溯的记忆对象 |
-| `POST /ingest-structured` | 结构化导入 | 批量导入 JSON/知识库数据 |
+| `/health` | GET | 健康检查 (匿名) |
+| `/search` | POST | 语义检索 |
+| `/embed` | POST | 向量索引重建 |
+| `/ingest-memory` | POST | LanceDB 记忆写入 |
+| `/ingest-memory/objects` | POST | Typed object 写入 |
+| `/ingest-structured` | POST | 结构化 JSON 写入 |
+| `/export-connection-token` | GET | 导出连接令牌 |
 
-*详见 [API Contract](docs/api-contract.md)*。
+---
+
+## ⚙️ 配置说明 (Environment Variables)
+
+所有配置均建议通过 `.env` 文件或环境变量注入，系统不再预设特定私有域名的默认值。
+
+| 环境变量 | 说明 | 示例/建议值 |
+| :--- | :--- | :--- |
+| `RAG_API_KEY` | 服务端鉴权密钥 | (必填) |
+| `EMBEDDING_BASE_URL` | Embedding API 地址 | `https://api.openai.com/v1` |
+| `EMBEDDING_API_KEY` | Embedding API 密钥 | (必填) |
+| `EMBEDDING_MODEL` | Embedding 模型名 | `text-embedding-3-small` |
+| `LLM_BASE_URL` | LLM API 地址 | `https://api.openai.com/v1` |
+| `LLM_API_KEY` | LLM API 密钥 | (必填) |
+| `WORKSPACE` | 数据存储根目录 | `./data` |
 
 ---
 
