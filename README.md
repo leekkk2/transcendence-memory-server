@@ -1,102 +1,190 @@
-# 🧠 Transcendence Memory Server
+# Transcendence Memory Server
 
-> **The Persistent Substrate for Multi-Agent Intelligence.**
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
 
-Transcendence Memory Server 是一个自托管的、为 AI Agent 量身定制的 **记忆中心 (Memory Cloud)**。它利用 RAG (检索增强生成) 技术，为长期运行的 Agent 提供跨会话的任务状态保存、决策跟踪和知识检索能力。
+> **Self-hosted multimodal RAG cloud memory service — a shared brain for your AI agents.**
 
----
+[中文文档](README.zh-CN.md)
 
-## 🚀 核心架构
+Transcendence Memory Server is a cloud memory backend that multiple AI agents connect to simultaneously. Each agent stores its own memories in isolated containers, while being able to cross-query other agents' knowledge — turning isolated AI sessions into a collaborative, persistent knowledge network.
 
-- **RAG 引擎**: 基于 **LanceDB** 的 server-side 向量检索，支持秒级增量索引。
-- **存储对象**: 支持 Task Cards (任务卡)、Markdown 记忆片段、Typed Objects (强类型对象) 以及任意结构化 JSON。
-- **多租户隔离**: 通过 `Container` 机制实现不同项目或 Agent 空间的物理隔离。
-- **知识图谱 (Alpha)**: 集成 LightRAG，支持实体关系抽取与深度关联检索。
-- **一键连接**: 独特的 Connection Token 机制，让客户端技能 [transcendence-memory](../transcendence-memory/README.md) 能够即插即用。
+```
+  Agent A (Claude Code)          Agent B (Codex CLI)          Agent C (OpenClaw)
+       |                              |                              |
+       |  store & search own          |  store & search own          |  store & search own
+       |  cross-query B, C            |  cross-query A, C            |  cross-query A, B
+       |                              |                              |
+       +------------------------------+------------------------------+
+                                      |
+                         Transcendence Memory Server
+                         +-------------------------+
+                         |  Container: agent-a      |
+                         |  Container: agent-b      |
+                         |  Container: agent-c      |
+                         |  Container: shared       |
+                         +-------------------------+
+```
 
----
+## Why Cloud Memory?
 
-## 🛠️ 快速部署
+| Problem | Without | With Transcendence |
+|---------|---------|-------------------|
+| Session ends | Memory lost | Persisted to cloud, recoverable anytime |
+| Switch agents | Start from zero | New agent inherits context via search |
+| Cross-project | Knowledge siloed | Agent B queries Agent A's decisions |
+| Team of agents | Each works in isolation | Shared container for collective knowledge |
+| Onboarding | Re-explain everything | Agent reads past decisions and rationale |
 
-### Docker (推荐)
+## Features
+
+- **Multi-Agent Cloud Memory** — one server, many agents; each stores its own, each can query others
+- **Container Isolation** — per-agent or per-project namespaces with full CRUD; shared containers for team knowledge
+- **LanceDB Vector Search** — sub-second semantic retrieval over task cards, memory objects, and structured data
+- **LightRAG Knowledge Graph** — entity/relation extraction with hybrid retrieval (local + global + keyword)
+- **RAG-Anything Multimodal** — PDF, image, and table parsing with vision model support
+- **Auto-Detect Architecture** — automatically enables capabilities based on configured API keys
+- **Connection Token** — one-step client setup; give each agent a token and it's connected
+- **Zero Permission Issues** — Docker named volumes, no bind mount headaches
+
+## Architecture Tiers
+
+The server auto-detects its capability tier based on your `.env` configuration:
+
+| Tier | Required Keys | Capabilities |
+|------|--------------|-------------|
+| `lancedb-only` | `EMBEDDING_API_KEY` | Vector search, typed objects, structured ingest |
+| `lancedb+lightrag` | + `LLM_API_KEY` | + Knowledge graph, entity extraction, hybrid queries |
+| `rag-everything` | + `VLM_API_KEY` | + PDF/image/table parsing, vision model queries |
+
+## Quick Start
+
+### Docker (recommended)
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填入 API Key 和 Endpoint
-docker compose up -d
+git clone https://github.com/leekkk2/transcendence-memory-server.git
+cd transcendence-memory-server
+cp .env.example .env    # edit with your API keys
+docker compose up -d --build
 curl http://localhost:8711/health
 ```
 
-### 本地运行
+### Production (VPS + Nginx)
+
+```bash
+# Preflight check
+bash scripts/preflight_check.sh
+
+# Deploy with localhost-only binding
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+### Connect Your Agents
+
+Once the server is running, each agent gets its own connection token:
+
+```bash
+# Export a token for Agent A
+curl -sS "http://localhost:8711/export-connection-token?container=agent-a" \
+  -H "X-API-KEY: your-key"
+
+# Export a token for Agent B (different container)
+curl -sS "http://localhost:8711/export-connection-token?container=agent-b" \
+  -H "X-API-KEY: your-key"
+
+# Export a shared container token (for cross-agent collaboration)
+curl -sS "http://localhost:8711/export-connection-token?container=shared" \
+  -H "X-API-KEY: your-key"
+```
+
+Give each token to the corresponding agent. With the [transcendence-memory](https://github.com/leekkk2/transcendence-memory) skill installed, the agent runs `/tm connect <token>` and it's ready.
+
+### Local Development
 
 ```bash
 ./scripts/bootstrap_dev.sh
-# 导出环境变量
-export RAG_API_KEY="your-key" 
+export RAG_API_KEY="your-key"
 export EMBEDDING_API_KEY="your-key"
-# 启动
 ./scripts/run_task_rag_server.sh
 ```
 
----
+## API Overview
 
-## 💻 CLI 指令
+### Text Memory (Lightweight Path)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check with module status (public) |
+| `/search` | POST | Semantic vector search |
+| `/embed` | POST | Rebuild LanceDB index |
+| `/ingest-memory/objects` | POST | Store typed memory objects |
+| `/ingest-structured` | POST | Structured JSON ingest |
+| `/containers/{c}/memories/{id}` | PUT/DELETE | Update/delete individual memories |
+
+### Multimodal RAG (Knowledge Graph Path)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/documents/text` | POST | Ingest text into knowledge graph |
+| `/documents/upload` | POST | Upload PDF/image/MD files |
+| `/query` | POST | RAG query with LLM-generated answer |
+
+### Management
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/containers` | GET | List all containers |
+| `/containers/{name}` | DELETE | Delete a container |
+| `/export-connection-token` | GET | Export credentials for client setup |
+| `/jobs/{pid}` | GET | Check async task status |
+
+All endpoints except `/health` require authentication via `X-API-KEY` or `Authorization: Bearer` header.
+
+## Configuration
+
+All settings via `.env` file (see [.env.example](.env.example)):
+
+| Variable | Required | Tier | Description |
+|----------|----------|------|-------------|
+| `RAG_API_KEY` | Yes | All | API authentication key |
+| `EMBEDDING_API_KEY` | Yes | All | Embedding model API key |
+| `EMBEDDING_BASE_URL` | No | All | Embedding endpoint (default: OpenAI) |
+| `EMBEDDING_MODEL` | No | All | Model name (default: gemini-embedding-001) |
+| `LLM_API_KEY` | No | lightrag+ | LLM API key for knowledge graph |
+| `LLM_MODEL` | No | lightrag+ | LLM model (default: gemini-2.5-flash) |
+| `VLM_API_KEY` | No | everything | Vision model API key |
+| `VLM_MODEL` | No | everything | Vision model (default: qwen3-vl-plus) |
+
+## CLI
 
 ```bash
-tm-server start              # 启动服务 (默认 0.0.0.0:8711)
-tm-server start --port 9000  # 自定义端口
-tm-server health             # 健康检查
-tm-server export-token       # 导出 connection token
+pip install -e .
+tm-server start              # Start server (default 0.0.0.0:8711)
+tm-server start --port 9000  # Custom port
+tm-server health             # Health check
+tm-server export-token       # Export connection token
 ```
 
----
+## Client Skill
 
-## 📡 API 概览
+Pair with [transcendence-memory](https://github.com/leekkk2/transcendence-memory) — an agent skill that provides built-in commands (`/tm connect`, `/tm search`, `/tm remember`, `/tm query`) for Claude Code, OpenClaw, Codex CLI, and other AI coding agents.
 
-| 端点 | 方法 | 说明 |
-| :--- | :--- | :--- |
-| `/health` | GET | 健康检查 (匿名) |
-| `/search` | POST | 语义检索 |
-| `/embed` | POST | 向量索引重建 |
-| `/ingest-memory` | POST | LanceDB 记忆写入 |
-| `/ingest-memory/objects` | POST | Typed object 写入 |
-| `/ingest-structured` | POST | 结构化 JSON 写入 |
-| `/export-connection-token` | GET | 导出连接令牌 |
+## Documentation
 
----
+- [Quick Start](docs/deployment/quickstart.md)
+- [Docker Deployment](docs/deployment/docker-deployment.md)
+- [Reverse Proxy](docs/deployment/reverse-proxy.md)
+- [Environment Reference](docs/deployment/environment-reference.md)
+- [API Contract](docs/api-contract.md)
+- [Health Check](docs/operations/health-check.md)
+- [Troubleshooting](docs/operations/troubleshooting.md)
+- [Development Bootstrap](docs/development-bootstrap.md)
 
-## ⚙️ 配置说明 (Environment Variables)
+## Contributing
 
-所有配置均建议通过 `.env` 文件或环境变量注入，系统不再预设特定私有域名的默认值。
-
-| 环境变量 | 说明 | 示例/建议值 |
-| :--- | :--- | :--- |
-| `RAG_API_KEY` | 服务端鉴权密钥 | (必填) |
-| `EMBEDDING_BASE_URL` | Embedding API 地址 | `https://api.openai.com/v1` |
-| `EMBEDDING_API_KEY` | Embedding API 密钥 | (必填) |
-| `EMBEDDING_MODEL` | Embedding 模型名 | `text-embedding-3-small` |
-| `LLM_BASE_URL` | LLM API 地址 | `https://api.openai.com/v1` |
-| `LLM_API_KEY` | LLM API 密钥 | (必填) |
-| `WORKSPACE` | 数据存储根目录 | `./data` |
-
----
-
-## 🔗 配套生态
-
-本服务端作为“记忆大脑”，需要配合以下客户端技能来实现完整的 Agent 增强：
-
-- **核心技能端**: [transcendence-memory](../transcendence-memory/README.md) —— 提供 AI Agent 使用的自然语言指令集。
-
----
-
-## 📖 文档索引
-
-- [API 契约](docs/api-contract.md)
-- [部署指南 (Docker/Systemd)](docs/deployment/docker-deployment.md)
-- [演进历史 (RAG Evolution)](docs/evolution/README.md)
-- [开发者快速入门](docs/development-bootstrap.md)
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md). Pull requests welcome.
 
 ## License
-MIT
+
+[MIT](LICENSE)
