@@ -50,8 +50,8 @@ export WORKSPACE="$PWD"
 export RAG_API_KEY="replace-me"
 export EMBEDDING_API_KEY="replace-me"
 export EMBEDDING_MODEL="gemini-embedding-001"
-export EMBEDDING_BASE_URL="https://newapi.zweiteng.tk/v1"    # runtime 当前优先读取
-export EMBEDDINGS_BASE_URL="https://newapi.zweiteng.tk/v1"   # canonical 名称，建议同时设置保持一致
+export EMBEDDING_BASE_URL="https://api.openai.com/v1"        # runtime 当前优先读取
+export EMBEDDINGS_BASE_URL="https://api.openai.com/v1"       # canonical 名称，建议同时设置保持一致
 export GOOGLE_EMBEDDING_BASE_URL="https://generativelanguage.googleapis.com/v1beta/models"
 ```
 

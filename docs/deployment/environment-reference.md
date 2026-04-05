@@ -28,7 +28,7 @@
 source ./scripts/load_rag_config.sh
 ```
 
-该脚本从 `~/.openclaw/workspace/tools/rag-config.json`（或 `RAG_CONFIG_FILE` 覆盖路径）导出：
+该脚本从 `~/.config/transcendence-memory/rag-config.json`（或 `RAG_CONFIG_FILE` 覆盖路径）导出：
 - `RAG_ENDPOINT`
 - `RAG_AUTH_HEADER`
 - `RAG_API_KEY`
