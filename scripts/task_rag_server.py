@@ -230,6 +230,9 @@ def child_env() -> dict[str, str]:
     env = os.environ.copy()
     if env.get('EMBEDDING_BASE_URL') and not env.get('EMBEDDINGS_BASE_URL'):
         env['EMBEDDINGS_BASE_URL'] = env['EMBEDDING_BASE_URL']
+    # Force UTF-8 for subprocess JSON I/O so Windows pipes can safely carry non-ASCII text.
+    env.setdefault('PYTHONUTF8', '1')
+    env.setdefault('PYTHONIOENCODING', 'utf-8')
     return env
 
 
@@ -239,7 +242,15 @@ def run(cmd: list[str], timeout_s: int) -> CommandResponse:
         return CommandResponse(command=cmd, code=127, stderr=f'script not found: {script}')
     real_cmd = [sys.executable, *cmd] if cmd[0].endswith('.py') else cmd
     try:
-        completed = subprocess.run(real_cmd, capture_output=True, text=True, timeout=timeout_s, env=child_env())
+        completed = subprocess.run(
+            real_cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=timeout_s,
+            env=child_env(),
+        )
         return CommandResponse(command=real_cmd, code=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
     except subprocess.TimeoutExpired as exc:
         return CommandResponse(
@@ -485,7 +496,7 @@ def write_memory_objects(container: str, rows: list[dict]) -> Path:
     with tmp_path.open('w', encoding='utf-8') as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + '\n')
-    tmp_path.rename(path)
+    tmp_path.replace(path)
     return path
 
 
