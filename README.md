@@ -100,6 +100,14 @@ curl -sS "http://localhost:8711/export-connection-token?container=shared" \
 
 Give each token to the corresponding agent. With the [transcendence-memory](https://github.com/leekkk2/transcendence-memory) skill installed, the agent runs `/tm connect <token>` and it's ready.
 
+`/export-connection-token` now returns three layers of onboarding material:
+
+- `token`: backward-compatible base64 connection token for `/tm connect <token>`
+- `pairing_auth`: explicit endpoint / api_key / container values for manual pairing
+- `agent_onboarding`: exact prompts the AI should show the user before importing, plus the auth facts it should proactively disclose
+
+For AI-assisted setup, do not silently import the token. Surface `agent_onboarding.collect_from_user` first, then tell the user which endpoint, container, and auth mode will be written into the local skill config.
+
 ### Local Development
 
 ```bash
@@ -136,7 +144,7 @@ export EMBEDDING_API_KEY="your-key"
 |----------|--------|-------------|
 | `/containers` | GET | List all containers |
 | `/containers/{name}` | DELETE | Delete a container |
-| `/export-connection-token` | GET | Export credentials for client setup |
+| `/export-connection-token` | GET | Export token, manual pairing auth info, and AI onboarding prompts |
 | `/jobs/{pid}` | GET | Check async task status |
 
 All endpoints except `/health` require authentication via `X-API-KEY` or `Authorization: Bearer` header.

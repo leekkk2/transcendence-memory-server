@@ -100,6 +100,14 @@ curl -sS "http://localhost:8711/export-connection-token?container=shared" \
 
 将 token 交给对应的 Agent。安装了 [transcendence-memory](https://github.com/leekkk2/transcendence-memory) 技能后，Agent 执行 `/tm connect <token>` 即可连接。
 
+现在 `/export-connection-token` 会同时返回三层引导材料：
+
+- `token`：兼容现有 `/tm connect <token>` 的 base64 连接令牌
+- `pairing_auth`：供手动配对使用的 `endpoint / api_key / container`
+- `agent_onboarding`：AI 在安装引导时应先向用户展示的采集提示，以及应主动告知用户的鉴权事实
+
+如果是 AI 辅助安装，不应静默导入 token。应先展示 `agent_onboarding.collect_from_user` 中的问题，再明确告知用户最终会写入本地技能配置的 endpoint、container 和鉴权模式。
+
 ### 本地开发
 
 ```bash
@@ -136,7 +144,7 @@ export EMBEDDING_API_KEY="your-key"
 |------|------|------|
 | `/containers` | GET | 列出所有容器 |
 | `/containers/{name}` | DELETE | 删除容器 |
-| `/export-connection-token` | GET | 导出客户端连接凭证 |
+| `/export-connection-token` | GET | 导出 token、手动配对鉴权材料与 AI 安装引导提示 |
 | `/jobs/{pid}` | GET | 查询异步任务状态 |
 
 除 `/health` 外，所有端点均需通过 `X-API-KEY` 或 `Authorization: Bearer` 头认证。
