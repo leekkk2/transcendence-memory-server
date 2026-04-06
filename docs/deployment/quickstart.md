@@ -78,16 +78,14 @@ BUILD_TARGET=full docker compose up -d --build
 
 后端部署完成后，不能只给前端一个 URL，至少应同时交付：
 
-1. `bundle.json`（由 `backend export-connection` 生成）
+1. 连接材料（优先使用 server 原生 `/export-connection-token` 响应；如仍保留独立 backend CLI，再额外导出 bundle）
 2. 当前前端应使用的鉴权模式
 3. 前端仍需本地补齐的鉴权材料
 4. 前端下一步应执行的命令顺序
 
 如果走 server 原生 `/export-connection-token` 流程，优先把响应里的 `pairing_auth` 与 `agent_onboarding` 一并交给接入方 AI，而不是只转发一个 token。
 
-```bash
-transcendence-memory backend export-connection --topology split_machine --output bundle.json
-```
+如项目仍保留独立 `backend export-connection` CLI，可将其视为兼容性补充路径，而不是优先入口。
 
 ## Backend Acceptance
 
