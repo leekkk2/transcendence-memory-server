@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "transcendence-memory-server"
-version = "0.3.2"
+version = "0.3.3"
 description = "Self-hosted multimodal RAG memory service with LanceDB + RAG-Anything"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
