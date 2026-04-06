@@ -1,5 +1,7 @@
 # 生产环境 overlay — 配合 Nginx 反代使用
-# 用法：docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# 用法：
+#   默认 lite: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#   full 模式: BUILD_TARGET=full docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 services:
   rag-server:
     ports:

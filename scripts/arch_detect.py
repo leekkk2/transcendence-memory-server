@@ -23,6 +23,9 @@ class ArchitectureInfo:
     """整体架构检测结果。"""
 
     name: str
+    build_flavor: str = 'lite'
+    multimodal_capable: bool = False
+    degraded_reasons: list[str] = field(default_factory=list)
     modules: dict[str, ModuleInfo] = field(default_factory=dict)
     configured_keys: list[str] = field(default_factory=list)
     missing_keys: list[str] = field(default_factory=list)
@@ -30,6 +33,14 @@ class ArchitectureInfo:
 
 
 _cached: ArchitectureInfo | None = None
+
+
+def detect_build_flavor(*, has_raganything: bool) -> str:
+    """检测当前镜像/环境的构建规格。"""
+    flavor = os.environ.get('TM_BUILD_FLAVOR', '').strip().lower()
+    if flavor in {'lite', 'full'}:
+        return flavor
+    return 'full' if has_raganything else 'lite'
 
 
 def detect_architecture(*, use_cache: bool = True) -> ArchitectureInfo:
@@ -48,6 +59,7 @@ def detect_architecture(*, use_cache: bool = True) -> ArchitectureInfo:
     has_lancedb = importlib.util.find_spec('lancedb') is not None
     has_lightrag = importlib.util.find_spec('lightrag') is not None
     has_raganything = importlib.util.find_spec('raganything') is not None
+    build_flavor = detect_build_flavor(has_raganything=has_raganything)
 
     # 环境变量
     embedding_key = bool(os.environ.get('EMBEDDING_API_KEY'))
@@ -89,6 +101,15 @@ def detect_architecture(*, use_cache: bool = True) -> ArchitectureInfo:
     else:
         arch_name = 'lancedb-only'
 
+    degraded_reasons: list[str] = []
+    if build_flavor == 'lite' and vlm_key:
+        degraded_reasons.append('multimodal configured while running lite build')
+    if build_flavor == 'full' and not has_raganything:
+        degraded_reasons.append('full build missing raganything package')
+    if build_flavor == 'full' and not has_lightrag:
+        degraded_reasons.append('full build missing lightrag package')
+    multimodal_capable = build_flavor == 'full' and has_raganything and has_lightrag
+
     # key 汇总
     all_keys = {
         'RAG_API_KEY': bool(os.environ.get('RAG_API_KEY')),
@@ -99,6 +120,9 @@ def detect_architecture(*, use_cache: bool = True) -> ArchitectureInfo:
 
     info = ArchitectureInfo(
         name=arch_name,
+        build_flavor=build_flavor,
+        multimodal_capable=multimodal_capable,
+        degraded_reasons=degraded_reasons,
         modules={'lancedb': lancedb_mod, 'lightrag': lightrag_mod, 'multimodal': multimodal_mod},
         configured_keys=[k for k, v in all_keys.items() if v],
         missing_keys=[k for k, v in all_keys.items() if not v],

@@ -53,6 +53,12 @@ curl -sS http://127.0.0.1:8711/health
 
 详见 [docker-deployment.md](docker-deployment.md)。
 
+默认构建规格为 `lite`。如果下一步就是多模态解析或 `rag-everything` 链路，请在启动前显式设置：
+
+```bash
+BUILD_TARGET=full docker compose up -d --build
+```
+
 ## 反向代理
 
 详见 [reverse-proxy.md](reverse-proxy.md)。
@@ -64,7 +70,8 @@ curl -sS http://127.0.0.1:8711/health
 ## 当前 Runtime 口径
 
 - 默认端口：`8711`
-- 主链架构：**LanceDB-only**
+- 默认构建规格：**lite**
+- 运行时架构：按 key + 包可用性动态检测
 - 认证方式：`X-API-KEY` header 或 `Authorization: Bearer`
 
 ## 部署后必须交给前端的信息

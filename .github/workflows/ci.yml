@@ -2,10 +2,10 @@ name: CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ["v*.*.*"]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
   test:
@@ -20,6 +20,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: pytest tests/ -v
+
+  docker-validate:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [lite, full]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.flavor }} image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: ${{ matrix.flavor }}
+          push: false
+          load: false
 
   publish-pypi:
     needs: test
@@ -40,28 +57,34 @@ jobs:
           twine upload dist/*
 
   publish-docker:
-    needs: test
+    needs: [test, docker-validate]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [lite, full]
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest
+      - name: Compute Docker tags
+        id: tags
+        run: |
+          image="${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server"
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${{ matrix.flavor }}" = "lite" ]; then
+            echo "tags=${image}:${version}-lite,${image}:lite,${image}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${image}:${version}-full,${image}:full" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
+          target: ${{ matrix.flavor }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.tags.outputs.tags }}

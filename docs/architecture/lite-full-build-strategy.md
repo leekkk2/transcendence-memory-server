@@ -1,5 +1,7 @@
 # Lite / Full 构建策略设计文档
 
+> 当前状态（2026-04-06）：Docker 多 target、`BUILD_TARGET=full` 切换、health flavor 字段、CI 双规格构建/发布已落地；Compose profile 方案未实现，当前以显式 `BUILD_TARGET` 作为唯一支持入口。
+
 > 目标：在 **同一服务边界** 下，为 `transcendence-memory-server` 提供 `lite` / `full` 两种构建规格，并通过 Docker 多 target + Compose profile / 参数切换完成统一部署。
 
 ## 1. 设计目标
@@ -93,26 +95,21 @@
 
 ### 4.2 Compose 切换方式
 
-推荐支持两种切换：
+当前已实现的切换方式：
 
 #### 方式 A：build target 参数
 ```bash
-docker compose build --build-arg BUILD_FLAVOR=lite
+docker compose up -d --build
 ```
 或
 ```bash
 BUILD_TARGET=full docker compose up -d --build
 ```
 
-#### 方式 B：Compose profile
-```bash
-docker compose up -d
-COMPOSE_PROFILES=full docker compose up -d
-```
-
-推荐最终实现：
+当前约定：
 - 默认：lite
-- profile=full 或 target=full 时：full
+- `BUILD_TARGET=full` 时：full
+- Compose profile 未实现，不作为当前对外承诺
 
 ---
 
@@ -125,7 +122,7 @@ COMPOSE_PROFILES=full docker compose up -d
 例如：
 - `VLM_API_KEY` 代表用户想启用 multimodal
 - 但如果当前构建规格是 lite，则 health 应明确提示：
-  - `multimodal configured but package not installed in lite build`
+  - `multimodal configured while running lite build`
 
 ### 原则
 - **build flavor 决定依赖集合**
@@ -225,19 +222,19 @@ pip install git+https://github.com/HKUDS/RAG-Anything.git
 ## 9. 推荐实施步骤
 
 ### Phase 1：最小可行实现
-- Dockerfile 支持 lite/full target
-- docker-compose 支持 target/profile 切换
-- health 增加 build flavor 信息
+- [x] Dockerfile 支持 lite/full target
+- [x] docker-compose 支持 target 切换
+- [x] health 增加 build flavor 信息
 
 ### Phase 2：文档完善
-- README / deployment / troubleshooting 补齐 lite/full 说明
+- [x] README / deployment / troubleshooting 补齐 lite/full 说明
 
 ### Phase 3：CI 与发布
-- CI 分别构建 lite/full
-- 发布镜像标签：
+- [x] CI 分别构建 lite/full
+- [x] 发布镜像标签：
   - `:lite`
   - `:full`
-  - `:latest` 默认指向 lite 或明确策略
+  - `:latest` 默认指向 lite
 
 ---
 
@@ -258,12 +255,9 @@ pip install git+https://github.com/HKUDS/RAG-Anything.git
 
 ---
 
-## 11. 后续落地建议（供下一次实现使用）
+## 11. Remaining Gaps
 
-下一次真正改代码时，建议按以下顺序提交：
-1. Dockerfile 多 target 改造
-2. docker-compose.yml / docker-compose.prod.yml 接入 target/profile
-3. health 增加 `build_flavor`
-4. README / docs 对齐
-5. CI build matrix（lite/full）
-
+当前仍未落地：
+1. Compose profile 方式的切换
+2. 更完整的 Docker daemon 级 end-to-end 构建验收
+3. 体积/耗时基准的正式记录

@@ -1,12 +1,15 @@
 services:
   rag-server:
-    build: .
+    build:
+      context: .
+      target: ${BUILD_TARGET:-lite}
     ports:
       - "${TM_PORT:-8711}:8711"
     volumes:
       - tm-data:/data
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - WORKSPACE=/data
     restart: unless-stopped
