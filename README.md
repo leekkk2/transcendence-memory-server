@@ -70,6 +70,13 @@ BUILD_TARGET=full docker compose up -d --build
 
 `/health` reports the active `build_flavor`, whether the runtime is `multimodal_capable`, and any `degraded_reasons`.
 
+## Platform Support
+
+- **Python package** — CI validates installation and tests on `Linux`, `macOS`, and `Windows` with Python `3.11`, `3.12`, and `3.13`
+- **Docker images** — published for `linux/amd64` and `linux/arm64`
+- **macOS / Windows hosts** — supported through Docker Desktop running Linux containers
+- **Native non-Linux containers** — no native macOS container image exists, and no native Windows container image is published for this project
+
 ## Architecture Tiers
 
 The server auto-detects its capability tier based on your `.env` configuration:
@@ -83,6 +90,8 @@ The server auto-detects its capability tier based on your `.env` configuration:
 ## Quick Start
 
 ### Docker (recommended)
+
+Docker Desktop on macOS and Windows is supported as long as it is running Linux containers. Intel hosts will typically pull `linux/amd64`; Apple Silicon and Windows on Arm can pull `linux/arm64`.
 
 ```bash
 git clone https://github.com/leekkk2/transcendence-memory-server.git
