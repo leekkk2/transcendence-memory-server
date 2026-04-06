@@ -1,2 +1,2 @@
 """Transcendence Memory Server — self-hosted multimodal RAG memory service."""
-__version__ = "0.3.2"
+__version__ = "0.3.3"
