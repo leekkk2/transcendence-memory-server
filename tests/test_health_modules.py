@@ -82,3 +82,32 @@ def test_runtime_ready_includes_query(tmp_path, monkeypatch):
     data = resp.json()
     assert 'query' in data['runtime_ready']
     assert 'documents_text' in data['runtime_ready']
+
+
+def test_health_returns_build_fields(tmp_path, monkeypatch):
+    """health 端点应返回构建规格相关字段。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch, {'TM_BUILD_FLAVOR': 'lite'})
+    client = TestClient(server.app)
+    resp = client.get('/health')
+    data = resp.json()
+    assert data['build_flavor'] == 'lite'
+    assert 'multimodal_capable' in data
+    assert 'degraded_reasons' in data
+
+
+def test_health_warns_when_vlm_used_in_lite_build(tmp_path, monkeypatch):
+    """lite 构建下启用 VLM 时应返回降级原因。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch, {
+        'TM_BUILD_FLAVOR': 'lite',
+        'EMBEDDING_API_KEY': 'test-key',
+        'LLM_API_KEY': 'test-llm-key',
+        'VLM_API_KEY': 'test-vlm-key',
+    })
+    client = TestClient(server.app)
+    resp = client.get('/health')
+    data = resp.json()
+    assert data['build_flavor'] == 'lite'
+    assert any('lite build' in reason for reason in data['degraded_reasons'])
+    assert any('lite build' in warning for warning in data['warnings'])

@@ -107,6 +107,9 @@ class HealthResponse(BaseModel):
     status: Literal['ok']
     service: str
     architecture: str
+    build_flavor: Literal['lite', 'full']
+    multimodal_capable: bool
+    degraded_reasons: list[str] = Field(default_factory=list)
     workspace: str
     containers_root: str
     auth_configured: bool
