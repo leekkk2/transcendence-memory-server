@@ -1,64 +1,64 @@
-# 环境变量参考 / Environment Reference
+# Environment Variable Reference
 
-## 必需变量
+## Required Variables
 
-| 变量 | 说明 | 示例 |
-|------|------|------|
-| `WORKSPACE` | 运行时根目录，包含 `tasks/`、`memory/` 等 | `$PWD`（server 仓库根目录） |
-| `RAG_API_KEY` | API 认证密钥 | `sk-xxx` |
-| `EMBEDDING_API_KEY` | Embedding provider 密钥 | `sk-xxx` |
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `WORKSPACE` | Runtime root directory containing `tasks/`, `memory/`, etc. | `$PWD` (server repository root) |
+| `RAG_API_KEY` | API authentication key | `sk-xxx` |
+| `EMBEDDING_API_KEY` | Embedding provider key | `sk-xxx` |
 
-## Embedding 相关变量
+## Embedding Variables
 
-| 变量 | 说明 | 优先级 |
-|------|------|--------|
-| `EMBEDDING_BASE_URL` | Embedding provider endpoint | 最高（runtime 优先读取） |
-| `EMBEDDINGS_BASE_URL` | Embedding provider endpoint（canonical 名称） | 次高 |
-| `EMBEDDING_MODEL` | Embedding 模型名称 | `gemini-embedding-001` |
-| `GOOGLE_EMBEDDING_BASE_URL` | Google embedding endpoint（备选） | — |
+| Variable | Description | Priority |
+|----------|-------------|----------|
+| `EMBEDDING_BASE_URL` | Embedding provider endpoint | Highest (read first by runtime) |
+| `EMBEDDINGS_BASE_URL` | Embedding provider endpoint (canonical name) | Second highest |
+| `EMBEDDING_MODEL` | Embedding model name | `gemini-embedding-001` |
+| `GOOGLE_EMBEDDING_BASE_URL` | Google embedding endpoint (fallback) | — |
 
-> **注意**：当前 runtime 解析顺序为 `EMBEDDING_BASE_URL` → `EMBEDDINGS_BASE_URL` → 默认值。
-> 本地调试时建议两个变量同时设置为同一值，避免 shell 环境中残留旧值导致歧义。
+> **Note**: The current runtime resolution order is `EMBEDDING_BASE_URL` → `EMBEDDINGS_BASE_URL` → default value.
+> During local debugging, it is recommended to set both variables to the same value to avoid ambiguity caused by stale values in the shell environment.
 
-## RAG 配置加载
+## RAG Configuration Loading
 
-如果使用 `load_rag_config.sh` 加载配置：
+If using `load_rag_config.sh` to load configuration:
 
 ```bash
 source ./scripts/load_rag_config.sh
 ```
 
-该脚本从 `~/.config/transcendence-memory/rag-config.json`（或 `RAG_CONFIG_FILE` 覆盖路径）导出：
+This script exports the following from `~/.config/transcendence-memory/rag-config.json` (or the path overridden by `RAG_CONFIG_FILE`):
 - `RAG_ENDPOINT`
 - `RAG_AUTH_HEADER`
 - `RAG_API_KEY`
 - `RAG_DEFAULT_CONTAINER`
 
-## 运行时目录结构
+## Runtime Directory Structure
 
 ```
 $WORKSPACE/
 ├── tasks/
-│   ├── active/          # 活跃任务卡
-│   ├── archived/        # 归档任务卡
+│   ├── active/          # Active task cards
+│   ├── archived/        # Archived task cards
 │   └── rag/
 │       └── containers/
-│           └── <name>/  # 每个 container 的 LanceDB 数据
-├── memory/              # Markdown memory 文件
-└── memory_archive/      # 归档 memory
+│           └── <name>/  # LanceDB data for each container
+├── memory/              # Markdown memory files
+└── memory_archive/      # Archived memory
 ```
 
-## 服务端口
+## Service Port
 
-| 配置项 | 默认值 |
-|--------|--------|
-| 监听端口 | `8711` |
-| 监听地址 | `0.0.0.0` |
+| Setting | Default |
+|---------|---------|
+| Listen port | `8711` |
+| Listen address | `0.0.0.0` |
 
-## 认证方式
+## Authentication
 
-支持两种 header：
+Two header formats are supported:
 - `X-API-KEY: <RAG_API_KEY>`
 - `Authorization: Bearer <RAG_API_KEY>`
 
-`/health` 端点为匿名访问，业务端点需要认证。
+The `/health` endpoint allows anonymous access; business endpoints require authentication.
