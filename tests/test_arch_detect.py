@@ -96,3 +96,35 @@ def test_reset_cache(monkeypatch):
     mod.detect_architecture(use_cache=False)
     mod.reset_cache()
     assert mod._cached is None
+
+
+def test_lite_build_reports_degraded_when_vlm_configured(monkeypatch):
+    """lite 构建下配置了 VLM 时应报告降级原因。"""
+    mod = _load_arch_detect(monkeypatch, {
+        'EMBEDDING_API_KEY': 'test-key',
+        'LLM_API_KEY': 'test-llm-key',
+        'VLM_API_KEY': 'test-vlm-key',
+        'TM_BUILD_FLAVOR': 'lite',
+    })
+    arch = mod.detect_architecture(use_cache=False)
+    assert arch.build_flavor == 'lite'
+    assert arch.multimodal_capable is False
+    assert any('lite build' in reason for reason in arch.degraded_reasons)
+
+
+def test_full_build_capable_when_multimodal_installed(monkeypatch):
+    """full 构建应根据 raganything 包是否存在报告 capability。"""
+    mod = _load_arch_detect(monkeypatch, {
+        'EMBEDDING_API_KEY': 'test-key',
+        'LLM_API_KEY': 'test-llm-key',
+        'VLM_API_KEY': 'test-vlm-key',
+        'TM_BUILD_FLAVOR': 'full',
+    })
+    arch = mod.detect_architecture(use_cache=False)
+    assert arch.build_flavor == 'full'
+    if arch.modules['multimodal'].package_available:
+        assert arch.multimodal_capable is True
+        assert arch.degraded_reasons == []
+    else:
+        assert arch.multimodal_capable is False
+        assert any('full build' in reason for reason in arch.degraded_reasons)

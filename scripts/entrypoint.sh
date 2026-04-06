@@ -11,6 +11,9 @@ echo "  Transcendence Memory Server — starting"
 echo "========================================================"
 echo ""
 
+BUILD_FLAVOR="${TM_BUILD_FLAVOR:-lite}"
+echo "  Build Flavor: ${BUILD_FLAVOR}"
+
 # 必需配置检查
 missing_required=0
 if [ -z "$RAG_API_KEY" ]; then
@@ -35,9 +38,12 @@ if [ -n "$VLM_API_KEY" ]; then
 else
     echo "  [--] VLM_API_KEY not set -> Multimodal RAG disabled"
 fi
+if [ "$BUILD_FLAVOR" = "lite" ] && [ -n "$VLM_API_KEY" ]; then
+    echo "  [WARN] Multimodal is configured while running the lite build"
+fi
 
 echo ""
-if [ "$missing_required" -eq 0 ] && [ -n "$LLM_API_KEY" ] && [ -n "$VLM_API_KEY" ]; then
+if [ "$missing_required" -eq 0 ] && [ "$BUILD_FLAVOR" = "full" ] && [ -n "$LLM_API_KEY" ] && [ -n "$VLM_API_KEY" ]; then
     echo "  -> Architecture: rag-everything (full)"
 elif [ "$missing_required" -eq 0 ] && [ -n "$LLM_API_KEY" ]; then
     echo "  -> Architecture: lancedb+lightrag"

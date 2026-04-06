@@ -40,6 +40,7 @@ Transcendence Memory Server is a cloud memory backend that multiple AI agents co
 ## Features
 
 - **Multi-Agent Cloud Memory** — one server, many agents; each stores its own, each can query others
+- **Lite / Full Build Flavors** — default `lite` image, optional `full` image for multimodal dependencies
 - **Container Isolation** — per-agent or per-project namespaces with full CRUD; shared containers for team knowledge
 - **LanceDB Vector Search** — sub-second semantic retrieval over task cards, memory objects, and structured data
 - **LightRAG Knowledge Graph** — entity/relation extraction with hybrid retrieval (local + global + keyword)
@@ -47,6 +48,27 @@ Transcendence Memory Server is a cloud memory backend that multiple AI agents co
 - **Auto-Detect Architecture** — automatically enables capabilities based on configured API keys
 - **Connection Token** — one-step client setup; give each agent a token and it's connected
 - **Zero Permission Issues** — Docker named volumes, no bind mount headaches
+
+## Build Flavors
+
+The server now exposes two build flavors:
+
+| Flavor | Default | Includes |
+|--------|---------|----------|
+| `lite` | Yes | FastAPI, LanceDB, LightRAG, typed ingest, connection token export |
+| `full` | No | `lite` + `raganything` multimodal dependencies |
+
+Switch flavors at build time:
+
+```bash
+# default
+docker compose up -d --build
+
+# full multimodal build
+BUILD_TARGET=full docker compose up -d --build
+```
+
+`/health` reports the active `build_flavor`, whether the runtime is `multimodal_capable`, and any `degraded_reasons`.
 
 ## Architecture Tiers
 
@@ -66,6 +88,7 @@ The server auto-detects its capability tier based on your `.env` configuration:
 git clone https://github.com/leekkk2/transcendence-memory-server.git
 cd transcendence-memory-server
 cp .env.example .env    # edit with your API keys
+# optional: BUILD_TARGET=full for multimodal package set
 docker compose up -d --build
 curl http://localhost:8711/health
 ```
@@ -76,6 +99,7 @@ curl http://localhost:8711/health
 # Preflight check
 bash scripts/preflight_check.sh
 
+# optional: BUILD_TARGET=full
 # Deploy with localhost-only binding
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
