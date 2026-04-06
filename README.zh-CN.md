@@ -70,6 +70,13 @@ BUILD_TARGET=full docker compose up -d --build
 
 `/health` 会显式返回 `build_flavor`、`multimodal_capable` 和 `degraded_reasons`。
 
+## 平台支持
+
+- **Python 包** — CI 会在 `Linux`、`macOS`、`Windows` 上，对 Python `3.11`、`3.12`、`3.13` 进行安装与测试验证
+- **Docker 镜像** — 发布 `linux/amd64` 与 `linux/arm64`
+- **macOS / Windows 宿主机** — 通过 Docker Desktop 运行 Linux 容器来支持
+- **非 Linux 原生容器** — 本项目不会发布原生 macOS 容器镜像，也不会发布原生 Windows 容器镜像
+
 ## 架构层级
 
 服务根据 `.env` 配置自动检测能力层级：
@@ -83,6 +90,8 @@ BUILD_TARGET=full docker compose up -d --build
 ## 快速开始
 
 ### Docker（推荐）
+
+如果你在 macOS 或 Windows 上使用 Docker Desktop，只要当前运行的是 Linux containers 模式，就可以直接部署本服务。Intel 宿主机通常拉取 `linux/amd64`，Apple Silicon 与 Windows on Arm 可拉取 `linux/arm64`。
 
 ```bash
 git clone https://github.com/leekkk2/transcendence-memory-server.git
