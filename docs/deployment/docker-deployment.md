@@ -28,6 +28,17 @@ BUILD_TARGET=full docker compose up -d --build
 
 建议把 `BUILD_TARGET` 写入 `.env`，避免不同会话切换时出现构建口径漂移。
 
+### 平台支持边界
+
+- Docker 发布镜像：`linux/amd64`、`linux/arm64`
+- Linux 宿主机：原生 Docker Engine 直接运行
+- macOS 宿主机：通过 Docker Desktop 运行 Linux 容器
+- Windows 宿主机：通过 Docker Desktop / WSL2 运行 Linux 容器
+- 不发布原生 macOS 容器镜像
+- 不发布原生 Windows 容器镜像
+
+如果你使用的是 Apple Silicon Mac，建议直接拉取 `linux/arm64` 多架构镜像；Intel Mac 与常见 x64 Windows 主机通常会自动匹配 `linux/amd64`。
+
 ### 设备特定提醒
 
 某些宿主机上，Docker 已安装但当前会话可能无法直接访问 Docker daemon，需要改走 sudo 路径：
