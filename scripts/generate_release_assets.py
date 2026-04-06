@@ -59,6 +59,11 @@ def docker_image_repository() -> str:
     return "transcendence-memory-server"
 
 
+def docker_image_platforms() -> list[str]:
+    raw = os.environ.get("DOCKER_IMAGE_PLATFORMS", "linux/amd64,linux/arm64")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def build_release_notes(
     *,
     tag: str,
@@ -66,6 +71,7 @@ def build_release_notes(
     commit_sha: str,
     repository: str,
     image_repository: str,
+    docker_platforms: list[str],
     previous: str | None,
     distributions: list[str],
     commits: list[dict[str, str]],
@@ -89,6 +95,10 @@ def build_release_notes(
         f"- `{image_repository}:lite`",
         f"- `{image_repository}:full`",
         f"- `{image_repository}:latest` -> lite",
+        f"- Published Linux image platforms: {', '.join(f'`{item}`' for item in docker_platforms)}",
+        "- macOS hosts: supported through Docker Desktop running Linux containers",
+        "- Windows hosts: supported through Docker Desktop / WSL2 running Linux containers",
+        "- Native macOS or native Windows container images are not published",
         "",
         "## 附件产物",
     ]
@@ -108,7 +118,7 @@ def build_release_notes(
     return "\n".join(lines)
 
 
-def build_docker_notes(*, tag: str, version: str, image_repository: str) -> str:
+def build_docker_notes(*, tag: str, version: str, image_repository: str, docker_platforms: list[str]) -> str:
     return "\n".join(
         [
             f"# Docker Image Tags for {tag}",
@@ -118,6 +128,9 @@ def build_docker_notes(*, tag: str, version: str, image_repository: str) -> str:
             f"- `{image_repository}:lite`",
             f"- `{image_repository}:full`",
             f"- `{image_repository}:latest` -> lite",
+            f"- Linux image platforms: {', '.join(docker_platforms)}",
+            "- Host support: Linux Docker Engine, Docker Desktop on macOS, Docker Desktop / WSL2 on Windows",
+            "- Native macOS or native Windows container images are not published",
             "",
         ]
     )
@@ -136,6 +149,7 @@ def main() -> None:
 
     repository = os.environ.get("GITHUB_REPOSITORY", "leekkk2/transcendence-memory-server").strip()
     image_repository = docker_image_repository()
+    docker_platforms = docker_image_platforms()
     commit_sha = os.environ.get("GITHUB_SHA", "").strip() or run_git("rev-parse", "HEAD")
     previous = previous_tag(tag)
     commits = collect_commits(previous)
@@ -158,6 +172,7 @@ def main() -> None:
             commit_sha=commit_sha,
             repository=repository,
             image_repository=image_repository,
+            docker_platforms=docker_platforms,
             previous=previous,
             distributions=distributions,
             commits=commits,
@@ -165,7 +180,12 @@ def main() -> None:
         encoding="utf-8",
     )
     docker_path.write_text(
-        build_docker_notes(tag=tag, version=version, image_repository=image_repository),
+        build_docker_notes(
+            tag=tag,
+            version=version,
+            image_repository=image_repository,
+            docker_platforms=docker_platforms,
+        ),
         encoding="utf-8",
     )
     manifest_path.write_text(
@@ -188,6 +208,13 @@ def main() -> None:
                     "channel_full": f"{image_repository}:full",
                     "latest": f"{image_repository}:latest",
                     "latest_points_to": "lite",
+                    "platforms": docker_platforms,
+                    "host_support": {
+                        "linux": "native Docker Engine",
+                        "macos": "Docker Desktop running Linux containers",
+                        "windows": "Docker Desktop / WSL2 running Linux containers",
+                    },
+                    "native_non_linux_images": False,
                 },
                 "python_distributions": distributions,
                 "commits": commits,
