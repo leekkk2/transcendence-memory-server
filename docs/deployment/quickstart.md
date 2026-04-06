@@ -1,107 +1,107 @@
-# 部署快速入门 / Deployment Quickstart
+# Deployment Quickstart
 
-## 身份优先
+## Identity First
 
-本页面向 **backend 身份** 或 **both 身份中的 backend 阶段**。
+This page is intended for **backend identity** or **the backend phase of a both identity**.
 
-- 如果当前机器是 `frontend`，请参考 transcendence-memory skill 的客户端文档
-- 先检查本地 `operator-identity.md`
-- 若身份文档缺失，先补录身份再继续部署
+- If the current machine is `frontend`, refer to the client documentation in the transcendence-memory skill
+- Check the local `operator-identity.md` first
+- If the identity document is missing, complete identity registration before proceeding with deployment
 
-## 前置条件
+## Prerequisites
 
 ```bash
 python3 --version    # >= 3.11
-docker --version     # 可选，Docker 部署时需要
+docker --version     # Optional, required for Docker deployment
 docker compose version
 ```
 
-确认：
-- Python 满足仓库要求（当前为 `>=3.11`）
-- 若使用 Docker 部署，Docker / Docker Compose 可用
-- 网络/代理路径可用（拉镜像或外部依赖时需要）
-- 当前会话是否能直接访问宿主机 Docker daemon
+Verify:
+- Python meets the repository requirement (currently `>=3.11`)
+- If using Docker deployment, Docker / Docker Compose are available
+- Network/proxy paths are available (needed when pulling images or external dependencies)
+- Whether the current session can directly access the host Docker daemon
 
-## 最短启动路径（裸机）
+## Shortest Startup Path (Bare Metal)
 
 ```bash
 cd transcendence-memory-server
 
-# 1. bootstrap 开发环境
+# 1. Bootstrap development environment
 ./scripts/bootstrap_dev.sh
 
-# 2. 设置环境变量
+# 2. Set environment variables
 export WORKSPACE="$PWD"
 export RAG_API_KEY="replace-me"
 export EMBEDDING_API_KEY="replace-me"
 export EMBEDDING_BASE_URL="https://your-embedding-endpoint/v1"
 export EMBEDDINGS_BASE_URL="https://your-embedding-endpoint/v1"
 
-# 3. 准备运行时目录
+# 3. Prepare runtime directories
 mkdir -p tasks/active tasks/archived tasks/rag/containers/imac memory memory_archive
 
-# 4. 启动服务
+# 4. Start the service
 ./scripts/run_task_rag_server.sh
-# 或手动：
+# Or manually:
 # uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 
-# 5. 健康检查
+# 5. Health check
 curl -sS http://127.0.0.1:8711/health
 ```
 
-## Docker 部署
+## Docker Deployment
 
-详见 [docker-deployment.md](docker-deployment.md)。
+See [docker-deployment.md](docker-deployment.md) for details.
 
-默认构建规格为 `lite`。如果下一步就是多模态解析或 `rag-everything` 链路，请在启动前显式设置：
+The default build target is `lite`. If the next step involves multimodal parsing or the `rag-everything` pipeline, explicitly set the build target before starting:
 
 ```bash
 BUILD_TARGET=full docker compose up -d --build
 ```
 
-## 反向代理
+## Reverse Proxy
 
-详见 [reverse-proxy.md](reverse-proxy.md)。
+See [reverse-proxy.md](reverse-proxy.md) for details.
 
-## 环境变量
+## Environment Variables
 
-完整参考见 [environment-reference.md](environment-reference.md)。
+See [environment-reference.md](environment-reference.md) for the full reference.
 
-## 当前 Runtime 口径
+## Current Runtime Specifications
 
-- 默认端口：`8711`
-- 默认构建规格：**lite**
-- 运行时架构：按 key + 包可用性动态检测
-- 认证方式：`X-API-KEY` header 或 `Authorization: Bearer`
+- Default port: `8711`
+- Default build target: **lite**
+- Runtime architecture: dynamic detection based on key + package availability
+- Authentication: `X-API-KEY` header or `Authorization: Bearer`
 
-## 部署后必须交给前端的信息
+## Information to Hand Off to Frontend After Deployment
 
-后端部署完成后，不能只给前端一个 URL，至少应同时交付：
+After backend deployment is complete, do not just give the frontend a URL. At minimum, provide the following:
 
-1. 连接材料（优先使用 server 原生 `/export-connection-token` 响应；如仍保留独立 backend CLI，再额外导出 bundle）
-2. 当前前端应使用的鉴权模式
-3. 前端仍需本地补齐的鉴权材料
-4. 前端下一步应执行的命令顺序
+1. Connection materials (prefer using the server's native `/export-connection-token` response; if a standalone backend CLI is still available, additionally export the bundle)
+2. The authentication mode the frontend should use
+3. Authentication materials the frontend still needs to prepare locally
+4. The command sequence the frontend should execute next
 
-如果走 server 原生 `/export-connection-token` 流程，优先把响应里的 `pairing_auth` 与 `agent_onboarding` 一并交给接入方 AI，而不是只转发一个 token。
+If using the server's native `/export-connection-token` flow, pass the `pairing_auth` and `agent_onboarding` from the response to the integrating AI, rather than just forwarding a token.
 
-如项目仍保留独立 `backend export-connection` CLI，可将其视为兼容性补充路径，而不是优先入口。
+If the project still has a standalone `backend export-connection` CLI, treat it as a compatibility fallback rather than the primary entry point.
 
 ## Backend Acceptance
 
-至少确认：
+Verify at minimum:
 - `GET /health` → 200
-- `POST /search` → 200 + 真实结果
+- `POST /search` → 200 + real results
 - `POST /embed` → 200 + success
-- 如目标链路依赖 typed ingest，再验证 `/ingest-memory/objects`
+- If the target pipeline depends on typed ingest, also verify `/ingest-memory/objects`
 
-## 排障入口
+## Troubleshooting
 
-优先排查：
-1. 当前说明是否仍与 canonical backend runtime 一致
-2. 环境是否满足 Python / Docker / 网络等前置条件
-3. 当前会话是否能访问 Docker daemon
-4. advertised endpoint 是否正确
-5. handoff / auth / smoke 路径是否闭合
+Check the following first:
+1. Whether the current documentation still matches the canonical backend runtime
+2. Whether the environment meets Python / Docker / network prerequisites
+3. Whether the current session can access the Docker daemon
+4. Whether the advertised endpoint is correct
+5. Whether the handoff / auth / smoke paths are complete
 
-详见 [troubleshooting.md](../operations/troubleshooting.md)。
+See [troubleshooting.md](../operations/troubleshooting.md) for details.
