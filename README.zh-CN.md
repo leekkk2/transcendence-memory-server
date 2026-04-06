@@ -70,6 +70,13 @@ BUILD_TARGET=full docker compose up -d --build
 
 `/health` 会显式返回 `build_flavor`、`multimodal_capable` 和 `degraded_reasons`。
 
+## 平台支持
+
+- **Python 包** — CI 会在 `Linux`、`macOS`、`Windows` 上，对 Python `3.11`、`3.12`、`3.13` 进行安装与测试验证
+- **Docker 镜像** — 发布 `linux/amd64` 与 `linux/arm64`
+- **macOS / Windows 宿主机** — 通过 Docker Desktop 运行 Linux 容器来支持
+- **非 Linux 原生容器** — 本项目不会发布原生 macOS 容器镜像，也不会发布原生 Windows 容器镜像
+
 ## 架构层级
 
 服务根据 `.env` 配置自动检测能力层级：
@@ -83,6 +90,8 @@ BUILD_TARGET=full docker compose up -d --build
 ## 快速开始
 
 ### Docker（推荐）
+
+如果你在 macOS 或 Windows 上使用 Docker Desktop，只要当前运行的是 Linux containers 模式，就可以直接部署本服务。Intel 宿主机通常拉取 `linux/amd64`，Apple Silicon 与 Windows on Arm 可拉取 `linux/arm64`。
 
 ```bash
 git clone https://github.com/leekkk2/transcendence-memory-server.git
@@ -131,6 +140,64 @@ curl -sS "http://localhost:8711/export-connection-token?container=shared" \
 - `agent_onboarding`：AI 在安装引导时应先向用户展示的采集提示，以及应主动告知用户的鉴权事实
 
 如果是 AI 辅助安装，不应静默导入 token。应先展示 `agent_onboarding.collect_from_user` 中的问题，再明确告知用户最终会写入本地技能配置的 endpoint、container 和鉴权模式。
+
+### AI 辅助安装（懒人提示语，复制即用）
+
+不想看文档？复制下面的提示语模板，填入你自己的信息，粘贴给你的 AI 助手（Claude Code、Codex CLI、Cursor 等）—— 它会帮你搞定一切。
+
+<details>
+<summary><strong>点击展开提示语模板</strong></summary>
+
+```text
+请为我全新安装并配置 transcendence-memory-server 后端服务，要求如下：
+
+1. 使用仓库：
+   https://github.com/leekkk2/transcendence-memory-server
+
+2. 部署目标：
+   • 服务域名：<你的域名>                    # 例如 memory.example.com，仅本机使用填 localhost
+   • 反向代理：Nginx                         # 仅本机使用可删除此行
+   • 后端监听：127.0.0.1:8711
+   • 对外访问入口：https://<你的域名>          # 仅本机使用可删除
+
+3. 构建规格（二选一）：
+   • lite   — 默认，文本记忆 + 向量检索 + 知识图谱
+   • full   — lite 全部能力 + 多模态（PDF/图片/表格解析，集成 RAG-Anything）
+
+4. LLM / Embedding / 视觉模型配置：
+   • LLM_BASE_URL=<你的 LLM 服务地址>        # 例如 https://api.openai.com/v1
+   • LLM_API_KEY=<你的 LLM 密钥>
+   • LLM_MODEL=<你的 LLM 模型>               # 例如 gpt-4o、claude-sonnet-4-20250514、gemini-2.5-flash
+   • EMBEDDING_BASE_URL=<你的 Embedding 服务地址>
+   • EMBEDDING_API_KEY=<你的 Embedding 密钥>
+   • EMBEDDING_MODEL=<你的 Embedding 模型>    # 例如 text-embedding-3-small、gemini-embedding-001
+   • VLM_API_KEY=<你的视觉模型密钥>            # 可选，仅 full 构建需要
+   • VLM_MODEL=<你的视觉模型>                 # 例如 gpt-4o、qwen3-vl-plus
+
+5. 部署要求：
+   • 构建规格：<lite 或 full>
+   • 正确写入 .env
+   • 设置 RAG_ADVERTISED_ENDPOINT=https://<你的域名>  # 仅本机使用可删除
+   • 确保服务启动后可长期运行
+   • Nginx 将域名反代到 127.0.0.1:8711                # 仅本机使用可删除
+
+6. 安装完成后必须验证：
+   • 本机健康检查：http://127.0.0.1:8711/health
+   • 外网健康检查：https://<你的域名>/health            # 仅本机使用可删除
+
+7. 安装完成后请输出：
+   • 实际部署路径
+   • 实际监听端口
+   • 健康检查结果
+   • 技能端可直接使用的 connection string
+   • 默认 container 名称：<你的容器名>  # 例如 eva、my-agent
+
+执行安装、配置、启动、验证，并输出最终可用结果。不要省略 connection string。
+```
+
+</details>
+
+> **提示**：仅在本机部署且不需要域名时，删除标注 `# 仅本机使用可删除` 的行即可。最小化部署（仅向量检索）只需填写 `EMBEDDING_*` 相关密钥，`LLM_*` 和 `VLM_*` 为可选项，配置后自动解锁更高的[架构层级](#架构层级)。
 
 ### 本地开发
 

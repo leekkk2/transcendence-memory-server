@@ -70,6 +70,13 @@ BUILD_TARGET=full docker compose up -d --build
 
 `/health` reports the active `build_flavor`, whether the runtime is `multimodal_capable`, and any `degraded_reasons`.
 
+## Platform Support
+
+- **Python package** — CI validates installation and tests on `Linux`, `macOS`, and `Windows` with Python `3.11`, `3.12`, and `3.13`
+- **Docker images** — published for `linux/amd64` and `linux/arm64`
+- **macOS / Windows hosts** — supported through Docker Desktop running Linux containers
+- **Native non-Linux containers** — no native macOS container image exists, and no native Windows container image is published for this project
+
 ## Architecture Tiers
 
 The server auto-detects its capability tier based on your `.env` configuration:
@@ -83,6 +90,8 @@ The server auto-detects its capability tier based on your `.env` configuration:
 ## Quick Start
 
 ### Docker (recommended)
+
+Docker Desktop on macOS and Windows is supported as long as it is running Linux containers. Intel hosts will typically pull `linux/amd64`; Apple Silicon and Windows on Arm can pull `linux/arm64`.
 
 ```bash
 git clone https://github.com/leekkk2/transcendence-memory-server.git
@@ -131,6 +140,65 @@ Give each token to the corresponding agent. With the [transcendence-memory](http
 - `agent_onboarding`: exact prompts the AI should show the user before importing, plus the auth facts it should proactively disclose
 
 For AI-assisted setup, do not silently import the token. Surface `agent_onboarding.collect_from_user` first, then tell the user which endpoint, container, and auth mode will be written into the local skill config.
+
+### AI-Assisted Setup (Copy & Paste Prompt)
+
+Don't want to read the docs? Copy the prompt below, fill in the placeholders, and paste it to your AI assistant (Claude Code, Codex CLI, Cursor, etc.) — it will handle the rest.
+
+<details>
+<summary><strong>Click to expand the prompt template</strong></summary>
+
+```text
+Please install and configure transcendence-memory-server for me:
+
+1. Repository:
+   https://github.com/leekkk2/transcendence-memory-server
+
+2. Deployment target:
+   • Service domain: <YOUR_DOMAIN>          # e.g. memory.example.com, or "localhost" for local-only
+   • Reverse proxy: Nginx                    # remove this line if local-only
+   • Backend listen: 127.0.0.1:8711
+   • Public URL: https://<YOUR_DOMAIN>       # remove if local-only
+
+3. Build flavor (pick one):
+   • lite   — default, text memory + vector search + knowledge graph
+   • full   — lite + multimodal (PDF/image/table parsing via RAG-Anything)
+
+4. LLM / Embedding / Vision config:
+   • LLM_BASE_URL=<YOUR_LLM_ENDPOINT>       # e.g. https://api.openai.com/v1
+   • LLM_API_KEY=<YOUR_LLM_KEY>
+   • LLM_MODEL=<YOUR_LLM_MODEL>             # e.g. gpt-4o, claude-sonnet-4-20250514, gemini-2.5-flash
+   • EMBEDDING_BASE_URL=<YOUR_EMBED_ENDPOINT>
+   • EMBEDDING_API_KEY=<YOUR_EMBED_KEY>
+   • EMBEDDING_MODEL=<YOUR_EMBED_MODEL>      # e.g. text-embedding-3-small, gemini-embedding-001
+   • VLM_API_KEY=<YOUR_VLM_KEY>              # optional, only needed for "full" build
+   • VLM_MODEL=<YOUR_VLM_MODEL>              # e.g. gpt-4o, qwen3-vl-plus
+
+5. Deployment requirements:
+   • Build flavor: <lite or full>
+   • Write .env correctly
+   • Set RAG_ADVERTISED_ENDPOINT=https://<YOUR_DOMAIN>   # remove if local-only
+   • Ensure service runs persistently
+   • Nginx reverse proxy to 127.0.0.1:8711               # remove if local-only
+
+6. Post-install verification:
+   • Local health check:  http://127.0.0.1:8711/health
+   • Public health check: https://<YOUR_DOMAIN>/health    # remove if local-only
+
+7. After installation, output:
+   • Actual deployment path
+   • Actual listen port
+   • Health check result
+   • Connection string for the client skill
+   • Default container name: <YOUR_CONTAINER>  # e.g. eva, my-agent
+
+Execute install, configure, start, verify, and output the final usable result.
+Do not omit the connection string.
+```
+
+</details>
+
+> **Tip**: Remove lines marked `# remove if local-only` when deploying on localhost without a domain. For the minimal setup (vector search only), you only need `EMBEDDING_*` keys — `LLM_*` and `VLM_*` are optional and unlock higher [architecture tiers](#architecture-tiers).
 
 ### Local Development
 
