@@ -132,11 +132,36 @@ class ClientIngestResponse(BaseModel):
 # --- 多模态 RAG 集成新增模型 ---
 
 
+class OnboardingPromptResponse(BaseModel):
+    id: str
+    title: str
+    prompt: str
+    reason: str
+
+
+class PairingAuthResponse(BaseModel):
+    mode: Literal['api_key']
+    endpoint: str
+    api_key: str
+    container: str
+    accepted_headers: list[str] = Field(default_factory=list)
+    token_transport: str
+    config_path: str
+
+
+class AgentOnboardingResponse(BaseModel):
+    collect_from_user: list[OnboardingPromptResponse] = Field(default_factory=list)
+    tell_user: list[str] = Field(default_factory=list)
+    recommended_commands: list[str] = Field(default_factory=list)
+
+
 class ConnectionTokenResponse(BaseModel):
     token: str
     endpoint: str
     container: str
     note: str
+    pairing_auth: PairingAuthResponse
+    agent_onboarding: AgentOnboardingResponse
 
 
 class UpdateMemoryReq(BaseModel):

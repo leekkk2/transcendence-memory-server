@@ -21,6 +21,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 
 try:
     from task_rag_server_models import (
+        AgentOnboardingResponse,
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
@@ -37,6 +38,8 @@ try:
         MemoryDeleteResponse,
         MemoryUpdateResponse,
         ModuleStatusResponse,
+        OnboardingPromptResponse,
+        PairingAuthResponse,
         QueryReq,
         QueryResponse,
         SearchHit,
@@ -47,6 +50,7 @@ try:
     )
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.task_rag_server_models import (
+        AgentOnboardingResponse,
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
@@ -63,6 +67,8 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         MemoryDeleteResponse,
         MemoryUpdateResponse,
         ModuleStatusResponse,
+        OnboardingPromptResponse,
+        PairingAuthResponse,
         QueryReq,
         QueryResponse,
         SearchHit,
@@ -88,6 +94,7 @@ SERVER_SCRIPTS = Path(__file__).resolve().parent
 WORKSPACE_SCRIPTS = WS / 'scripts'
 RAG_API_KEY = os.environ.get('RAG_API_KEY', '')
 SERVER_STARTED_AT = time.time()
+SKILL_CONFIG_PATH = '~/.transcendence-memory/config.toml'
 
 
 def script_path(name: str) -> Path:
@@ -106,6 +113,55 @@ def container_root(container: str) -> Path:
 
 def memory_objects_path(container: str) -> Path:
     return container_root(container) / 'memory_objects.jsonl'
+
+
+def build_connection_onboarding(endpoint: str, container: str, api_key: str) -> tuple[PairingAuthResponse, AgentOnboardingResponse]:
+    pairing_auth = PairingAuthResponse(
+        mode='api_key',
+        endpoint=endpoint,
+        api_key=api_key,
+        container=container,
+        accepted_headers=['X-API-KEY', 'Authorization: Bearer <api_key>'],
+        token_transport='base64-json(endpoint, api_key, container)',
+        config_path=SKILL_CONFIG_PATH,
+    )
+    onboarding = AgentOnboardingResponse(
+        collect_from_user=[
+            OnboardingPromptResponse(
+                id='who_is_pairing_for',
+                title='确认使用主体',
+                prompt='这次要为哪个 Agent、设备或项目配对？如果你希望隔离记忆，请告诉我你想使用的名称。',
+                reason='帮助 AI 按 Agent / 设备 / 项目拆分命名空间，避免不同上下文写入同一 container。',
+            ),
+            OnboardingPromptResponse(
+                id='confirm_container',
+                title='确认 container',
+                prompt=f'我准备把你连接到 container "{container}"。如果你想改成别的命名空间，请现在告诉我。',
+                reason='让用户在导入前确认最终写入的 container。',
+            ),
+            OnboardingPromptResponse(
+                id='choose_pairing_mode',
+                title='选择配对方式',
+                prompt='你希望我直接导入 connection token，还是把 endpoint / api_key / container 展示给你手动配置？',
+                reason='有些用户偏好一键导入，有些用户需要显式查看和保存鉴权材料。',
+            ),
+            OnboardingPromptResponse(
+                id='confirm_local_write',
+                title='确认本地落盘',
+                prompt=f'继续后，技能端通常会把 endpoint、container 和 API key 写入 {SKILL_CONFIG_PATH}。是否继续？',
+                reason='让用户明确知道哪些配对信息会被写入本地配置。',
+            ),
+        ],
+        tell_user=[
+            f'当前 skill 端会连接到 endpoint "{endpoint}"，默认 container 为 "{container}"。',
+            '当前 skill 端鉴权模式为 api_key，服务端同时接受 X-API-KEY 与 Authorization: Bearer <api_key> 两种头部。',
+            '这次返回的 connection token 本质上是一个 base64 JSON，里面包含 endpoint、api_key、container 三项配对材料。',
+            '如果用户选择手动模式，请明确展示 pairing_auth 中的 endpoint、api_key、container，而不是只告诉用户 token 已生成。',
+            f'导入完成后，技能端通常会把这些信息写入 {SKILL_CONFIG_PATH}。',
+        ],
+        recommended_commands=['/tm connect <token-from-this-response>', '/tm connect --manual'],
+    )
+    return pairing_auth, onboarding
 
 
 def verify_auth(
@@ -432,11 +488,14 @@ def export_connection_token(container: str = DEFAULT_CONTAINER) -> ConnectionTok
     endpoint = os.environ.get('RAG_ADVERTISED_ENDPOINT', 'http://localhost:8711')
     payload = json.dumps({'endpoint': endpoint, 'api_key': RAG_API_KEY, 'container': container}, ensure_ascii=False)
     token = base64.b64encode(payload.encode('utf-8')).decode('ascii')
+    pairing_auth, agent_onboarding = build_connection_onboarding(endpoint, container, RAG_API_KEY)
     return ConnectionTokenResponse(
         token=token,
         endpoint=endpoint,
         container=container,
-        note='Base64-encoded connection token. Decode to get endpoint, api_key, container.',
+        note='Base64-encoded connection token plus onboarding prompts and explicit pairing auth material for AI-assisted setup.',
+        pairing_auth=pairing_auth,
+        agent_onboarding=agent_onboarding,
     )
 
 

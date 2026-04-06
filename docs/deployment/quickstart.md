@@ -76,6 +76,8 @@ curl -sS http://127.0.0.1:8711/health
 3. 前端仍需本地补齐的鉴权材料
 4. 前端下一步应执行的命令顺序
 
+如果走 server 原生 `/export-connection-token` 流程，优先把响应里的 `pairing_auth` 与 `agent_onboarding` 一并交给接入方 AI，而不是只转发一个 token。
+
 ```bash
 transcendence-memory backend export-connection --topology split_machine --output bundle.json
 ```

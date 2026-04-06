@@ -226,6 +226,49 @@ Response shape:
 }
 ```
 
+### `GET /export-connection-token`
+
+Export an agent pairing bundle. The legacy `token` field stays backward compatible, and the response now also includes:
+
+- `pairing_auth`: explicit `endpoint / api_key / container` values for manual setup
+- `agent_onboarding.collect_from_user`: exact user-facing prompts an AI installer should ask before importing
+- `agent_onboarding.tell_user`: auth facts the AI should proactively disclose instead of silently pairing
+
+Response shape:
+
+```json
+{
+  "token": "eyJlbmRwb2ludCI6Imh0dHBzOi8vcmFnLmV4YW1wbGUuY29tIiwiYXBpX2tleSI6InNrLXh4eCIsImNvbnRhaW5lciI6ImltYWMifQ==",
+  "endpoint": "https://rag.example.com",
+  "container": "imac",
+  "note": "Base64-encoded connection token plus onboarding prompts and explicit pairing auth material for AI-assisted setup.",
+  "pairing_auth": {
+    "mode": "api_key",
+    "endpoint": "https://rag.example.com",
+    "api_key": "sk-xxx",
+    "container": "imac",
+    "accepted_headers": ["X-API-KEY", "Authorization: Bearer <api_key>"],
+    "token_transport": "base64-json(endpoint, api_key, container)",
+    "config_path": "~/.transcendence-memory/config.toml"
+  },
+  "agent_onboarding": {
+    "collect_from_user": [
+      {
+        "id": "confirm_container",
+        "title": "确认 container",
+        "prompt": "我准备把你连接到 container \"imac\"。如果你想改成别的命名空间，请现在告诉我。",
+        "reason": "让用户在导入前确认最终写入的 container。"
+      }
+    ],
+    "tell_user": [
+      "当前 skill 端鉴权模式为 api_key。",
+      "connection token 内含 endpoint、api_key、container。"
+    ],
+    "recommended_commands": ["/tm connect <token-from-this-response>", "/tm connect --manual"]
+  }
+}
+```
+
 ## Repository evidence
 
 - `tests/test_task_rag_server_memory_objects.py` covers typed object persistence plus `/embed -> /search` retrieval on the LanceDB-only path
