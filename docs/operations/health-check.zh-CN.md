@@ -1,20 +1,20 @@
-# Health Check & Monitoring
+# 健康检查与监控 / Health Check & Monitoring
 
-## Quick Health Check
+## 快速健康检查
 
-### From the server host
+### 从服务端本机
 
 ```bash
 curl -sS http://127.0.0.1:8711/health
 ```
 
-### From the public endpoint
+### 从公网端点
 
 ```bash
 curl -sS https://your-memory-endpoint.example.com/health
 ```
 
-### Expected response
+### 预期响应
 
 ```json
 {
@@ -40,13 +40,13 @@ curl -sS https://your-memory-endpoint.example.com/health
 }
 ```
 
-Field descriptions:
+字段说明：
 
-- `build_flavor`: Current image variant, `lite` or `full`
-- `multimodal_capable`: Whether the current build actually has multimodal dependencies available
-- `degraded_reasons`: List of degradation reasons for the current build/config combination
+- `build_flavor`: 当前镜像规格，`lite` 或 `full`
+- `multimodal_capable`: 当前构建是否真正具备多模态依赖
+- `degraded_reasons`: 当前构建/配置组合下的降级原因列表
 
-## Full Verification Flow
+## 完整验证流程
 
 ```bash
 # 1. health
@@ -64,37 +64,37 @@ curl -sS -X POST http://127.0.0.1:8711/embed \
   -H "Content-Type: application/json" \
   -d '{"container":"imac","background":true}'
 
-# 4. typed ingest (as needed)
+# 4. typed ingest（按需）
 curl -sS -X POST http://127.0.0.1:8711/ingest-memory/objects \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"container":"imac","objects":[]}'
 ```
 
-## Service Status Check
+## 服务状态检查
 
-### Docker deployment
+### Docker 部署
 
 ```bash
 docker compose ps
 docker compose logs rag-server --tail=100
 ```
 
-### systemd deployment
+### systemd 部署
 
 ```bash
 systemctl status transcendence-memory-backend
 journalctl -u transcendence-memory-backend -n 100 --no-pager
 ```
 
-## Common Alert Reference
+## 常见告警解读
 
-| Symptom | Possible Cause |
-|---------|----------------|
-| `/health` returns `auth_configured: false` | `RAG_API_KEY` not set |
-| `/health` returns `embedding_configured: false` | `EMBEDDING_API_KEY` not set |
-| `/health` returns `lancedb_available: false` | LanceDB dependency missing or runtime directory unavailable |
-| `/health` returns `build_flavor: lite` with `degraded_reasons` mentioning lite build | VLM configured but image is still lite |
-| `/health` returns `build_flavor: full` with `multimodal_capable: false` | Full build missing `raganything` / `lightrag` dependencies |
-| `/health` unreachable | Service not running or port occupied |
-| Public `/health` returns 5xx | Reverse proxy misconfiguration or unhealthy backend |
+| 症状 | 可能原因 |
+|------|----------|
+| `/health` 返回 `auth_configured: false` | `RAG_API_KEY` 未设置 |
+| `/health` 返回 `embedding_configured: false` | `EMBEDDING_API_KEY` 未设置 |
+| `/health` 返回 `lancedb_available: false` | LanceDB 依赖缺失或运行时目录不可用 |
+| `/health` 返回 `build_flavor: lite` 且 `degraded_reasons` 提示 lite build | 已配置 VLM，但镜像仍是 lite |
+| `/health` 返回 `build_flavor: full` 且 `multimodal_capable: false` | full 构建缺少 `raganything` / `lightrag` 依赖 |
+| `/health` 不可达 | 服务未启动或端口被占用 |
+| 公网 `/health` 5xx | 反向代理配置问题或后端服务不健康 |

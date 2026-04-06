@@ -1,86 +1,86 @@
-# 服务端排障 / Server Troubleshooting
+# Server Troubleshooting
 
-## 排查优先级
+## Triage Priority
 
-按以下顺序排查：
+Investigate in the following order:
 
-1. 服务/容器状态
-2. 反向代理或 advertised URL 链路
-3. API key / auth header 一致性
-4. Provider 和运行时依赖
-5. 后端日志中的 search/embed/ingest 错误
-6. operator 文档是否与当前 backend runtime 真相一致
+1. Service / container status
+2. Reverse proxy or advertised URL connectivity
+3. API key / auth header consistency
+4. Provider and runtime dependencies
+5. search/embed/ingest errors in backend logs
+6. Whether operator documentation matches the actual backend runtime state
 
-## 常见问题
+## Common Issues
 
 ### 5xx at public endpoint
 
-通常是反向代理或后端健康问题：
+Usually a reverse proxy or backend health issue:
 
 ```bash
-# 检查后端服务状态
+# Check backend service status
 systemctl status transcendence-memory-backend
-# 或 Docker
+# Or Docker
 docker compose ps
 docker compose logs rag-server --tail=100
 
-# 检查 Nginx
+# Check Nginx
 nginx -t
 journalctl -u nginx -n 50
 ```
 
 ### 401 / 403
 
-API key 不匹配或 auth header 错误：
+API key mismatch or incorrect auth header:
 
 ```bash
-# 确认本机 RAG_API_KEY
+# Verify the local RAG_API_KEY
 echo $RAG_API_KEY
 
-# 直接测试
+# Direct test
 curl -sS -i http://127.0.0.1:8711/search \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"container":"imac","query":"test","topk":3}'
 ```
 
-### search 返回 HTTP 200 但 body 有错误
+### search returns HTTP 200 but body contains errors
 
-这不算成功，视为 rollout 失败。检查后端日志：
+This is not a success — treat it as a rollout failure. Check backend logs:
 
 ```bash
 journalctl -u transcendence-memory-backend -n 200 --no-pager | grep -i error
 ```
 
-### embed 失败
+### embed failure
 
-通常是 dependency / runtime / provider / persistence 问题：
+Usually a dependency / runtime / provider / persistence issue:
 
 ```bash
-# 确认 embedding 配置
+# Verify embedding configuration
 echo $EMBEDDING_API_KEY
 echo $EMBEDDING_BASE_URL
 
-# 检查日志
+# Check logs
 docker compose logs rag-server --tail=200 | grep -i embed
 ```
 
-### VLM 已配置但 multimodal 仍不可用
+### VLM configured but multimodal still unavailable
 
-先看 `/health`：
+Check `/health` first:
 
 ```bash
 curl -sS http://127.0.0.1:8711/health | python3 -m json.tool
 ```
 
-重点判断：
+Key indicators:
 
-- `build_flavor=lite`：说明你还在轻量构建，应重新用 `BUILD_TARGET=full docker compose up -d --build`
-- `build_flavor=full` 但 `multimodal_capable=false`：说明 full 镜像里的多模态依赖没有准备好，需要重建 full 镜像并检查构建日志
+- `build_flavor=lite`: You are still on the lite build. Rebuild with `BUILD_TARGET=full docker compose up -d --build`
+- `build_flavor=full` but `multimodal_capable=false`: The multimodal dependencies in the full image are not ready. Rebuild the full image and inspect the build logs
 
-### typed ingest 成功但 search 无结果
+### typed ingest succeeds but search returns no results
 
-确认 embed/indexing 已完成，目标 container 已初始化：
+Confirm that embed/indexing has completed and the target container is initialized:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8711/embed \
@@ -89,44 +89,44 @@ curl -sS -X POST http://127.0.0.1:8711/embed \
   -d '{"container":"imac","background":false,"wait":true}'
 ```
 
-### Docker daemon 不可访问
+### Docker daemon inaccessible
 
-不要立刻写成"主机没有 Docker"。先检查当前上下文是否需要 sudo：
+Do not immediately conclude that the host lacks Docker. First check whether the current context requires sudo:
 
 ```bash
 sudo docker compose ps
 sudo docker compose logs rag-server --tail=100
 ```
 
-这个判断是环境特定的，不应泛化成通用规则。
+This determination is environment-specific and should not be generalized into a universal rule.
 
-### full 构建失败
+### full build failure
 
-优先执行：
+Run this first:
 
 ```bash
 BUILD_TARGET=full docker compose build --no-cache
 ```
 
-然后检查：
+Then inspect:
 
 ```bash
 docker compose logs rag-server --tail=200
 ```
 
-若 `/health` 仍显示 `full build missing raganything package` 或 `full build missing lightrag package`，说明镜像构建没有真正产出完整依赖集。
+If `/health` still reports `full build missing raganything package` or `full build missing lightrag package`, the image build did not produce the complete dependency set.
 
 ### ModuleNotFoundError
 
-先完成项目级开发安装：
+Complete the project-level dev install first:
 
 ```bash
 ./scripts/bootstrap_dev.sh
 source .venv-task-rag-server/bin/activate
 ```
 
-## 命名边界提醒
+## Naming Boundary Reminder
 
-- Eva 生产实例 live unit：`rag-everything.service`
-- 公共部署资产 wrapper name：`transcendence-memory-backend`
-- 不要将这两个命名面合并
+- Eva production instance live unit: `rag-everything.service`
+- Public deployment asset wrapper name: `transcendence-memory-backend`
+- Do not merge these two naming surfaces
