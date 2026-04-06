@@ -271,14 +271,14 @@ tm-server export-token       # 导出连接令牌
 
 ## 文档
 
-- [快速入门](docs/deployment/quickstart.md)
-- [Docker 部署](docs/deployment/docker-deployment.md)
-- [反向代理](docs/deployment/reverse-proxy.md)
-- [环境变量参考](docs/deployment/environment-reference.md)
-- [API 契约](docs/api-contract.md)
-- [健康检查](docs/operations/health-check.md)
-- [排障指南](docs/operations/troubleshooting.md)
-- [开发快速入门](docs/development-bootstrap.md)
+- [快速入门](docs/deployment/quickstart.zh-CN.md)
+- [Docker 部署](docs/deployment/docker-deployment.zh-CN.md)
+- [反向代理](docs/deployment/reverse-proxy.zh-CN.md)
+- [环境变量参考](docs/deployment/environment-reference.zh-CN.md)
+- [API 契约](docs/api-contract.zh-CN.md)
+- [健康检查](docs/operations/health-check.zh-CN.md)
+- [排障指南](docs/operations/troubleshooting.zh-CN.md)
+- [开发快速入门](docs/development-bootstrap.zh-CN.md)
 
 ## 参与贡献
 

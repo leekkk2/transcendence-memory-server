@@ -1,19 +1,19 @@
-# 反向代理配置 / Reverse Proxy
+# Reverse Proxy Configuration
 
-## 概述
+## Overview
 
-生产环境推荐通过反向代理暴露 Memory API，提供 HTTPS 终止、域名绑定和访问控制。
+In production environments, it is recommended to expose the Memory API through a reverse proxy, providing HTTPS termination, domain binding, and access control.
 
-## Nginx 配置参考
+## Nginx Configuration Reference
 
-### 核心要点
+### Key Points
 
-1. 将外部 HTTPS 流量代理到本地 `127.0.0.1:8711`
-2. 配置 SSL 证书（推荐 Let's Encrypt / certbot）
-3. 设置适当的超时（embed 操作可能耗时较长）
-4. 传递原始 Host header 和客户端 IP
+1. Proxy external HTTPS traffic to local `127.0.0.1:8711`
+2. Configure SSL certificates (Let's Encrypt / certbot recommended)
+3. Set appropriate timeouts (embed operations may take longer)
+4. Forward the original Host header and client IP
 
-### 最小 Nginx 配置模板
+### Minimal Nginx Configuration Template
 
 ```nginx
 server {
@@ -30,31 +30,31 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # embed 操作可能耗时较长
+        # Embed operations may take longer
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
 }
 ```
 
-### 验证反向代理
+### Verify the Reverse Proxy
 
 ```bash
-# 从外部访问
+# Access from external network
 curl -sS https://your-memory-endpoint.example.com/health
 
-# 确认代理链路
+# Verify the proxy chain
 curl -sS -i https://your-memory-endpoint.example.com/search \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"container":"test","query":"hello","topk":3}'
 ```
 
-## split-machine 注意事项
+## Split-Machine Considerations
 
-在 split-machine 拓扑下导出连接信息时，`config.toml` 的 `advertised_url` 必须设为前端实际可达的公网域名/IP，不能使用 `127.0.0.1` / `localhost` / 私有网段。
+When exporting connection information in a split-machine topology, the `advertised_url` in `config.toml` must be set to the public domain/IP that the frontend can actually reach. Do not use `127.0.0.1` / `localhost` / private network addresses.
 
-## 相关文档
+## Related Documentation
 
-- [快速入门](quickstart.md)
-- [环境变量参考](environment-reference.md)
+- [Quickstart](quickstart.md)
+- [Environment Variable Reference](environment-reference.md)
