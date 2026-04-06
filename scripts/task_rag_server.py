@@ -189,6 +189,7 @@ def _startup_banner() -> None:
         '',
         '=' * 56,
         '  Transcendence Memory Server',
+        f'  Build Flavor: {arch.build_flavor}',
         f'  Architecture: {arch.name}',
         '-' * 56,
     ]
@@ -206,6 +207,10 @@ def _startup_banner() -> None:
         lines.append('  To unlock full rag-everything:')
         for key in arch.missing_keys:
             lines.append(f'    - Set {key} in .env')
+    if arch.degraded_reasons:
+        lines.append('-' * 56)
+        for reason in arch.degraded_reasons:
+            lines.append(f'  [WARN] {reason}')
     lines.append('=' * 56)
     lines.append('')
     for line in lines:
@@ -291,6 +296,7 @@ def health() -> HealthResponse:
 
     # 架构检测
     arch = detect_architecture()
+    warnings.extend(arch.degraded_reasons)
 
     # 模块状态
     modules_resp = {
@@ -313,6 +319,9 @@ def health() -> HealthResponse:
         status='ok',
         service='transcendence-memory-server',
         architecture=arch.name,
+        build_flavor=arch.build_flavor,
+        multimodal_capable=arch.multimodal_capable,
+        degraded_reasons=arch.degraded_reasons,
         workspace=str(WS),
         containers_root=str(containers),
         auth_configured=bool(RAG_API_KEY),
