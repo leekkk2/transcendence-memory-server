@@ -1,5 +1,9 @@
 FROM python:3.13-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir .
 RUN pip install --no-cache-dir \
     fastapi uvicorn httpx requests numpy \
     lancedb pyarrow lightrag-hku
@@ -13,6 +17,7 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY scripts/ ./scripts/
 COPY src/ ./src/
+COPY pyproject.toml README.md ./
 RUN chmod +x /app/scripts/entrypoint.sh
 RUN mkdir -p /data/tasks/active /data/tasks/archived /data/tasks/rag/containers /data/memory /data/memory_archive
 ENV WORKSPACE=/data
