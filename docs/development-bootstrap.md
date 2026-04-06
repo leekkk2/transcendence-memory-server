@@ -1,12 +1,12 @@
 # Development Bootstrap
 
-## 目标
+## Goal
 
-让当前仓库以最小代价进入“可本地启动、可解释、可继续演进”的 `LanceDB-only` server 开发状态。
+Get the repository into a locally runnable, understandable, and evolvable `LanceDB-only` server development state with minimal effort.
 
-## 前置依赖
+## Prerequisites
 
-- Python 3.11+（当前测试文件使用 `dict[str, str] | None` 等 3.10+ 语法，建议直接使用 3.11）
+- Python 3.11+ (test files use `dict[str, str] | None` and other 3.10+ syntax; 3.11 is recommended)
 - `pytest`
 - `httpx`
 - `fastapi`
@@ -16,52 +16,52 @@
 - `lancedb`
 - `pyarrow`
 
-推荐先跑项目内 bootstrap：
+It is recommended to run the in-repo bootstrap first:
 
 ```bash
 ./scripts/bootstrap_dev.sh
 ```
 
-如本机默认 `python3` 仍是 3.9，可显式指定：
+If your default `python3` is still 3.9, specify the binary explicitly:
 
 ```bash
 PYTHON_BIN=python3.11 ./scripts/bootstrap_dev.sh
 ```
 
-它会：
+The script will:
 
-- 创建/复用 `.venv-task-rag-server`
-- 默认优先使用 `python3.11`（可通过 `PYTHON_BIN` 覆盖）
-- 安装 `pytest` 与当前最小开发依赖
-- 让 `scripts/run_task_rag_server.sh` 与 `python -m pytest ...` 共用同一虚拟环境
+- Create or reuse `.venv-task-rag-server`
+- Default to `python3.11` (overridable via `PYTHON_BIN`)
+- Install `pytest` and the minimal dev dependencies
+- Share the same virtual environment between `scripts/run_task_rag_server.sh` and `python -m pytest ...`
 
-如果只想手动安装，等价命令为：
+To install manually instead, the equivalent command is:
 
 ```bash
 python3 -m pip install pytest httpx fastapi uvicorn requests numpy lancedb pyarrow
 ```
 
-## 必要环境变量
+## Required Environment Variables
 
-当前文档默认你就在 `transcendence-memory-server/` 仓库根目录内执行命令，因此：
+This document assumes you are running commands from the `transcendence-memory-server/` repository root:
 
 ```bash
 export WORKSPACE="$PWD"
 export RAG_API_KEY="replace-me"
 export EMBEDDING_API_KEY="replace-me"
 export EMBEDDING_MODEL="gemini-embedding-001"
-export EMBEDDING_BASE_URL="https://api.openai.com/v1"        # runtime 当前优先读取
-export EMBEDDINGS_BASE_URL="https://api.openai.com/v1"       # canonical 名称，建议同时设置保持一致
+export EMBEDDING_BASE_URL="https://api.openai.com/v1"        # read first by runtime
+export EMBEDDINGS_BASE_URL="https://api.openai.com/v1"       # canonical name; set both to keep them consistent
 export GOOGLE_EMBEDDING_BASE_URL="https://generativelanguage.googleapis.com/v1beta/models"
 ```
 
-> 注意：当前 runtime 的实际解析顺序是 `EMBEDDING_BASE_URL` → `EMBEDDINGS_BASE_URL` → 默认值。
-> 如果你的 shell 环境里预先存在旧值，单独设置 `EMBEDDINGS_BASE_URL` 可能不会覆盖它；本地调试时最稳妥做法是两个变量一起显式设置为同一个 endpoint。
+> Note: The actual resolution order at runtime is `EMBEDDING_BASE_URL` -> `EMBEDDINGS_BASE_URL` -> default value.
+> If your shell already has an older value for one of these, setting only `EMBEDDINGS_BASE_URL` may not override it. The safest approach during local debugging is to explicitly set both variables to the same endpoint.
 
-## 运行时目录
+## Runtime Directories
 
-当前脚本仍使用历史 `tasks/...` 目录约定，而不是仓库里的 `tasks_rag/` 名称。
-本地最小目录可以先这样准备：
+The current scripts still use the legacy `tasks/...` directory convention rather than the `tasks_rag/` name found in the repo.
+Prepare the minimal local directory structure as follows:
 
 ```bash
 mkdir -p \
@@ -72,51 +72,51 @@ mkdir -p \
   memory_archive
 ```
 
-## 启动服务
+## Starting the Service
 
 ```bash
 uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 ```
 
-## 最小 smoke test
+## Minimal Smoke Test
 
 ```bash
 curl -sS http://127.0.0.1:8711/health
 ```
 
-## Typed object proof smoke
+## Typed Object Proof Smoke
 
-如果只想验证“typed client objects 能被稳定写入 canonical storage”，可运行：
+To verify that typed client objects can be stably written to canonical storage, run:
 
 ```bash
 python3 scripts/smoke_test_client_ingest_search.py
 ```
 
-该脚本会：
+The script will:
 
-- 创建临时 `WORKSPACE`
-- 通过 `POST /ingest-memory/objects` 写入 typed objects
-- 直接检查 `memory_objects.jsonl`
+- Create a temporary `WORKSPACE`
+- Write typed objects via `POST /ingest-memory/objects`
+- Directly inspect `memory_objects.jsonl`
 
-## Pytest verification
+## Pytest Verification
 
-如果要验证真正的 `LanceDB-only` 检索链路，可运行：
+To verify the full `LanceDB-only` retrieval pipeline, run:
 
 ```bash
 python3 -m pytest tests/test_task_rag_server_memory_objects.py -q
 ```
 
-该测试会：
+The test will:
 
-- 创建临时 `WORKSPACE`
-- 启动本地 fake embedding HTTP 服务
-- 通过 `POST /ingest-memory/objects` 写入 typed objects
-- 调用 `POST /embed` 重建 LanceDB
-- 调用 `POST /search` 验证对象可被命中
+- Create a temporary `WORKSPACE`
+- Start a local fake embedding HTTP service
+- Write typed objects via `POST /ingest-memory/objects`
+- Call `POST /embed` to rebuild LanceDB
+- Call `POST /search` to verify the objects are retrievable
 
-## 当前已知约束
+## Known Constraints
 
-- `embed` 和 `search` 依赖 `lancedb` 与 `pyarrow`
-- 当前服务端仍保留 script-wrapper observability 字段，但主链架构已经统一为 `LanceDB-only`
-- `POST /build-manifest` 已退出主链，仅保留 deprecated no-op
-- 目录名与脚本名仍保留 `task_rag_*` 历史语义，本轮不做重命名
+- `embed` and `search` depend on `lancedb` and `pyarrow`
+- The server still retains script-wrapper observability fields, but the main pipeline architecture has been unified to `LanceDB-only`
+- `POST /build-manifest` has been removed from the main pipeline and is retained only as a deprecated no-op
+- Directory and script names still carry the legacy `task_rag_*` semantics; renaming is out of scope for this cycle
