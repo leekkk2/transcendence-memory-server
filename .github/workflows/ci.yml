@@ -78,6 +78,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Download release assets
         uses: actions/download-artifact@v5
         with:
@@ -88,8 +91,8 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          pip install twine
-          twine upload release-assets/*.tar.gz release-assets/*.whl
+          python -m pip install --upgrade pip twine pkginfo
+          python -m twine upload release-assets/*.tar.gz release-assets/*.whl
 
   publish-docker:
     needs: [test, docker-validate]
