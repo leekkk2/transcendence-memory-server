@@ -22,7 +22,7 @@
 systemctl status transcendence-memory-backend
 # 或 Docker
 docker compose ps
-docker compose logs backend --tail=100
+docker compose logs rag-server --tail=100
 
 # 检查 Nginx
 nginx -t
@@ -62,8 +62,21 @@ echo $EMBEDDING_API_KEY
 echo $EMBEDDING_BASE_URL
 
 # 检查日志
-docker compose logs backend --tail=200 | grep -i embed
+docker compose logs rag-server --tail=200 | grep -i embed
 ```
+
+### VLM 已配置但 multimodal 仍不可用
+
+先看 `/health`：
+
+```bash
+curl -sS http://127.0.0.1:8711/health | python3 -m json.tool
+```
+
+重点判断：
+
+- `build_flavor=lite`：说明你还在轻量构建，应重新用 `BUILD_TARGET=full docker compose up -d --build`
+- `build_flavor=full` 但 `multimodal_capable=false`：说明 full 镜像里的多模态依赖没有准备好，需要重建 full 镜像并检查构建日志
 
 ### typed ingest 成功但 search 无结果
 
@@ -82,10 +95,26 @@ curl -sS -X POST http://127.0.0.1:8711/embed \
 
 ```bash
 sudo docker compose ps
-sudo docker compose logs backend --tail=100
+sudo docker compose logs rag-server --tail=100
 ```
 
 这个判断是环境特定的，不应泛化成通用规则。
+
+### full 构建失败
+
+优先执行：
+
+```bash
+BUILD_TARGET=full docker compose build --no-cache
+```
+
+然后检查：
+
+```bash
+docker compose logs rag-server --tail=200
+```
+
+若 `/health` 仍显示 `full build missing raganything package` 或 `full build missing lightrag package`，说明镜像构建没有真正产出完整依赖集。
 
 ### ModuleNotFoundError
 
