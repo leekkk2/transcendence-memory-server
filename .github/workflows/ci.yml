@@ -2,10 +2,10 @@ name: CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ["v*.*.*"]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
   test:
@@ -21,47 +21,134 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest tests/ -v
 
-  publish-pypi:
+  docker-validate:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [lite, full]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.flavor }} image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: ${{ matrix.flavor }}
+          push: false
+          load: false
+
+  build-release-assets:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Build and publish
+      - name: Build Python distributions
+        run: |
+          pip install build
+          python -m build
+      - name: Assemble GitHub release assets
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOCKER_IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server
+        run: |
+          mkdir -p release-assets
+          cp dist/* release-assets/
+          python scripts/generate_release_assets.py --output-dir release-assets
+          (
+            cd release-assets
+            sha256sum * > SHA256SUMS.txt
+          )
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-release-assets
+          path: release-assets/*
+
+  publish-pypi:
+    needs: [test, build-release-assets]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v5
+        with:
+          name: github-release-assets
+          path: release-assets
+      - name: Publish Python distributions
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          pip install build twine
-          python -m build
-          twine upload dist/*
+          pip install twine
+          twine upload release-assets/*.tar.gz release-assets/*.whl
 
   publish-docker:
-    needs: test
+    needs: [test, docker-validate]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [lite, full]
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest
+      - name: Compute Docker tags
+        id: tags
+        run: |
+          image="${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server"
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${{ matrix.flavor }}" = "lite" ]; then
+            echo "tags=${image}:${version}-lite,${image}:lite,${image}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${image}:${version}-full,${image}:full" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
+          target: ${{ matrix.flavor }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.tags.outputs.tags }}
+
+  github-release:
+    needs: [build-release-assets, publish-pypi, publish-docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v5
+        with:
+          name: github-release-assets
+          path: release-assets
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No release assets were generated." >&2
+            exit 1
+          fi
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" --verify-tag --generate-notes --latest
+          fi

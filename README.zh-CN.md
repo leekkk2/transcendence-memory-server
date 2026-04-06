@@ -40,6 +40,7 @@ Transcendence Memory Server 是一个云端记忆后端，多个 AI Agent 可以
 ## 特性
 
 - **多 Agent 云记忆** — 一个服务端，多个 Agent 连接；各自存储，互相查询
+- **Lite / Full 构建规格** — 默认 `lite` 镜像，可按需切到带多模态依赖的 `full`
 - **容器隔离** — 按 Agent 或按项目的命名空间，支持完整 CRUD；共享容器用于团队知识
 - **LanceDB 向量检索** — 亚秒级语义搜索，覆盖任务卡、记忆对象和结构化数据
 - **LightRAG 知识图谱** — 实体/关系抽取，支持混合检索（本地 + 全局 + 关键词）
@@ -47,6 +48,27 @@ Transcendence Memory Server 是一个云端记忆后端，多个 AI Agent 可以
 - **架构自动检测** — 根据已配置的 API key 自动启用对应能力
 - **连接令牌** — 给每个 Agent 一个 token，一步连接
 - **零权限问题** — Docker named volume，无需处理宿主机目录权限
+
+## 构建规格
+
+当前服务支持两种构建规格：
+
+| 规格 | 默认 | 包含能力 |
+|------|------|---------|
+| `lite` | 是 | FastAPI、LanceDB、LightRAG、typed ingest、connection token 导出 |
+| `full` | 否 | `lite` 全部能力 + `raganything` 多模态依赖 |
+
+切换方式：
+
+```bash
+# 默认 lite
+docker compose up -d --build
+
+# full 多模态构建
+BUILD_TARGET=full docker compose up -d --build
+```
+
+`/health` 会显式返回 `build_flavor`、`multimodal_capable` 和 `degraded_reasons`。
 
 ## 架构层级
 
@@ -66,6 +88,7 @@ Transcendence Memory Server 是一个云端记忆后端，多个 AI Agent 可以
 git clone https://github.com/leekkk2/transcendence-memory-server.git
 cd transcendence-memory-server
 cp .env.example .env    # 编辑填入你的 API key
+# 如需完整多模态依赖，可额外设置 BUILD_TARGET=full
 docker compose up -d --build
 curl http://localhost:8711/health
 ```
@@ -76,6 +99,7 @@ curl http://localhost:8711/health
 # 预检
 bash scripts/preflight_check.sh
 
+# 如需完整多模态依赖，可额外设置 BUILD_TARGET=full
 # 部署（端口仅绑定 127.0.0.1，配合 Nginx 反代）
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```

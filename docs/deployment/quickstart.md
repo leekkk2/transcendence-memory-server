@@ -53,6 +53,12 @@ curl -sS http://127.0.0.1:8711/health
 
 详见 [docker-deployment.md](docker-deployment.md)。
 
+默认构建规格为 `lite`。如果下一步就是多模态解析或 `rag-everything` 链路，请在启动前显式设置：
+
+```bash
+BUILD_TARGET=full docker compose up -d --build
+```
+
 ## 反向代理
 
 详见 [reverse-proxy.md](reverse-proxy.md)。
@@ -64,23 +70,22 @@ curl -sS http://127.0.0.1:8711/health
 ## 当前 Runtime 口径
 
 - 默认端口：`8711`
-- 主链架构：**LanceDB-only**
+- 默认构建规格：**lite**
+- 运行时架构：按 key + 包可用性动态检测
 - 认证方式：`X-API-KEY` header 或 `Authorization: Bearer`
 
 ## 部署后必须交给前端的信息
 
 后端部署完成后，不能只给前端一个 URL，至少应同时交付：
 
-1. `bundle.json`（由 `backend export-connection` 生成）
+1. 连接材料（优先使用 server 原生 `/export-connection-token` 响应；如仍保留独立 backend CLI，再额外导出 bundle）
 2. 当前前端应使用的鉴权模式
 3. 前端仍需本地补齐的鉴权材料
 4. 前端下一步应执行的命令顺序
 
 如果走 server 原生 `/export-connection-token` 流程，优先把响应里的 `pairing_auth` 与 `agent_onboarding` 一并交给接入方 AI，而不是只转发一个 token。
 
-```bash
-transcendence-memory backend export-connection --topology split_machine --output bundle.json
-```
+如项目仍保留独立 `backend export-connection` CLI，可将其视为兼容性补充路径，而不是优先入口。
 
 ## Backend Acceptance
 
