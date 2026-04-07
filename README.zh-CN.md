@@ -130,7 +130,7 @@ BUILD_TARGET=full docker compose up -d --build
 
 ## 平台支持
 
- - **Python 包** — CI 会在 `Linux`、`Windows` 上验证 Python `3.11`、`3.12`、`3.13`，并在 `macOS` 上验证 Python `3.12`、`3.13`
+ - **Python 包** — CI 当前会在 `Linux`、`Windows` 上验证 Python `3.11`、`3.12`、`3.13`
 - **Docker 镜像** — 发布 `linux/amd64` 与 `linux/arm64`
 - **macOS / Windows 宿主机** — 通过 Docker Desktop 运行 Linux 容器来支持
 - **非 Linux 原生容器** — 本项目不会发布原生 macOS 容器镜像，也不会发布原生 Windows 容器镜像
