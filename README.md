@@ -131,7 +131,7 @@ BUILD_TARGET=full docker compose up -d --build
 
 ## Platform Support
 
- - **Python package** — CI validates `Linux` and `Windows` on Python `3.11`, `3.12`, `3.13`, and validates `macOS` on Python `3.12`, `3.13`
+ - **Python package** — CI currently validates `Linux` and `Windows` on Python `3.11`, `3.12`, `3.13`
 - **Docker images** — published for `linux/amd64` and `linux/arm64`
 - **macOS / Windows hosts** — supported through Docker Desktop running Linux containers
 - **Native non-Linux containers** — no native macOS container image exists, and no native Windows container image is published for this project
