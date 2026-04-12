@@ -8,10 +8,26 @@ from pydantic import BaseModel, Field
 DEFAULT_CONTAINER = 'imac'
 
 
+PatternMode = Literal['substring', 'prefix', 'glob']
+
+
 class SearchReq(BaseModel):
     query: str = Field(..., min_length=1)
     topk: int = Field(default=5, ge=1, le=100)
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
+    containers: list[str] | None = Field(
+        default=None,
+        description='显式指定要搜索的容器列表；非空时优先级高于 container_pattern 与 container。',
+    )
+    container_pattern: str | None = Field(
+        default=None,
+        max_length=64,
+        description='按 pattern_mode 模糊匹配容器名（大小写不敏感）。当 containers 为空时生效，优先级高于 container。',
+    )
+    pattern_mode: PatternMode = Field(
+        default='substring',
+        description='container_pattern 的匹配模式：substring（子串）/ prefix（前缀）/ glob（fnmatch）。',
+    )
     timeout_s: int = Field(default=600, ge=1, le=1800)
 
 
@@ -62,6 +78,7 @@ class CommandResponse(BaseModel):
 
 class SearchHit(BaseModel):
     score: float | None = None
+    container: str | None = None
     taskId: str | None = None
     chunkId: str | None = None
     docType: str | None = None
@@ -82,6 +99,14 @@ class SearchResponse(BaseModel):
     query: str
     topk: int
     container: str
+    containers: list[str] = Field(
+        default_factory=list,
+        description='本次实际命中的容器列表（解析 containers / container_pattern / container 之后）。',
+    )
+    per_container_status: dict[str, str] = Field(
+        default_factory=dict,
+        description='每个命中容器的执行状态：ok / not_initialized / error: <message>。',
+    )
     initialized: bool
     message: str | None = None
     results: list[SearchHit]
