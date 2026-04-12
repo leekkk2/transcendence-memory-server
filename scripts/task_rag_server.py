@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import importlib.util
 import json
 import logging
@@ -13,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from contextlib import asynccontextmanager
@@ -356,29 +358,145 @@ def health() -> HealthResponse:
     )
 
 
-@app.post('/search', response_model=SearchResponse, dependencies=[Depends(verify_auth)])
-def search(req: SearchReq) -> SearchResponse:
-    result = run([str(script_path('task_rag_search.py')), '--query', req.query, '--topk', str(req.topk), '--container', req.container], req.timeout_s)
+def _resolve_search_targets(req: SearchReq) -> list[str]:
+    """根据 SearchReq 解析最终要查询的容器列表。
+
+    优先级：containers > container_pattern > container。
+    """
+    if req.containers:
+        for name in req.containers:
+            validate_container_name(name)
+        # 去重保序
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in req.containers:
+            if name not in seen:
+                ordered.append(name)
+                seen.add(name)
+        return ordered
+
+    if req.container_pattern is not None:
+        _validate_pattern(req.container_pattern)
+        names = [
+            p.name for p in _list_container_dirs()
+            if _match_container(p.name, req.container_pattern, req.pattern_mode)
+        ]
+        return names
+
+    validate_container_name(req.container)
+    return [req.container]
+
+
+def _run_single_search(query: str, topk: int, container: str, timeout_s: int) -> tuple[CommandResponse, dict]:
+    result = run(
+        [str(script_path('task_rag_search.py')), '--query', query, '--topk', str(topk), '--container', container],
+        timeout_s,
+    )
     try:
         payload = json.loads(result.stdout) if result.stdout.strip() else {}
     except json.JSONDecodeError:
         payload = {}
-    raw_results = payload.get('results') if isinstance(payload, dict) else []
-    if not isinstance(raw_results, list):
-        raw_results = []
-    parsed = [SearchHit(**item) for item in raw_results if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        payload = {}
+    return result, payload
+
+
+@app.post('/search', response_model=SearchResponse, dependencies=[Depends(verify_auth)])
+def search(req: SearchReq) -> SearchResponse:
+    targets = _resolve_search_targets(req)
+
+    # 命中 0 个容器：返回空结果，但不算错误
+    if not targets:
+        return SearchResponse(
+            status='ok',
+            command=[],
+            code=0,
+            query=req.query,
+            topk=req.topk,
+            container=req.container,
+            containers=[],
+            per_container_status={},
+            initialized=False,
+            message='No container matched the request.',
+            results=[],
+            stdout='',
+            stderr='',
+        )
+
+    # 跨容器召回时拉宽每容器 topk，避免被某个容器全占
+    per_container_topk = req.topk if len(targets) == 1 else min(req.topk * len(targets), 100)
+
+    per_status: dict[str, str] = {}
+    all_hits: list[SearchHit] = []
+    last_command: list[str] = []
+    last_stdout = ''
+    last_stderr = ''
+    any_initialized = False
+
+    def _do(name: str) -> tuple[str, CommandResponse, dict]:
+        cmd_result, payload = _run_single_search(req.query, per_container_topk, name, req.timeout_s)
+        return name, cmd_result, payload
+
+    if len(targets) == 1:
+        results_iter = [_do(targets[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(targets), 4)) as pool:
+            futures = [pool.submit(_do, name) for name in targets]
+            results_iter = [f.result() for f in as_completed(futures)]
+
+    for name, cmd_result, payload in results_iter:
+        last_command = cmd_result.command
+        last_stdout = cmd_result.stdout
+        last_stderr = cmd_result.stderr
+        if cmd_result.code != 0:
+            per_status[name] = f'error: exit {cmd_result.code}'
+            continue
+        code = payload.get('code')
+        if code == 'container_not_initialized':
+            per_status[name] = 'not_initialized'
+            continue
+        if code and code != 'ok':
+            per_status[name] = f'error: {code}'
+            continue
+        per_status[name] = 'ok'
+        any_initialized = True
+        raw_results = payload.get('results') or []
+        if not isinstance(raw_results, list):
+            continue
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            item.setdefault('container', name)
+            try:
+                all_hits.append(SearchHit(**item))
+            except Exception:  # pragma: no cover - defensive
+                continue
+
+    # LanceDB 距离越小越相关；None 视为最差
+    all_hits.sort(key=lambda hit: (hit.score is None, hit.score if hit.score is not None else 0.0))
+    merged = all_hits[: req.topk]
+
+    has_any_ok = any(s == 'ok' for s in per_status.values())
+    primary_container = targets[0] if len(targets) == 1 else (req.container if req.container in targets else targets[0])
+
+    message = None
+    if not has_any_ok and per_status:
+        message = '; '.join(f'{name}: {status}' for name, status in per_status.items())
+
     return SearchResponse(
-        status='ok' if result.code == 0 else 'error',
-        command=result.command,
-        code=result.code,
+        status='ok' if has_any_ok else 'error',
+        command=last_command,
+        code=0 if has_any_ok else 1,
         query=req.query,
         topk=req.topk,
-        container=req.container,
-        initialized=bool(payload.get('initialized')) if isinstance(payload, dict) else False,
-        message=str(payload.get('message')) if isinstance(payload, dict) and payload.get('message') else None,
-        results=parsed,
-        stdout=result.stdout,
-        stderr=result.stderr,
+        container=primary_container,
+        containers=targets,
+        per_container_status=per_status,
+        initialized=any_initialized,
+        message=message,
+        results=merged,
+        stdout=last_stdout,
+        stderr=last_stderr,
     )
 
 
@@ -475,6 +593,36 @@ def validate_container_name(name: str) -> None:
         raise HTTPException(status_code=400, detail=f'invalid container name: {name}')
 
 
+_PATTERN_FORBIDDEN = re.compile(r'[\x00-\x1f/\\]')
+
+
+def _validate_pattern(pattern: str) -> None:
+    """限制 pattern 长度与字符集，避免路径分隔符与控制字符。"""
+    if len(pattern) > 64:
+        raise HTTPException(status_code=400, detail='pattern too long (max 64)')
+    if _PATTERN_FORBIDDEN.search(pattern):
+        raise HTTPException(status_code=400, detail='pattern contains forbidden characters')
+
+
+def _match_container(name: str, pattern: str, mode: str) -> bool:
+    """大小写不敏感的容器名匹配，支持 substring/prefix/glob 三种模式。"""
+    needle = pattern.lower()
+    target = name.lower()
+    if mode == 'prefix':
+        return target.startswith(needle)
+    if mode == 'glob':
+        return fnmatch.fnmatchcase(target, needle)
+    return needle in target
+
+
+def _list_container_dirs() -> list[Path]:
+    """列出 containers 目录下的子目录，按名称排序。"""
+    root = WS / 'tasks' / 'rag' / 'containers'
+    if not root.exists():
+        return []
+    return sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name)
+
+
 def read_memory_objects(container: str) -> list[dict]:
     """读取 container 下的 memory_objects.jsonl，返回 dict 列表。"""
     path = memory_objects_path(container)
@@ -520,13 +668,21 @@ def export_connection_token(container: str = DEFAULT_CONTAINER) -> ConnectionTok
 
 
 @app.get('/containers', dependencies=[Depends(verify_auth)])
-def list_containers():
-    containers_dir = WS / 'tasks' / 'rag' / 'containers'
-    if not containers_dir.exists():
-        return {'containers': [], 'count': 0}
+def list_containers(pattern: str | None = None, mode: str = 'substring'):
+    """列出容器，可选 pattern 模糊过滤。
+
+    - pattern: 大小写不敏感的匹配字符串，留空时返回全部
+    - mode: substring（默认）/ prefix / glob
+    """
+    if mode not in ('substring', 'prefix', 'glob'):
+        raise HTTPException(status_code=400, detail=f'invalid mode: {mode}')
+    if pattern is not None:
+        _validate_pattern(pattern)
+
+    dirs = _list_container_dirs()
     result = []
-    for p in sorted(containers_dir.iterdir()):
-        if not p.is_dir():
+    for p in dirs:
+        if pattern and not _match_container(p.name, pattern, mode):
             continue
         # 统计对象数
         jsonl = p / 'memory_objects.jsonl'
