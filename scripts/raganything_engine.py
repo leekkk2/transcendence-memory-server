@@ -23,6 +23,9 @@ try:
         _llm_func,
         _container_working_dir,
         get_lightrag,
+        LLM_BASE_URL as _RAG_LLM_BASE_URL,
+        LLM_API_KEY as _RAG_LLM_API_KEY,
+        LLM_MODEL as _RAG_LLM_MODEL,
     )
 except ModuleNotFoundError:  # pragma: no cover
     from scripts.rag_engine import (  # type: ignore
@@ -30,13 +33,18 @@ except ModuleNotFoundError:  # pragma: no cover
         _llm_func,
         _container_working_dir,
         get_lightrag,
+        LLM_BASE_URL as _RAG_LLM_BASE_URL,
+        LLM_API_KEY as _RAG_LLM_API_KEY,
+        LLM_MODEL as _RAG_LLM_MODEL,
     )
 
 logger = logging.getLogger(__name__)
 
-VLM_MODEL = os.environ.get("VLM_MODEL", os.environ.get("LLM_MODEL", "gemini-2.5-flash-lite"))
-VLM_BASE_URL = os.environ.get("VLM_BASE_URL", os.environ.get("LLM_BASE_URL", ""))
-VLM_API_KEY = os.environ.get("VLM_API_KEY", os.environ.get("LLM_API_KEY", ""))
+VLM_MODEL = os.environ.get("VLM_MODEL") or _RAG_LLM_MODEL
+VLM_BASE_URL = os.environ.get("VLM_BASE_URL") or _RAG_LLM_BASE_URL
+VLM_API_KEY = os.environ.get("VLM_API_KEY") or _RAG_LLM_API_KEY
+
+_SUPPORTED_PARSERS = {"mineru", "docling"}
 
 _instances: dict[str, Any] = {}
 _locks: dict[str, asyncio.Lock] = {}
@@ -123,9 +131,15 @@ async def get_raganything(container: str) -> Any:
             func=_embed_func,
         )
 
+        parser_name = os.environ.get("RAG_PARSER", "mineru")
+        if parser_name not in _SUPPORTED_PARSERS:
+            raise ValueError(
+                f"unsupported RAG_PARSER={parser_name!r}; expected one of {sorted(_SUPPORTED_PARSERS)}"
+            )
+
         config = RAGAnythingConfig(
             working_dir=str(working_dir),
-            parser=os.environ.get("RAG_PARSER", "mineru"),
+            parser=parser_name,
             parse_method=os.environ.get("RAG_PARSE_METHOD", "auto"),
             enable_image_processing=True,
             enable_table_processing=True,

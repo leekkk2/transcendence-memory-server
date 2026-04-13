@@ -20,6 +20,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 import tempfile
+from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 
@@ -236,6 +237,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+_MAX_UPLOAD_BYTES_ENV = int(os.environ.get('MAX_UPLOAD_BYTES', str(200 * 1024 * 1024)))
+
+
+@app.middleware('http')
+async def _enforce_upload_limit(request, call_next):
+    """对 multipart 上传预检 Content-Length，避免 Starlette 先把整份 body 落盘。"""
+    if request.url.path == '/documents/file' and request.method == 'POST':
+        cl = request.headers.get('content-length')
+        if cl is not None:
+            try:
+                size = int(cl)
+            except ValueError:
+                size = -1
+            if size > _MAX_UPLOAD_BYTES_ENV:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=413,
+                    content={'detail': f'file exceeds max upload size {_MAX_UPLOAD_BYTES_ENV} bytes'},
+                )
+    return await call_next(request)
 
 
 def child_env() -> dict[str, str]:
@@ -827,6 +850,16 @@ async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
 _MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(200 * 1024 * 1024)))  # 200 MB
 
 
+def _sanitize_upload_filename(raw: str | None) -> str:
+    """校验并规范化上传文件名，不合法即抛 400。"""
+    name = os.path.basename(raw or '')
+    if not name or name in ('.', '..'):
+        raise HTTPException(status_code=400, detail='invalid filename: empty or reserved')
+    if '\x00' in name or '/' in name or '\\' in name:
+        raise HTTPException(status_code=400, detail=f'invalid filename: {name!r}')
+    return name
+
+
 @app.post('/documents/file', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def ingest_document_file(
     container: str = Form(...),
@@ -843,13 +876,15 @@ async def ingest_document_file(
     if get_raganything is None:
         raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
 
-    filename = file.filename or 'upload.bin'
-    if '/' in filename or '\\' in filename or filename in ('.', '..'):
-        raise HTTPException(status_code=400, detail=f'invalid filename: {filename}')
+    filename = _sanitize_upload_filename(file.filename)
 
-    # 流式落盘到临时目录，同时做大小上限检查
     tmp_dir = Path(tempfile.mkdtemp(prefix='tm-upload-'))
     saved = tmp_dir / filename
+    # 防御性：验证 resolve 后仍在 tmp_dir 内
+    if not str(saved.resolve()).startswith(str(tmp_dir.resolve()) + os.sep):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail='invalid filename: path traversal')
+
     total = 0
     try:
         with saved.open('wb') as f:
@@ -868,10 +903,18 @@ async def ingest_document_file(
         rag = await get_raganything(container)
         parse_output = tmp_dir / 'parsed'
         parse_output.mkdir(exist_ok=True)
+        parser_kwargs: dict[str, Any] = {}
+        backend = os.environ.get('RAG_PARSER_BACKEND')
+        if backend:
+            parser_kwargs['backend'] = backend
+        lang = os.environ.get('RAG_PARSER_LANG')
+        if lang:
+            parser_kwargs['lang'] = lang
         await rag.process_document_complete(
             file_path=str(saved),
             output_dir=str(parse_output),
             parse_method=parse_method or os.environ.get('RAG_PARSE_METHOD', 'auto'),
+            **parser_kwargs,
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
