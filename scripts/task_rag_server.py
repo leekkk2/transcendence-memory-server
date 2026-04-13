@@ -81,9 +81,9 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     )
 
 try:
-    from rag_engine import get_rag, ensure_rag_initialized
+    from rag_engine import get_lightrag
 except ModuleNotFoundError:  # pragma: no cover - package import path
-    from scripts.rag_engine import get_rag, ensure_rag_initialized
+    from scripts.rag_engine import get_lightrag
 
 try:
     from arch_detect import detect_architecture, reset_cache as reset_arch_cache
@@ -288,7 +288,7 @@ def run_or_start(cmd: list[str], timeout_s: int, background: bool | None, wait: 
 
 
 @app.get('/health', response_model=HealthResponse)
-def health() -> HealthResponse:
+async def health(container: str | None = None) -> HealthResponse:
     containers = WS / 'tasks' / 'rag' / 'containers'
     scripts_present = {
         'search': script_path('task_rag_search.py').exists(),
@@ -328,6 +328,15 @@ def health() -> HealthResponse:
         optional=arch.optional_keys,
     )
 
+    documents_text_ready = arch.modules['lightrag'].ready
+    if container and documents_text_ready:
+        validate_container_name(container)
+        try:
+            await get_lightrag(container)
+        except Exception as exc:
+            documents_text_ready = False
+            warnings.append(f'LightRAG probe failed for container={container}: {exc}')
+
     return HealthResponse(
         status='ok',
         service='transcendence-memory-server',
@@ -347,8 +356,8 @@ def health() -> HealthResponse:
             'ingest_memory': scripts_present['lancedb_ingest'] and embedding_configured and lancedb_available,
             'ingest_objects': True,
             'ingest_structured': scripts_present['structured_ingest'] and embedding_configured and lancedb_available,
-            'query': arch.modules['lightrag'].ready,
-            'documents_text': arch.modules['lightrag'].ready,
+            'query': documents_text_ready,
+            'documents_text': documents_text_ready,
         },
         available_containers=sorted(path.name for path in containers.iterdir() if path.is_dir()) if containers.exists() else [],
         warnings=warnings,
@@ -780,69 +789,45 @@ def job_status(pid: int) -> JobStatusResponse:
         return JobStatusResponse(pid=pid, running=True, message=f'Process {pid} exists (permission denied for signal).')
 
 
+def _require_lightrag_ready() -> None:
+    arch = detect_architecture()
+    module = arch.modules['lightrag']
+    if module.ready:
+        return
+    pkg = '' if module.package_available else ' lightrag package not installed.'
+    missing = f' Missing keys: {", ".join(module.missing_keys)}' if module.missing_keys else ''
+    raise HTTPException(status_code=503, detail=f'LightRAG not available.{pkg}{missing}')
+
+
 @app.post('/documents/text', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
     validate_container_name(req.container)
-    arch = detect_architecture()
-    if not arch.modules['lightrag'].ready:
-        missing = arch.modules['lightrag'].missing_keys
-        pkg = '' if arch.modules['lightrag'].package_available else ' lightrag/raganything package not installed.'
-        return QueryResponse(
-            status='error', query='', container=req.container,
-            answer=f'LightRAG not available.{pkg} Missing keys: {", ".join(missing)}' if missing else f'LightRAG not available.{pkg}',
-            mode='insert',
-        )
-    try:
-        rag = await ensure_rag_initialized(req.container)
-        await rag.lightrag.ainsert(req.text)
-        return QueryResponse(
-            status='ok',
-            query='',
-            container=req.container,
-            answer=f'Text ingested into container {req.container} knowledge graph.',
-            mode='insert',
-        )
-    except Exception as exc:
-        return QueryResponse(
-            status='error',
-            query='',
-            container=req.container,
-            answer=f'Ingest failed: {exc}',
-            mode='insert',
-        )
+    _require_lightrag_ready()
+    lightrag = await get_lightrag(req.container)
+    await lightrag.ainsert(req.text)
+    return QueryResponse(
+        status='ok',
+        query='',
+        container=req.container,
+        answer=f'Text ingested into container {req.container} knowledge graph.',
+        mode='insert',
+    )
 
 
 @app.post('/query', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
-    arch = detect_architecture()
-    if not arch.modules['lightrag'].ready:
-        missing = arch.modules['lightrag'].missing_keys
-        pkg = '' if arch.modules['lightrag'].package_available else ' lightrag/raganything package not installed.'
-        return QueryResponse(
-            status='error', query=req.query, container=req.container,
-            answer=f'LightRAG not available.{pkg} Missing keys: {", ".join(missing)}' if missing else f'LightRAG not available.{pkg}',
-            mode=req.mode,
-        )
-    try:
-        rag = await ensure_rag_initialized(req.container)
-        from lightrag import QueryParam
-        answer = await rag.lightrag.aquery(
-            req.query,
-            param=QueryParam(mode=req.mode, top_k=req.top_k),
-        )
-        return QueryResponse(
-            status='ok',
-            query=req.query,
-            container=req.container,
-            answer=answer or '(no answer generated)',
-            mode=req.mode,
-        )
-    except Exception as exc:
-        return QueryResponse(
-            status='error',
-            query=req.query,
-            container=req.container,
-            answer=f'Query failed: {exc}',
-            mode=req.mode,
-        )
+    _require_lightrag_ready()
+    from lightrag import QueryParam
+    lightrag = await get_lightrag(req.container)
+    answer = await lightrag.aquery(
+        req.query,
+        param=QueryParam(mode=req.mode, top_k=req.top_k),
+    )
+    return QueryResponse(
+        status='ok',
+        query=req.query,
+        container=req.container,
+        answer=answer or '(no answer generated)',
+        mode=req.mode,
+    )
