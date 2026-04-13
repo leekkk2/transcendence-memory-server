@@ -46,21 +46,52 @@ async def _embed_func(texts: list[str]):
         return np.array([d["embedding"] for d in sorted_data], dtype="float32")
 
 
+_LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
+_LLM_RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "1.5"))
+
+
 async def _llm_func(prompt: str, system_prompt: str | None = None, **_: Any) -> str:
+    """调用 OpenAI 兼容 chat/completions。上游 5xx / 连接错误指数退避重试。
+
+    LightRAG 的实体抽取 pipeline 对每个 chunk 发起一次 LLM 调用，任何一次失败
+    都会阻断整个 chunk 的抽取结果。gateway 若出现抖动，必须在客户端层兜底重试。
+    """
     import httpx
     url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
     messages: list[dict[str, Any]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
+    payload = {"model": LLM_MODEL, "messages": messages}
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+
+    last_exc: Exception | None = None
     async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post(
-            url,
-            json={"model": LLM_MODEL, "messages": messages},
-            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        for attempt in range(_LLM_MAX_RETRIES):
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"upstream {resp.status_code}", request=resp.request, response=resp,
+                    )
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"].get("content")
+                if not content:
+                    raise ValueError(f"LLM returned empty content: {data}")
+                return content
+            except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
+                last_exc = exc
+                if attempt == _LLM_MAX_RETRIES - 1:
+                    break
+                delay = _LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "LLM call failed (attempt %d/%d): %s; retrying in %.1fs",
+                    attempt + 1, _LLM_MAX_RETRIES, exc, delay,
+                )
+                await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _container_working_dir(container: str) -> Path:
