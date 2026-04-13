@@ -37,7 +37,11 @@ Repository = "https://github.com/leekkk2/transcendence-memory-server"
 Issues = "https://github.com/leekkk2/transcendence-memory-server/issues"
 
 [project.optional-dependencies]
-multimodal = ["raganything>=1.2.0"]
+multimodal = [
+    "raganything>=1.2.10",
+    "mineru[core]>=3.0.9",
+    "python-multipart>=0.0.6",
+]
 dev = ["pytest>=8.0.0", "httpx>=0.24.0"]
 
 [project.scripts]
