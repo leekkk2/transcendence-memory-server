@@ -19,7 +19,9 @@ from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+import tempfile
+
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 
 try:
     from task_rag_server_models import (
@@ -84,6 +86,14 @@ try:
     from rag_engine import get_lightrag
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.rag_engine import get_lightrag
+
+try:
+    from raganything_engine import get_raganything
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    try:
+        from scripts.raganything_engine import get_raganything
+    except ModuleNotFoundError:
+        get_raganything = None  # type: ignore[assignment]
 
 try:
     from arch_detect import detect_architecture, reset_cache as reset_arch_cache
@@ -810,6 +820,67 @@ async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
         query='',
         container=req.container,
         answer=f'Text ingested into container {req.container} knowledge graph.',
+        mode='insert',
+    )
+
+
+_MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(200 * 1024 * 1024)))  # 200 MB
+
+
+@app.post('/documents/file', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
+async def ingest_document_file(
+    container: str = Form(...),
+    file: UploadFile = File(...),
+    parse_method: str | None = Form(default=None),
+) -> QueryResponse:
+    """多模态文档入库：PDF / Office / 图片 / HTML / Markdown 等。
+
+    底层走 RAGAnything.process_document_complete → mineru parser → LightRAG。
+    与 /documents/text 共享同一个 container working_dir，写入同一知识图谱。
+    """
+    validate_container_name(container)
+    _require_lightrag_ready()
+    if get_raganything is None:
+        raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
+
+    filename = file.filename or 'upload.bin'
+    if '/' in filename or '\\' in filename or filename in ('.', '..'):
+        raise HTTPException(status_code=400, detail=f'invalid filename: {filename}')
+
+    # 流式落盘到临时目录，同时做大小上限检查
+    tmp_dir = Path(tempfile.mkdtemp(prefix='tm-upload-'))
+    saved = tmp_dir / filename
+    total = 0
+    try:
+        with saved.open('wb') as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f'file exceeds max upload size {_MAX_UPLOAD_BYTES} bytes',
+                    )
+                f.write(chunk)
+
+        rag = await get_raganything(container)
+        parse_output = tmp_dir / 'parsed'
+        parse_output.mkdir(exist_ok=True)
+        await rag.process_document_complete(
+            file_path=str(saved),
+            output_dir=str(parse_output),
+            parse_method=parse_method or os.environ.get('RAG_PARSE_METHOD', 'auto'),
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return QueryResponse(
+        status='ok',
+        query='',
+        container=container,
+        answer=f'Document {filename} ({total} bytes) ingested into container {container}.',
         mode='insert',
     )
 
