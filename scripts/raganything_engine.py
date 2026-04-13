@@ -22,6 +22,7 @@ try:
         _embed_func,
         _llm_func,
         _container_working_dir,
+        call_openai_chat,
         get_lightrag,
         LLM_BASE_URL as _RAG_LLM_BASE_URL,
         LLM_API_KEY as _RAG_LLM_API_KEY,
@@ -32,6 +33,7 @@ except ModuleNotFoundError:  # pragma: no cover
         _embed_func,
         _llm_func,
         _container_working_dir,
+        call_openai_chat,
         get_lightrag,
         LLM_BASE_URL as _RAG_LLM_BASE_URL,
         LLM_API_KEY as _RAG_LLM_API_KEY,
@@ -51,25 +53,35 @@ _locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
 
 
+def _image_url_field(img: str) -> str:
+    """把 raganything 传来的图像字段归一成 chat/completions 的 image_url.url。"""
+    if img.startswith("http://") or img.startswith("https://") or img.startswith("data:"):
+        return img
+    # 本地文件路径 → 读取并 base64 编码
+    if os.path.isabs(img) and os.path.exists(img):
+        import base64, mimetypes
+        mime = mimetypes.guess_type(img)[0] or "image/png"
+        with open(img, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f"data:{mime};base64,{b64}"
+    # 默认按 base64 字符串处理
+    return f"data:image/png;base64,{img}"
+
+
 async def _vision_model_func(
-    prompt: str,
+    prompt: str = "",
     system_prompt: str | None = None,
     history_messages: list[dict[str, Any]] | None = None,
     image_data: str | list[str] | None = None,
     messages: list[dict[str, Any]] | None = None,
     **_: Any,
 ) -> str:
-    """OpenAI 兼容的 vision chat/completions 调用。
+    """OpenAI 兼容的 vision chat/completions 调用，带指数退避重试。
 
-    兼容 RAGAnything 既有两种调用签名：
+    兼容 RAGAnything 的两种调用签名：
       1) 直接传 `messages=[...]`（含混排 text/image_url content）
-      2) 传 `prompt` + `image_data`（base64 编码的单张或多张图片）
+      2) 传 `prompt` + `image_data`（URL / data URI / 绝对路径 / base64 字符串）
     """
-    import httpx
-
-    url = f"{VLM_BASE_URL.rstrip('/')}/chat/completions"
-    headers = {"Authorization": f"Bearer {VLM_API_KEY}"}
-
     if messages is None:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         images: list[str] = []
@@ -78,8 +90,7 @@ async def _vision_model_func(
         elif isinstance(image_data, list):
             images = list(image_data)
         for img in images:
-            url_field = img if img.startswith("http") or img.startswith("data:") else f"data:image/jpeg;base64,{img}"
-            content.append({"type": "image_url", "image_url": {"url": url_field}})
+            content.append({"type": "image_url", "image_url": {"url": _image_url_field(img)}})
         msgs: list[dict[str, Any]] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
@@ -89,15 +100,13 @@ async def _vision_model_func(
     else:
         msgs = messages
 
-    payload = {"model": VLM_MODEL, "messages": msgs}
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        out = data["choices"][0]["message"].get("content")
-        if not out:
-            raise ValueError(f"VLM returned empty content: {data}")
-        return out
+    return await call_openai_chat(
+        base_url=VLM_BASE_URL,
+        api_key=VLM_API_KEY,
+        model=VLM_MODEL,
+        messages=msgs,
+        label="VLM",
+    )
 
 
 async def _get_lock(container: str) -> asyncio.Lock:
