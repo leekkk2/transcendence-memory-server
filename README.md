@@ -270,6 +270,42 @@ tm-server export-token       # Export connection token
 
 Pair with [transcendence-memory](https://github.com/leekkk2/transcendence-memory) — an agent skill that provides built-in commands (`/tm connect`, `/tm search`, `/tm remember`, `/tm query`) for Claude Code, OpenClaw, Codex CLI, and other AI coding agents.
 
+## Rclone Archive → Searchable Memory Workflow
+
+For EVA-style deployments where historical archive data must remain at its original rclone path while still being searchable through `transcendence-memory-server`, use this pattern:
+
+1. Keep source data in place, e.g. `/mnt/rclone/zweiteng/eva`
+2. Bind-mount the rclone root into the container as read-only with mount propagation. Do this in a host-specific `docker-compose.override.yml` (auto-loaded by `docker compose`, gitignored by this repo) so upstream defaults stay untouched:
+   ```yaml
+   # docker-compose.override.yml (host-only, never committed)
+   services:
+     rag-server:
+       volumes:
+         - /mnt/rclone/zweiteng:/mnt/rclone/zweiteng:ro,slave
+   ```
+3. Expose a canonical in-container source path, e.g.:
+   ```bash
+   ln -s /mnt/rclone/zweiteng/eva /data/tasks/rag/containers/eva/sources/rclone-eva
+   ```
+4. Materialize retrievable objects into canonical storage (`memory_objects.jsonl`) using the helper script:
+   ```bash
+   python3 scripts/sync_rclone_archive_to_memory_objects.py \
+     --origin-root /mnt/rclone/zweiteng/eva \
+     --memory-objects /data/tasks/rag/containers/eva/memory_objects.jsonl
+   ```
+5. Rebuild LanceDB:
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8711/embed \
+     -H "X-API-KEY: $RAG_API_KEY" -H "Content-Type: application/json" \
+     -d '{"container":"eva","wait":true}'
+   ```
+
+Why this pattern is recommended:
+- original archive path stays unchanged
+- container access remains read-only and auditable
+- retrieval still goes through the server's canonical `memory_objects.jsonl -> /embed -> LanceDB` path
+- avoids treating raw FUSE/rclone directories as a live database
+
 ## Documentation
 
 - [Quick Start](docs/deployment/quickstart.md)
