@@ -52,3 +52,7 @@ coverage.xml
 .notes/
 .drafts/
 DEPLOY_ISSUES_*.md
+
+# Host-specific compose override (auto-loaded by docker compose)
+docker-compose.override.yml
+docker-compose.override.*.yml
