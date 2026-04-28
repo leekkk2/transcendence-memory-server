@@ -30,20 +30,83 @@ _lightrag_locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
 
 
+_EMBED_MAX_RETRIES = int(os.environ.get("EMBEDDING_MAX_RETRIES", "6"))
+_EMBED_RETRY_BASE_DELAY = float(os.environ.get("EMBEDDING_RETRY_BASE_DELAY", "1.5"))
+_EMBED_RETRY_MAX_DELAY = float(os.environ.get("EMBEDDING_RETRY_MAX_DELAY", "60"))
+_EMBED_TIMEOUT = float(os.environ.get("EMBEDDING_TIMEOUT", "90"))
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    import time
+    from email.utils import parsedate_to_datetime
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt is None:
+            return None
+        return max(0.0, dt.timestamp() - time.time())
+    except (TypeError, ValueError):
+        return None
+
+
+def _embed_backoff(attempt: int, retry_after: float | None) -> float:
+    import random
+    base = min(_EMBED_RETRY_BASE_DELAY * (2 ** attempt), _EMBED_RETRY_MAX_DELAY)
+    jitter = base * random.uniform(-0.25, 0.25)
+    delay = max(0.5, base + jitter)
+    if retry_after is not None:
+        delay = max(delay, min(retry_after, _EMBED_RETRY_MAX_DELAY))
+    return delay
+
+
 async def _embed_func(texts: list[str]):
+    """Embedding 调用，对 5xx / 429 / 连接错误执行指数退避重试，尊重 Retry-After。"""
     import httpx
     import numpy as np
+
     url = f"{BASE_URL.rstrip('/')}/embeddings"
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp = await client.post(
-            url,
-            json={"model": EMBEDDING_MODEL, "input": texts},
-            headers={"Authorization": f"Bearer {API_KEY}"},
-        )
-        resp.raise_for_status()
-        data = resp.json()["data"]
-        sorted_data = sorted(data, key=lambda x: x["index"])
-        return np.array([d["embedding"] for d in sorted_data], dtype="float32")
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    payload = {"model": EMBEDDING_MODEL, "input": texts}
+
+    last_exc: Exception | None = None
+    async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
+        for attempt in range(_EMBED_MAX_RETRIES):
+            retry_after: float | None = None
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                    raise httpx.HTTPStatusError(
+                        f"embedding upstream {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                resp.raise_for_status()
+                data = resp.json()["data"]
+                sorted_data = sorted(data, key=lambda x: x["index"])
+                return np.array([d["embedding"] for d in sorted_data], dtype="float32")
+            except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    code = exc.response.status_code
+                    if not (code == 429 or code >= 500):
+                        raise
+                last_exc = exc
+                if attempt == _EMBED_MAX_RETRIES - 1:
+                    break
+                delay = _embed_backoff(attempt, retry_after)
+                logger.warning(
+                    "Embedding call failed (attempt %d/%d): %s; retrying in %.1fs",
+                    attempt + 1, _EMBED_MAX_RETRIES, exc, delay,
+                )
+                await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 _LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
