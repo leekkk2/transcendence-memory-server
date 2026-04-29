@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -241,80 +241,132 @@ def load_existing_rows(container: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _is_metadata_string_schema(table) -> bool:
+    """检查 LanceDB 表的 metadata 列是不是 string 类型（v0.5.4+ schema）。
+
+    旧版（≤v0.5.2）将 metadata 直接存为嵌套 struct，schema 字段不一致会让 add()
+    抛 `Invalid input, field 'X' does not exist in table schema`。
+    """
+    try:
+        field = table.schema.field('metadata')
+        type_str = str(field.type).lower()
+        return 'string' in type_str
+    except Exception:
+        return False
+
+
+def _try_optimize(table) -> None:
+    """合并 fragments + 清理旧版本，避免 LanceDB MVCC 累积膨胀盘占。
+
+    历史教训（2026-04-29）：v0.5.2 之前 ingest 用 mode='overwrite' 创建新 dataset
+    version 但保留旧 fragments，多次 ingest 后 yzjx 容器从 ~100 MB 实际数据
+    膨胀到 2.0 GB 盘占。
+    """
+    try:
+        # optimize() 内部 = compact_files() + cleanup_old_versions()
+        # cleanup_older_than=0 立刻清掉所有旧版本（生产 OK，因为 ingest 是 batch 操作，
+        # 没有 in-flight reader 还在读旧 version）
+        table.optimize(cleanup_older_than=datetime.timedelta(seconds=0))
+    except Exception:
+        # fallback: 单独调，互不依赖
+        try:
+            table.compact_files()
+        except Exception:
+            pass
+        try:
+            table.cleanup_old_versions()
+        except Exception:
+            pass
+
+
 def rebuild_rows(
     container: str,
     fresh_rows: list[dict[str, Any]],
     batch_size: int = 50,
 ) -> dict[str, int]:
-    """Batched overwrite: 第一批用 mode='overwrite' 重置 schema，后续 batch 用 add。
+    """In-place incremental rebuild + 自动 fragment 清理。
 
-    设计要点（基于 2026-04-29 OOM 复盘）：
-    - **batched write**：每批 ~batch_size 条 vector flush 到 table，避免主进程
-      持有所有 vector 列表（旧实现单进程峰值 RSS ~1 GB，叠加 retry churn 把
-      宿主机推到 swap thrashing）。
-    - **first-batch overwrite**：第一次 add 用 mode='overwrite' 清掉旧表，
-      解决跨次 ingest 的 schema 不兼容问题（特别是 metadata 列从 struct → string
-      的迁移）。
-    - **retain rows 也 normalize**：旧表的 metadata 可能是 struct，统一转 string
-      后再写回，保证整张表 schema 一致。
-    - **失败时只保留部分行**：mode='overwrite' first batch 已删除旧数据，
-      后续某个 batch add 失败会丢失剩余行——但比"完整 list 一次性写、失败前功尽弃"
-      好：retry 期间内存是 batch 级（KB 量级）而不是整库级（GB 量级）。
+    设计要点（基于 2026-04-29 多次复盘）：
+    - **不再 rmtree**：v0.5.4 用 shutil.rmtree 在 embed 失败时会丢索引（jsonl 是
+      source of truth 没真丢，但用户感知是"数据没了"）。改为 in-place delete +
+      add，失败时旧索引保留，下次 ingest 继续修复。
+    - **delete REBUILD_DOC_TYPES + 增量 add**：retain 行原地保留，新行追加，
+      不重写整表。
+    - **batched flush**：每批 ~batch_size 条 flush，主进程峰值内存 ~KB 而非 GB。
+    - **schema 不兼容自动 fallback**：旧表 metadata=struct 时 add() 会失败，
+      自动切到 mode='overwrite' 完成一次性 schema migration（仅在跨大版本升级时触发）。
+    - **末尾 optimize**：自动 compact_files + cleanup_old_versions，避免 MVCC
+      fragments 累积（杜绝 yzjx 容器 100 MB 数据膨胀到 2 GB 的旧 bug）。
     """
-    db_dir = lancedb_dir(container)
+    db = lancedb.connect(str(lancedb_dir(container)))
 
-    # 1. 加载并 normalize retain rows（不属于 REBUILD_DOC_TYPES 的旧行）
-    retained_rows: list[dict[str, Any]] = []
+    # 1. 打开既有表，检查 schema 兼容性
+    table = None
+    schema_compatible = False
     try:
-        old_db = lancedb.connect(str(db_dir))
-        old_table = old_db.open_table('chunks')
-        for raw in old_table.to_arrow().to_pylist():
-            item = dict(raw)
-            item.pop('_distance', None)
-            if str(item.get('docType') or '') in REBUILD_DOC_TYPES:
-                continue
-            _normalize_metadata_inplace(item)
-            retained_rows.append(item)
+        table = db.open_table('chunks')
+        schema_compatible = _is_metadata_string_schema(table)
     except Exception:
-        pass
+        table = None
 
-    if not fresh_rows and not retained_rows:
-        return {'retained': 0, 'ingested': 0, 'total': 0}
-
-    # 2. 直接 rmtree 旧 LanceDB 目录绕开 lancedb 0.30.x 的 drop_table /
-    #    mode='overwrite' 偶发 listing.rs unreachable! panic（macOS RustPanic /
-    #    Linux SIGABRT 不可 except）。retain 数据已经在内存里，下面会重新写回。
-    chunks_path = db_dir / 'chunks.lance'
-    if chunks_path.exists():
+    # 2. 如果旧 schema 不兼容（metadata=struct），需要做一次性 migration:
+    #    把 retain 行读到内存 → mode='overwrite' 重建 schema 时一并写回
+    retain_for_migration: list[dict[str, Any]] = []
+    if table is not None and not schema_compatible:
         try:
-            shutil.rmtree(chunks_path)
+            for raw in table.to_arrow().to_pylist():
+                item = dict(raw)
+                item.pop('_distance', None)
+                if str(item.get('docType') or '') in REBUILD_DOC_TYPES:
+                    continue
+                _normalize_metadata_inplace(item)
+                retain_for_migration.append(item)
+        except Exception:
+            pass
+        # migration 标记：让 _flush 第一批走 mode='overwrite'
+        table = None  # 重置，下面 _flush 第一次会重建
+
+    # 3. schema 兼容时只删 REBUILD_DOC_TYPES 那部分，retain 行原地保留
+    if table is not None and schema_compatible:
+        rebuild_types = ", ".join(f"'{t}'" for t in REBUILD_DOC_TYPES)
+        try:
+            table.delete(f"docType IN ({rebuild_types})")
         except Exception:
             pass
 
-    # 3. 重新 connect 让 LanceDB 看到清空后的 path
-    db = lancedb.connect(str(db_dir))
+    if not fresh_rows and not retain_for_migration:
+        # 没有新数据也不需要 migration — 仅 compact + 返回
+        if table is not None:
+            _try_optimize(table)
+            n = int(table.count_rows())
+            return {'retained': n, 'ingested': 0, 'total': n}
+        return {'retained': 0, 'ingested': 0, 'total': 0}
 
     ingested = 0
-    table = None
     buf: list[dict[str, Any]] = []
+    is_first_flush = True
 
     def _flush(items: list[dict[str, Any]]) -> None:
-        nonlocal table
+        nonlocal table, is_first_flush
         if not items:
             return
         if table is None:
-            table = db.create_table('chunks', data=items)
+            # 表不存在 → 第一批 create_table（默认 mode='create'）
+            # 如果是 schema migration 路径，用 mode='overwrite' 清掉旧 dataset
+            mode = 'overwrite' if (is_first_flush and retain_for_migration) else 'create'
+            table = db.create_table('chunks', data=items, mode=mode)
         else:
             table.add(items)
+        is_first_flush = False
 
-    # 2. 先 flush retained
-    for row in retained_rows:
+    # 4a. migration 模式下先 flush 旧 retain 行（schema 已 normalize 为 string）
+    for row in retain_for_migration:
         buf.append(row)
         if len(buf) >= batch_size:
             _flush(buf)
             buf = []
 
-    # 3. 再 embed + flush fresh rows
+    # 4b. embed + flush 新 fresh rows
     for row in fresh_rows:
         item = _normalize_row(row, container)
         item['vector'] = embed_text(item['text']).tolist()
@@ -326,14 +378,16 @@ def rebuild_rows(
 
     _flush(buf)
 
+    # 5. 末尾 optimize 清旧 fragments
+    if table is not None:
+        _try_optimize(table)
+
     if table is None:
-        # buf 为空且 retained_rows + fresh_rows 都为空 — 上面已 early return
-        # 安全兜底
-        return {'retained': len(retained_rows), 'ingested': ingested, 'total': 0}
+        return {'retained': len(retain_for_migration), 'ingested': ingested, 'total': 0}
 
     total = int(table.count_rows())
     return {
-        'retained': len(retained_rows),
+        'retained': max(0, total - ingested),
         'ingested': ingested,
         'total': total,
     }
