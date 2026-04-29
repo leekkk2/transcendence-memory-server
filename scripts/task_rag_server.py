@@ -544,7 +544,21 @@ def search(req: SearchReq) -> SearchResponse:
 
 @app.post('/embed', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def embed(req: ContainerReq) -> CommandResponse:
-    return run_or_start([str(script_path('task_rag_lancedb_ingest.py')), '--container', req.container], req.timeout_s, req.background, req.wait)
+    cmd = [str(script_path('task_rag_lancedb_ingest.py')), '--container', req.container]
+    result = run_or_start(cmd, req.timeout_s, req.background, req.wait)
+    # lancedb 0.30.x 在子进程内偶发 listing.rs unreachable! panic（macOS RustPanic /
+    # Linux SIGABRT, rc=-6）。这种崩溃由 race condition 触发，重试一次几乎必稳。
+    # 仅对 wait=True 的同步调用做兜底重试，避免 background 任务被双开。
+    if (
+        result.code in (-6, 134, 1)  # -6 = SIGABRT (POSIX), 134 = 128+6
+        and not result.background
+        and (req.wait or req.background is False)
+    ):
+        retry = run_or_start(cmd, req.timeout_s, req.background, req.wait)
+        if retry.code == 0:
+            retry.note = (retry.note or '') + ' (auto-retried after lancedb panic)'
+            return retry
+    return result
 
 
 @app.post('/build-manifest', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
