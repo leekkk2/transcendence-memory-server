@@ -110,6 +110,23 @@ jobs:
         flavor: [lite, full]
     steps:
       - uses: actions/checkout@v4
+      # ubuntu-latest runner 默认仅 ~14 GB 可用空间，full 镜像（mineru / opencv /
+      # raganything 多平台）会爆 "no space left on device"（v0.5.6 实测）。
+      # 删除预装的 dotnet/android/ghc/codeql + docker prune 释放 ~30 GB。
+      - name: Free up disk space (full flavor only)
+        if: matrix.flavor == 'full'
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"/PyPy
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"/Ruby
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"/go
+          sudo docker image prune --all --force || true
+          df -h /
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
