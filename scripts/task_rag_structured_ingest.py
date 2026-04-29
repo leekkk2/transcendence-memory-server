@@ -11,10 +11,10 @@ from typing import Any
 import lancedb
 
 try:
-    from task_rag_lancedb_ingest import load_existing_rows
+    from task_rag_lancedb_ingest import _try_optimize, load_existing_rows
     from task_rag_runtime import embed_text, lancedb_dir
 except ModuleNotFoundError:  # pragma: no cover - package import path
-    from scripts.task_rag_lancedb_ingest import load_existing_rows
+    from scripts.task_rag_lancedb_ingest import _try_optimize, load_existing_rows
     from scripts.task_rag_runtime import embed_text, lancedb_dir
 
 
@@ -142,7 +142,10 @@ def upsert_records(container: str, doc_id: str, doc_type: str, records: list[dic
     merged = retained + materialized
     if merged:
         db = lancedb.connect(str(lancedb_dir(container)))
-        db.create_table('chunks', data=merged, mode='overwrite')
+        table = db.create_table('chunks', data=merged, mode='overwrite')
+        # 末尾 optimize 防止 mode='overwrite' 累积 dead fragments（旧版本会让单容器
+        # 从实际几十 MB 数据膨胀到 GB 级盘占）
+        _try_optimize(table)
     return {
         'retained': len(retained),
         'ingested': len(materialized),
