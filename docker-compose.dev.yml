@@ -1,0 +1,8 @@
+services:
+  rag-server:
+    image: transcendence-memory-server:dev-${BUILD_TARGET:-lite}
+    build:
+      context: .
+      target: ${BUILD_TARGET:-lite}
+    mem_limit: 6g
+    memswap_limit: 6g

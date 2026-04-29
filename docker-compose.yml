@@ -1,8 +1,6 @@
 services:
   rag-server:
-    build:
-      context: .
-      target: ${BUILD_TARGET:-lite}
+    image: ${TM_IMAGE:?TM_IMAGE 必须设置，例如 docker.io/<dockerhub-user>/transcendence-memory-server:lite。本仓库 docker-compose.yml 不包含 build 段（远端永久禁 build），如需本地构建请用 docker-compose.dev.yml}
     ports:
       - "${TM_PORT:-8711}:8711"
     volumes:
@@ -13,11 +11,15 @@ services:
     environment:
       - WORKSPACE=/data
     restart: unless-stopped
+    mem_limit: ${TM_MEM_LIMIT:-3g}
+    memswap_limit: ${TM_MEM_LIMIT:-3g}
+    mem_reservation: ${TM_MEM_RESERVATION:-1g}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8711/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
     logging:
       driver: json-file
       options:
