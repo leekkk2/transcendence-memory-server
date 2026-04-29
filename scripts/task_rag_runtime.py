@@ -25,11 +25,15 @@ EMBEDDINGS_BASE_URL = (
 )
 GOOGLE_BASE_URL = os.getenv('GOOGLE_EMBEDDING_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/models')
 
-# 重试配置：上游限速时（429/5xx）走指数退避 + 抖动，远高于默认 3 次以扛住短时配额耗尽
-_EMBED_MAX_RETRIES = int(os.getenv('EMBEDDING_MAX_RETRIES', '6'))
+# 重试配置：上游限速时（429/5xx）走指数退避 + 抖动。
+# 单条 chunk 最坏耗时 = MAX_RETRIES * (TIMEOUT + 平均退避)，控制在 ~3 分钟内，
+# 避免 ingest 卡住时主线程持有 materialized_rows 列表导致内存压力持续累积。
+# 历史教训（2026-04-29）：MAX_RETRIES=6 + MAX_DELAY=60 让 ingest 单条最坏卡 ~9 分钟，
+# 容器整体陷入 churn 推升 swap thrashing。
+_EMBED_MAX_RETRIES = int(os.getenv('EMBEDDING_MAX_RETRIES', '3'))
 _EMBED_RETRY_BASE_DELAY = float(os.getenv('EMBEDDING_RETRY_BASE_DELAY', '1.5'))
-_EMBED_RETRY_MAX_DELAY = float(os.getenv('EMBEDDING_RETRY_MAX_DELAY', '60'))
-_EMBED_TIMEOUT = float(os.getenv('EMBEDDING_TIMEOUT', '90'))
+_EMBED_RETRY_MAX_DELAY = float(os.getenv('EMBEDDING_RETRY_MAX_DELAY', '30'))
+_EMBED_TIMEOUT = float(os.getenv('EMBEDDING_TIMEOUT', '60'))
 
 logger = logging.getLogger(__name__)
 if not logger.handlers and not logging.getLogger().handlers:

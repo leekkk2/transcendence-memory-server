@@ -180,6 +180,52 @@ def collect_memory_objects(container: str) -> list[dict[str, Any]]:
     return records
 
 
+# 所有 row 的统一 schema 字段集 — 保证 streaming add 时 schema 一致
+_ROW_SCHEMA_FIELDS: tuple[str, ...] = (
+    'chunkId', 'taskId', 'docType', 'sourcePath', 'section', 'text',
+    'container', 'title', 'source', 'tags', 'metadata',
+)
+
+
+def _normalize_metadata_inplace(row: dict[str, Any]) -> None:
+    """metadata 统一序列化为 JSON 字符串，避免 LanceDB 嵌套 struct schema 不兼容。
+
+    历史问题（2026-04-29）：不同 docType 的 metadata 字段不同（task_card 含
+    project/status；client_ingest 含 kind/taskId），LanceDB 第一次建表时按首条
+    row 推断嵌套 struct schema，后续 add 不同 keys 的 row 会抛
+    `Invalid input, field 'X' does not exist in table schema`。
+    解决：metadata 列类型统一为 string，反序列化推迟到查询端按需处理。
+    """
+    raw = row.get('metadata')
+    if isinstance(raw, str):
+        return
+    if isinstance(raw, dict):
+        row['metadata'] = json.dumps(raw, ensure_ascii=False, default=str)
+    elif raw is None:
+        row['metadata'] = '{}'
+    else:
+        try:
+            row['metadata'] = json.dumps(raw, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            row['metadata'] = '{}'
+
+
+def _normalize_row(row: dict[str, Any], container: str) -> dict[str, Any]:
+    """补齐缺失字段，保证混合来源（task_card / memory / client_ingest）的 schema 一致。"""
+    item: dict[str, Any] = {}
+    for field in _ROW_SCHEMA_FIELDS:
+        item[field] = row.get(field)
+    item['container'] = container
+    if item.get('tags') is None:
+        item['tags'] = []
+    if item.get('title') is None:
+        item['title'] = ''
+    if item.get('source') is None:
+        item['source'] = ''
+    _normalize_metadata_inplace(item)
+    return item
+
+
 def load_existing_rows(container: str) -> list[dict[str, Any]]:
     db = lancedb.connect(str(lancedb_dir(container)))
     try:
@@ -194,27 +240,98 @@ def load_existing_rows(container: str) -> list[dict[str, Any]]:
     return rows
 
 
-def rebuild_rows(container: str, fresh_rows: list[dict[str, Any]]) -> dict[str, int]:
-    existing_rows = load_existing_rows(container)
-    retained_rows = [
-        row for row in existing_rows
-        if str(row.get('docType') or '') not in REBUILD_DOC_TYPES
-    ]
-    materialized_rows = []
-    for row in fresh_rows:
-        item = dict(row)
-        item['container'] = container
-        item['vector'] = embed_text(item['text']).tolist()
-        materialized_rows.append(item)
+def rebuild_rows(
+    container: str,
+    fresh_rows: list[dict[str, Any]],
+    batch_size: int = 50,
+) -> dict[str, int]:
+    """Batched overwrite: 第一批用 mode='overwrite' 重置 schema，后续 batch 用 add。
 
-    merged_rows = retained_rows + materialized_rows
-    if merged_rows:
-        db = lancedb.connect(str(lancedb_dir(container)))
-        db.create_table('chunks', data=merged_rows, mode='overwrite')
+    设计要点（基于 2026-04-29 OOM 复盘）：
+    - **batched write**：每批 ~batch_size 条 vector flush 到 table，避免主进程
+      持有所有 vector 列表（旧实现单进程峰值 RSS ~1 GB，叠加 retry churn 把
+      宿主机推到 swap thrashing）。
+    - **first-batch overwrite**：第一次 add 用 mode='overwrite' 清掉旧表，
+      解决跨次 ingest 的 schema 不兼容问题（特别是 metadata 列从 struct → string
+      的迁移）。
+    - **retain rows 也 normalize**：旧表的 metadata 可能是 struct，统一转 string
+      后再写回，保证整张表 schema 一致。
+    - **失败时只保留部分行**：mode='overwrite' first batch 已删除旧数据，
+      后续某个 batch add 失败会丢失剩余行——但比"完整 list 一次性写、失败前功尽弃"
+      好：retry 期间内存是 batch 级（KB 量级）而不是整库级（GB 量级）。
+    """
+    db = lancedb.connect(str(lancedb_dir(container)))
+
+    # 1. 加载并 normalize retain rows（不属于 REBUILD_DOC_TYPES 的旧行）
+    retained_rows: list[dict[str, Any]] = []
+    try:
+        old_table = db.open_table('chunks')
+        for raw in old_table.to_arrow().to_pylist():
+            item = dict(raw)
+            item.pop('_distance', None)
+            if str(item.get('docType') or '') in REBUILD_DOC_TYPES:
+                continue
+            _normalize_metadata_inplace(item)
+            retained_rows.append(item)
+    except Exception:
+        pass
+
+    if not fresh_rows and not retained_rows:
+        return {'retained': 0, 'ingested': 0, 'total': 0}
+
+    ingested = 0
+    table = None
+    buf: list[dict[str, Any]] = []
+
+    def _flush(items: list[dict[str, Any]]) -> None:
+        nonlocal table
+        if not items:
+            return
+        if table is None:
+            # 第一批 → 清掉旧表（含历史 schema 不兼容的数据）
+            # lancedb 0.30.x 在 mode='overwrite' + 旧 dataset 残留时偶发
+            # `pyo3_async_runtimes.RustPanic: rust future panicked` (listing.rs unreachable!)
+            # 手动 drop_table 后再 create 可绕过
+            try:
+                table = db.create_table('chunks', data=items, mode='overwrite')
+            except Exception:
+                try:
+                    db.drop_table('chunks', ignore_missing=True)
+                except Exception:
+                    pass
+                table = db.create_table('chunks', data=items)
+        else:
+            table.add(items)
+
+    # 2. 先 flush retained
+    for row in retained_rows:
+        buf.append(row)
+        if len(buf) >= batch_size:
+            _flush(buf)
+            buf = []
+
+    # 3. 再 embed + flush fresh rows
+    for row in fresh_rows:
+        item = _normalize_row(row, container)
+        item['vector'] = embed_text(item['text']).tolist()
+        buf.append(item)
+        ingested += 1
+        if len(buf) >= batch_size:
+            _flush(buf)
+            buf = []
+
+    _flush(buf)
+
+    if table is None:
+        # buf 为空且 retained_rows + fresh_rows 都为空 — 上面已 early return
+        # 安全兜底
+        return {'retained': len(retained_rows), 'ingested': ingested, 'total': 0}
+
+    total = int(table.count_rows())
     return {
         'retained': len(retained_rows),
-        'ingested': len(materialized_rows),
-        'total': len(merged_rows),
+        'ingested': ingested,
+        'total': total,
     }
 
 

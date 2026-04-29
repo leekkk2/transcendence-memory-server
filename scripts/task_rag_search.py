@@ -57,6 +57,15 @@ def search_lancedb(query: str, topk: int, container: str) -> dict[str, object]:
         item.pop('vector', None)
         if distance is not None:
             item['score'] = float(distance)
+        # ingest 端 metadata 序列化为 JSON string；查询端反序列化回 dict 以兼容
+        # SearchHit 模型 (metadata: dict[str, object])。详见 task_rag_lancedb_ingest.py
+        raw_meta = item.get('metadata')
+        if isinstance(raw_meta, str):
+            try:
+                parsed = json.loads(raw_meta)
+                item['metadata'] = parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                item['metadata'] = {}
         cleaned.append(item)
     return {
         'code': 'ok',

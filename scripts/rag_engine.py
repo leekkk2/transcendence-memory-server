@@ -30,10 +30,12 @@ _lightrag_locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
 
 
-_EMBED_MAX_RETRIES = int(os.environ.get("EMBEDDING_MAX_RETRIES", "6"))
+# 默认值与 task_rag_runtime.py 保持一致：单条最坏耗时控制在 ~3 分钟内，
+# 防止 retry 期间主调用方持有大对象导致内存压力堆积。
+_EMBED_MAX_RETRIES = int(os.environ.get("EMBEDDING_MAX_RETRIES", "3"))
 _EMBED_RETRY_BASE_DELAY = float(os.environ.get("EMBEDDING_RETRY_BASE_DELAY", "1.5"))
-_EMBED_RETRY_MAX_DELAY = float(os.environ.get("EMBEDDING_RETRY_MAX_DELAY", "60"))
-_EMBED_TIMEOUT = float(os.environ.get("EMBEDDING_TIMEOUT", "90"))
+_EMBED_RETRY_MAX_DELAY = float(os.environ.get("EMBEDDING_RETRY_MAX_DELAY", "30"))
+_EMBED_TIMEOUT = float(os.environ.get("EMBEDDING_TIMEOUT", "60"))
 
 
 def _parse_retry_after(value: str | None) -> float | None:
