@@ -1,0 +1,57 @@
+# 版本控制
+.git
+.gitignore
+.gitattributes
+
+# 本地虚拟环境与缓存
+.venv
+venv
+env
+*.egg-info
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+
+# 测试与开发产物
+tests
+htmlcov
+.coverage
+.coverage.*
+coverage.xml
+release-assets
+
+# IDE / 编辑器
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# 日志与本地数据
+*.log
+data
+tmp
+*.lance
+*.db
+
+# 文档与 ops 笔记（除 README 外不进镜像）
+docs
+ops-notes
+*.md
+!README.md
+
+# 容器与编排（除 Dockerfile 自身）
+docker-compose*.yml
+.dockerignore
+Dockerfile.*
+
+# CI / GitHub
+.github
+
+# 环境模板（敏感信息隔离）
+.env
+.env.*
+!.env.example
