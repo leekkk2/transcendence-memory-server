@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -255,6 +257,57 @@ def _is_metadata_string_schema(table) -> bool:
         return False
 
 
+_logger = logging.getLogger(__name__)
+if not _logger.handlers and not logging.getLogger().handlers:
+    import sys as _sys
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s', stream=_sys.stderr)
+
+
+class IngestPacer:
+    """自适应限速器：连续失败时指数退避 sleep（规避上游限速），
+    连续成功时 sleep 收敛回 0。
+
+    Why: gemini-embedding-001 等上游在突发并发下返回 429/5xx，但客户端
+    无法直接探知"何时该慢下来"。通过 success/failure 信号自适应即可
+    避免硬编码 sleep。
+
+    用法：
+        pacer = IngestPacer()
+        for row in rows:
+            try:
+                embed(...)
+                pacer.on_success()
+            except Exception:
+                pacer.on_failure()
+            pacer.sleep_if_needed()
+    """
+
+    def __init__(self, threshold: int = 3, base: float = 2.0, max_delay: float = 30.0):
+        self._threshold = threshold
+        self._base = base
+        self._max = max_delay
+        self._consecutive_fails = 0
+        self._success_streak = 0
+        self.delay = 0.0
+
+    def on_success(self) -> None:
+        self._consecutive_fails = 0
+        self._success_streak += 1
+        if self._success_streak >= 5 and self.delay > 0:
+            self.delay = max(0.0, self.delay / 2 - 0.5)
+            self._success_streak = 0
+
+    def on_failure(self) -> None:
+        self._success_streak = 0
+        self._consecutive_fails += 1
+        if self._consecutive_fails >= self._threshold:
+            self.delay = self._base if self.delay == 0 else min(self._max, self.delay * 2)
+
+    def sleep_if_needed(self) -> None:
+        if self.delay > 0:
+            time.sleep(self.delay)
+
+
 def _try_optimize(table) -> None:
     """合并 fragments + 清理旧版本，避免 LanceDB MVCC 累积膨胀盘占。
 
@@ -366,29 +419,88 @@ def rebuild_rows(
             _flush(buf)
             buf = []
 
-    # 4b. embed + flush 新 fresh rows
+    # 4b. Pass 1：embed + flush 新 fresh rows，单条失败记录到 retry queue 不阻塞
+    pacer = IngestPacer(threshold=3, base=2.0, max_delay=30.0)
+    failed_pass1: list[dict[str, Any]] = []
+    HARD_FAIL_LIMIT = 20  # 连续 20 条失败说明上游真断了，整体 raise 让下次重跑
+    consecutive_fails = 0
+
     for row in fresh_rows:
         item = _normalize_row(row, container)
-        item['vector'] = embed_text(item['text']).tolist()
-        buf.append(item)
-        ingested += 1
-        if len(buf) >= batch_size:
-            _flush(buf)
-            buf = []
+        try:
+            item['vector'] = embed_text(item['text']).tolist()
+            pacer.on_success()
+            consecutive_fails = 0
+            buf.append(item)
+            ingested += 1
+            if len(buf) >= batch_size:
+                _flush(buf)
+                buf = []
+        except Exception as exc:
+            pacer.on_failure()
+            consecutive_fails += 1
+            failed_pass1.append({'row': row, 'error': str(exc)[:200]})
+            if consecutive_fails >= HARD_FAIL_LIMIT:
+                _flush(buf)
+                if table is not None:
+                    _try_optimize(table)
+                raise RuntimeError(
+                    f'Aborting ingest: {HARD_FAIL_LIMIT} consecutive embed failures, '
+                    f'last: {exc}'
+                )
+            _logger.warning(
+                'embed pass1 chunkId=%s failed (%d/%d consecutive): %s',
+                row.get('chunkId'), consecutive_fails, HARD_FAIL_LIMIT, str(exc)[:120],
+            )
+        pacer.sleep_if_needed()
 
     _flush(buf)
+    buf = []
+
+    # 4c. Pass 2：失败队列固定间隔重试一次（绕开瞬时 5xx / 限速）
+    skipped: list[dict[str, str]] = []
+    if failed_pass1:
+        _logger.info('pass2: retrying %d failed chunks at 5s interval', len(failed_pass1))
+        for entry in failed_pass1:
+            time.sleep(5.0)
+            row = entry['row']
+            item = _normalize_row(row, container)
+            try:
+                item['vector'] = embed_text(item['text']).tolist()
+                buf.append(item)
+                ingested += 1
+                if len(buf) >= batch_size:
+                    _flush(buf)
+                    buf = []
+            except Exception as exc:
+                skipped.append({
+                    'chunkId': str(item.get('chunkId') or ''),
+                    'error': str(exc)[:200],
+                })
+                _logger.warning(
+                    'embed pass2 chunkId=%s still failing, skipped: %s',
+                    item.get('chunkId'), str(exc)[:120],
+                )
+        _flush(buf)
 
     # 5. 末尾 optimize 清旧 fragments
     if table is not None:
         _try_optimize(table)
 
     if table is None:
-        return {'retained': len(retain_for_migration), 'ingested': ingested, 'total': 0}
+        return {
+            'retained': len(retain_for_migration),
+            'ingested': ingested,
+            'skipped': len(skipped),
+            'total': 0,
+        }
 
     total = int(table.count_rows())
     return {
         'retained': max(0, total - ingested),
         'ingested': ingested,
+        'skipped': len(skipped),
+        'skipped_chunks': skipped[:20],  # 头 20 条便于排障，超过的省略
         'total': total,
     }
 
