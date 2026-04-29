@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -260,12 +261,13 @@ def rebuild_rows(
       后续某个 batch add 失败会丢失剩余行——但比"完整 list 一次性写、失败前功尽弃"
       好：retry 期间内存是 batch 级（KB 量级）而不是整库级（GB 量级）。
     """
-    db = lancedb.connect(str(lancedb_dir(container)))
+    db_dir = lancedb_dir(container)
 
     # 1. 加载并 normalize retain rows（不属于 REBUILD_DOC_TYPES 的旧行）
     retained_rows: list[dict[str, Any]] = []
     try:
-        old_table = db.open_table('chunks')
+        old_db = lancedb.connect(str(db_dir))
+        old_table = old_db.open_table('chunks')
         for raw in old_table.to_arrow().to_pylist():
             item = dict(raw)
             item.pop('_distance', None)
@@ -279,6 +281,19 @@ def rebuild_rows(
     if not fresh_rows and not retained_rows:
         return {'retained': 0, 'ingested': 0, 'total': 0}
 
+    # 2. 直接 rmtree 旧 LanceDB 目录绕开 lancedb 0.30.x 的 drop_table /
+    #    mode='overwrite' 偶发 listing.rs unreachable! panic（macOS RustPanic /
+    #    Linux SIGABRT 不可 except）。retain 数据已经在内存里，下面会重新写回。
+    chunks_path = db_dir / 'chunks.lance'
+    if chunks_path.exists():
+        try:
+            shutil.rmtree(chunks_path)
+        except Exception:
+            pass
+
+    # 3. 重新 connect 让 LanceDB 看到清空后的 path
+    db = lancedb.connect(str(db_dir))
+
     ingested = 0
     table = None
     buf: list[dict[str, Any]] = []
@@ -288,18 +303,7 @@ def rebuild_rows(
         if not items:
             return
         if table is None:
-            # 第一批 → 清掉旧表（含历史 schema 不兼容的数据）
-            # lancedb 0.30.x 在 mode='overwrite' + 旧 dataset 残留时偶发
-            # `pyo3_async_runtimes.RustPanic: rust future panicked` (listing.rs unreachable!)
-            # 手动 drop_table 后再 create 可绕过
-            try:
-                table = db.create_table('chunks', data=items, mode='overwrite')
-            except Exception:
-                try:
-                    db.drop_table('chunks', ignore_missing=True)
-                except Exception:
-                    pass
-                table = db.create_table('chunks', data=items)
+            table = db.create_table('chunks', data=items)
         else:
             table.add(items)
 
