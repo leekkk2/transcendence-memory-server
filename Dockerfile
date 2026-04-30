@@ -1,52 +1,77 @@
 # syntax=docker/dockerfile:1.7
-# ===================================================================
-# Multi-stage Dockerfile for transcendence-memory-server
-# Stages:
-#   builder-base   - 安装核心 Python 依赖（共享层，缓存最大化）
-#   builder-lite   - lite flavor（无 multimodal 编译）
-#   builder-full   - full flavor（含 mineru / raganything / opencv-headless）
-#   runtime-base   - 系统包 + 应用代码 + healthcheck（runtime 公共层）
-#   lite / full    - 最终 image，仅复制对应 builder 的 site-packages
+# =============================================================================
+# transcendence-memory-server — multi-stage container build
 #
-# 构建：远端禁用，统一用 GitHub Actions 或本地 buildx
-# 见仓库根 CLAUDE.md 的 R1-R5 规则
-# ===================================================================
+# Stages:
+#   deps          installs runtime Python deps from pyproject.toml + constraints
+#   deps-full     adds [multimodal] extras and pre-warms mineru models
+#   runtime-base  shared runtime layer: system libs, non-root user, app code
+#   lite          final image: deps-only site-packages
+#   full          final image: deps-full site-packages + mineru model cache
+#
+# Single source of truth for Python deps is pyproject.toml. constraints.txt
+# pins versions that pip would otherwise resolve in a way the runtime can't
+# support (notably the headless variants of opencv).
+#
+# Per repo R1: this Dockerfile is built only by CI or local buildx. The
+# remote production host never builds — it only `docker pull`s the image.
+# =============================================================================
 
-ARG PYTHON_IMAGE=python:3.13-slim
+ARG PYTHON_VERSION=3.13
+ARG PYTHON_IMAGE=python:${PYTHON_VERSION}-slim-bookworm
+ARG TM_VERSION=dev
 
-# ---------- builder-base：核心依赖 ----------
-FROM ${PYTHON_IMAGE} AS builder-base
+# -----------------------------------------------------------------------------
+# Stage: deps  — resolve and install runtime Python deps. Cached aggressively
+# because we only re-execute when pyproject.toml or constraints.txt change.
+# -----------------------------------------------------------------------------
+FROM ${PYTHON_IMAGE} AS deps
+ARG PYTHON_VERSION
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_CONSTRAINT=/build/constraints.txt
 WORKDIR /build
-# 1. 先复制 metadata，让依赖层独立于源码变化
-COPY pyproject.toml README.md ./
-# 2. 再装通用依赖（pyproject 里没声明的运行时包）
-RUN pip install --no-cache-dir \
-        fastapi uvicorn httpx requests numpy \
-        lancedb pyarrow lightrag-hku
-# 3. 最后复制源码并安装本项目
-COPY src/ ./src/
-RUN pip install --no-cache-dir .
 
-# ---------- builder-lite：lite flavor 等价 builder-base ----------
-FROM builder-base AS builder-lite
+# Copy only what the dep resolver needs; source code copied later in runtime stage.
+COPY pyproject.toml constraints.txt README.md ./
+COPY src/tm_server/__init__.py ./src/tm_server/__init__.py
 
-# ---------- builder-full：multimodal flavor ----------
-# 合并多个 RUN：装 multimodal extras，然后强制把 opencv-python 替换为 headless
-# （RAGAnything 上游会拉 GUI 版的 opencv-python，import cv2 会要求 libxcb 等 X11 库）
-FROM builder-base AS builder-full
-RUN pip install --no-cache-dir ".[multimodal]" \
-    && pip uninstall -y opencv-python opencv-contrib-python || true \
-    && pip install --no-cache-dir --force-reinstall opencv-python-headless
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --constraint constraints.txt .
 
-# ---------- runtime-base：系统包 + 应用代码 ----------
+# -----------------------------------------------------------------------------
+# Stage: deps-full — add multimodal extras under the same constraints, then
+# pre-warm mineru's model cache so the first /documents/file request doesn't
+# stall on a multi-hundred-MB download. Failure is tolerated (network blips
+# in CI) — runtime falls back to lazy download.
+# -----------------------------------------------------------------------------
+FROM deps AS deps-full
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --constraint constraints.txt ".[multimodal]"
+
+RUN python -c "from mineru.cli.common import prepare_env; prepare_env()" 2>/dev/null \
+    || python -c "import mineru" 2>/dev/null \
+    || echo "mineru pre-warm skipped (will lazy-download at first use)"
+
+# -----------------------------------------------------------------------------
+# Stage: runtime-base — system libs + non-root user + app code. Final images
+# inherit from this and only differ in which deps stage they copy from.
+# -----------------------------------------------------------------------------
 FROM ${PYTHON_IMAGE} AS runtime-base
-# 系统依赖：
-#   curl              -> healthcheck
-#   libgl1 / libglib2.0-0 / libgomp1  -> opencv-headless & mineru
-#   poppler-utils     -> mineru PDF 处理
-#   libmagic1         -> python-magic 文件类型嗅探
+ARG PYTHON_VERSION
+ARG TM_VERSION
+
+LABEL org.opencontainers.image.title="transcendence-memory-server" \
+      org.opencontainers.image.version="${TM_VERSION}" \
+      org.opencontainers.image.source="https://github.com/leekkk2/transcendence-memory-server" \
+      org.opencontainers.image.licenses="MIT"
+
+# Runtime system deps:
+#   libgl1 / libglib2.0-0 / libgomp1   opencv-headless + mineru
+#   poppler-utils                       mineru PDF text extraction
+#   libmagic1                           python-magic file-type sniffing
+# No curl — healthcheck is a stdlib Python script (scripts/healthcheck.py).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
@@ -54,27 +79,57 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Non-root user. UID 10001 picked above default-system range to stay clear of
+# host system accounts when bind-mounting host paths.
+RUN groupadd --system --gid 10001 tm \
+    && useradd --system --uid 10001 --gid tm --home-dir /home/tm \
+               --create-home --shell /usr/sbin/nologin tm
+
+# Pre-create /data with correct ownership. Bind-mounted volumes override
+# this, but the chown gives sane defaults when the volume is empty.
+RUN install -d -o tm -g tm /data /data/tasks /data/memory /data/memory_archive
+
 WORKDIR /app
-# 应用代码：scripts 在前（运行时入口），src 在后（被 site-packages 安装版本覆盖）
-COPY --chmod=755 scripts/ ./scripts/
-COPY src/ ./src/
+COPY --chown=tm:tm scripts/ ./scripts/
+COPY --chown=tm:tm src/ ./src/
+RUN chmod 755 /app/scripts/*.sh /app/scripts/*.py
 
 ENV WORKSPACE=/data \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/scripts:/app/src \
+    PATH="/app/scripts:${PATH}"
+
+USER tm
 EXPOSE 8711
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=15s \
-    CMD curl -f http://localhost:8711/health || exit 1
+
+# Healthcheck uses Python stdlib (no curl in image). start-period is generous
+# so first-time mineru imports don't trip the probe on full flavor.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20s \
+    CMD ["python3", "/app/scripts/healthcheck.py"]
+
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 
-# ---------- lite ----------
+# -----------------------------------------------------------------------------
+# Stage: lite — final image with deps-stage site-packages only. ~700-900 MB.
+# -----------------------------------------------------------------------------
 FROM runtime-base AS lite
-COPY --from=builder-lite /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
-COPY --from=builder-lite /usr/local/bin /usr/local/bin
+ARG PYTHON_VERSION
 ENV TM_BUILD_FLAVOR=lite
+COPY --from=deps /usr/local/lib/python${PYTHON_VERSION}/site-packages \
+                 /usr/local/lib/python${PYTHON_VERSION}/site-packages
+# Selective bin copy — only entry points we actually invoke from runtime.
+COPY --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 
-# ---------- full ----------
+# -----------------------------------------------------------------------------
+# Stage: full — final image with multimodal site-packages + mineru cache.
+# -----------------------------------------------------------------------------
 FROM runtime-base AS full
-COPY --from=builder-full /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
-COPY --from=builder-full /usr/local/bin /usr/local/bin
+ARG PYTHON_VERSION
 ENV TM_BUILD_FLAVOR=full
+COPY --from=deps-full /usr/local/lib/python${PYTHON_VERSION}/site-packages \
+                      /usr/local/lib/python${PYTHON_VERSION}/site-packages
+COPY --from=deps-full /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+# mineru pre-warm cache (root-owned in builder; copy --chown to tm so the
+# unprivileged runtime user can actually read it).
+COPY --from=deps-full --chown=tm:tm /root/.cache/mineru /home/tm/.cache/mineru

@@ -1,0 +1,22 @@
+# Per-host override template. Copy to docker-compose.override.yml on each host
+# (the .override.yml filename is .gitignored — never commit host-specific values).
+#
+# docker compose auto-loads docker-compose.override.yml on top of
+# docker-compose.yml without explicit -f flags.
+#
+# Use this file for:
+#   * memory caps tuned to the actual VPS
+#   * extra environment variables specific to this deployment
+#   * NOT for rclone bind-mounts — those went away in v0.6.0 (see
+#     deploy/systemd/rclone-sync.* for the new sync-to-volume design).
+
+services:
+  rag-server:
+    # Tighter memory cap if this host is multi-tenant. The baseline 3g default
+    # in docker-compose.yml is reasonable for dedicated boxes; multi-tenant
+    # hosts (e.g. shared Oracle Cloud) want more headroom for other tenants.
+    mem_limit: 1500m
+    memswap_limit: 1500m
+    # Add host-specific env, e.g. an external observability endpoint.
+    # environment:
+    #   OTEL_EXPORTER_OTLP_ENDPOINT: http://prometheus.internal:4317

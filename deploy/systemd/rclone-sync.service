@@ -1,0 +1,59 @@
+# One-shot rsync from rclone FUSE mount to the docker named volume the
+# transcendence-memory-server container reads. Runs under unbuffered timeouts
+# so a misbehaving FUSE can never hang this unit indefinitely — TimeoutStartSec
+# kills it cleanly, and the timer just retries on the next tick.
+#
+# The container side mounts `rclone-archive` (a regular ext4 docker volume),
+# never the FUSE filesystem itself. This decoupling is what prevents rclone
+# health from ever blocking container reads in D-state.
+#
+# Install:
+#   sudo cp deploy/systemd/rclone-sync.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rclone-sync.timer
+
+[Unit]
+Description=Sync rclone mirror into transcendence-memory rclone-archive volume
+Documentation=https://github.com/leekkk2/transcendence-memory-server
+RequiresMountsFor=/mnt/rclone/example-archive
+After=docker.service rag-everything.service
+# Don't fail the timer when the docker volume isn't created yet (first-time install).
+# rsync will create the destination dir if needed.
+
+[Service]
+Type=oneshot
+User=root
+# Hard timeout — if rclone FUSE deadlocks, kill rsync after 5 minutes and let
+# the next timer tick try again. Without this, a stuck rsync would hold a
+# lock indefinitely.
+TimeoutStartSec=300
+# IO niceness so the sync doesn't fight with the container or other services.
+IOSchedulingClass=idle
+Nice=10
+# rsync flags:
+#   -a     archive mode (preserves perms/symlinks/times)
+#   --delete  remove files in dest that no longer exist in source
+#   --timeout=60  per-file IO timeout — bounds individual stuck reads
+#   --partial-dir prevents half-transferred files from poisoning the cache
+#
+# Source: the rclone FUSE mount. Destination: the docker volume mountpoint
+# (resolved via `docker volume inspect`). We use rsync into the resolved path
+# so the container sees changes without needing a container restart.
+ExecStart=/bin/bash -c '\
+    set -euo pipefail; \
+    SRC=/mnt/rclone/example-archive; \
+    DEST_PATH=$$(/usr/bin/docker volume inspect --format "{{.Mountpoint}}" \
+        transcendence-memory-server_rclone-archive 2>/dev/null || true); \
+    if [ -z "$$DEST_PATH" ]; then \
+        echo "rclone-archive volume not yet created; skipping until first compose up"; \
+        exit 0; \
+    fi; \
+    if ! /usr/bin/timeout 10 /usr/bin/test -d "$$SRC"; then \
+        echo "rclone source $$SRC unreachable; skipping this tick"; \
+        exit 0; \
+    fi; \
+    /usr/bin/rsync -a --delete --timeout=60 --partial-dir=.partial \
+        "$$SRC/" "$$DEST_PATH/"'
+
+[Install]
+WantedBy=multi-user.target

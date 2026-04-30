@@ -1,8 +1,18 @@
-# systemd 部署 / Systemd Deployment
+# Legacy: native systemd deployment (NOT supported as of v0.6.0)
 
-## 概述
+> **This document describes the pre-Docker deployment path** in which a
+> systemd unit ran `uvicorn` directly out of a host Python venv. As of
+> v0.6.0, the supported deployment is `docker compose` managed by a thin
+> systemd wrapper — see [docker-deployment.md](docker-deployment.md) and
+> `deploy/systemd/rag-everything.service` in the repo.
+>
+> The legacy path was retired because it produced a 520k-restart loop when
+> the entrypoint script was relocated and nobody noticed. Keeping this doc
+> for archaeology and for users who deliberately maintain a native install.
 
-裸机 Linux 生产环境推荐使用 systemd 管理 Memory Server 进程。
+## Overview (legacy)
+
+裸机 Linux 生产环境（已弃用）使用 systemd 直接管理 uvicorn 进程。
 
 ## 创建 service 文件
 

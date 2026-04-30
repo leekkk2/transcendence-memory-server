@@ -1,0 +1,16 @@
+# Periodic trigger for rclone-sync.service. Runs every 15 minutes after boot,
+# with a small randomized delay to avoid all timers firing at once.
+
+[Unit]
+Description=Periodic rclone → transcendence-memory cache sync
+Documentation=https://github.com/leekkk2/transcendence-memory-server
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+Unit=rclone-sync.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
