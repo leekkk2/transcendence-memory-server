@@ -15,6 +15,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+# os.kill(pid, 0) is the POSIX liveness probe. On Windows it actually
+# terminates the target process (Windows ignores sig=0), so the related
+# tests are POSIX-only.
+posix_only = pytest.mark.skipif(
+    os.name != "posix",
+    reason="Liveness probing via os.kill(pid, 0) is POSIX-only; Windows would terminate the target.",
+)
+
+
 @pytest.fixture
 def protection(monkeypatch):
     """每次测试拿到全新的 server_protection 模块（重置全局单例）。"""
@@ -182,6 +191,7 @@ def test_retry_limiter_lru_evicts_oldest(protection):
 # ---------- BackgroundJobTracker ----------
 
 
+@posix_only
 def test_bg_tracker_registers_and_lists(protection):
     tr = protection.BackgroundJobTracker(max_alive=8)
     # 自己进程一定还活着，用它当样本
@@ -192,6 +202,7 @@ def test_bg_tracker_registers_and_lists(protection):
     assert jobs[0]["container"] == "foo"
 
 
+@posix_only
 def test_bg_tracker_prunes_dead_pids(protection):
     tr = protection.BackgroundJobTracker(max_alive=8)
     # 注册一个肯定不存在的 PID（PID_MAX 通常是 4M+，10M 安全越界）
@@ -201,6 +212,7 @@ def test_bg_tracker_prunes_dead_pids(protection):
     assert tr.count_active() == 0
 
 
+@posix_only
 def test_bg_tracker_capacity_check(protection):
     tr = protection.BackgroundJobTracker(max_alive=2)
     tr.register(os.getpid(), container="a")
@@ -213,6 +225,9 @@ def test_bg_tracker_capacity_check(protection):
 
 def test_bg_tracker_unregister(protection):
     tr = protection.BackgroundJobTracker()
-    tr.register(os.getpid(), container="foo")
-    tr.unregister(os.getpid())
+    # unregister doesn't require os.kill, safe on all platforms
+    tr.register(12345, container="foo")
+    tr.unregister(12345)
+    # On Windows count_active() short-circuits to current dict size (no prune)
+    # On POSIX prune runs but pid 12345 is already removed
     assert tr.count_active() == 0
