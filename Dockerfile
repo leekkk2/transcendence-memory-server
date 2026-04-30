@@ -49,9 +49,15 @@ FROM deps AS deps-full
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --constraint constraints.txt ".[multimodal]"
 
-RUN python -c "from mineru.cli.common import prepare_env; prepare_env()" 2>/dev/null \
-    || python -c "import mineru" 2>/dev/null \
-    || echo "mineru pre-warm skipped (will lazy-download at first use)"
+# Always create the cache dir so the runtime stage's COPY succeeds even when
+# the pre-warm step is a no-op (e.g. when mineru's API surface changes).
+# A populated cache makes the first /documents/file response fast; an empty
+# dir is safe — mineru will lazy-download at first use.
+RUN mkdir -p /root/.cache/mineru \
+    && (python -c "from mineru.cli.common import prepare_env; prepare_env()" 2>/dev/null \
+        || python -c "import mineru" 2>/dev/null \
+        || echo "mineru pre-warm skipped — will lazy-download at first use") \
+    && ls -la /root/.cache/mineru
 
 # -----------------------------------------------------------------------------
 # Stage: runtime-base — system libs + non-root user + app code. Final images
