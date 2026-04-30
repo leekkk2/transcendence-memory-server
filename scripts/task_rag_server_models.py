@@ -147,6 +147,13 @@ class HealthResponse(BaseModel):
     uptime_seconds: int
     modules: dict[str, ModuleStatusResponse] | None = None
     configuration_guide: ConfigurationGuide | None = None
+    # 自我保护层暴露的系统快照与准入状态。客户端据此判断是否需要退避。
+    system: dict | None = None
+    accepting_ingest: bool = True
+    background_jobs_active: int = 0
+    # Persistent job queue snapshot. queue_stats keys: pending/running/done/failed/cancelled.
+    queue_stats: dict | None = None
+    worker_running: bool = False
 
 
 class ClientIngestResponse(BaseModel):

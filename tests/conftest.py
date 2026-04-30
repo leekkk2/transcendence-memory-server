@@ -14,9 +14,15 @@ DEFAULT_CONTAINER = "testbox"
 
 
 def load_server(workspace: Path, monkeypatch, extra_env: dict[str, str] | None = None):
-    """Reload the server module with a fresh WORKSPACE and RAG_API_KEY."""
+    """Reload the server module with a fresh WORKSPACE and RAG_API_KEY.
+
+    The persistent job worker is disabled by default for tests; tests that
+    exercise the queue worker should pass {"TM_DISABLE_WORKER": "0"} explicitly
+    via extra_env and then drive the worker manually.
+    """
     monkeypatch.setenv("WORKSPACE", str(workspace))
     monkeypatch.setenv("RAG_API_KEY", API_KEY)
+    monkeypatch.setenv("TM_DISABLE_WORKER", "1")
     for key, value in (extra_env or {}).items():
         monkeypatch.setenv(key, value)
 
@@ -24,7 +30,9 @@ def load_server(workspace: Path, monkeypatch, extra_env: dict[str, str] | None =
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    # 清除缓存的模块以重新加载
+    # 清除缓存的模块以重新加载。
+    # server_protection 暴露的全局单例 GATE/RETRY_LIMITER/BG_TRACKER 是模块级状态，
+    # 必须一并清掉，否则测试间互相干扰（一个测试 mark_retry 后下一个测试还在冷却中）。
     for mod_name in list(sys.modules):
         if mod_name.startswith("scripts.task_rag_server") or mod_name.startswith("scripts.rag_engine"):
             sys.modules.pop(mod_name, None)
@@ -33,6 +41,12 @@ def load_server(workspace: Path, monkeypatch, extra_env: dict[str, str] | None =
     sys.modules.pop("rag_engine", None)
     sys.modules.pop("arch_detect", None)
     sys.modules.pop("scripts.arch_detect", None)
+    sys.modules.pop("server_protection", None)
+    sys.modules.pop("scripts.server_protection", None)
+    sys.modules.pop("job_queue", None)
+    sys.modules.pop("scripts.job_queue", None)
+    sys.modules.pop("job_worker", None)
+    sys.modules.pop("scripts.job_worker", None)
 
     return importlib.import_module("scripts.task_rag_server")
 

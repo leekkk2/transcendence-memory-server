@@ -101,6 +101,30 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.arch_detect import detect_architecture, reset_cache as reset_arch_cache
 
+try:
+    from server_protection import (
+        BG_TRACKER,
+        GATE,
+        RETRY_LIMITER,
+        IngestBusyError,
+        read_system_health,
+    )
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.server_protection import (
+        BG_TRACKER,
+        GATE,
+        RETRY_LIMITER,
+        IngestBusyError,
+        read_system_health,
+    )
+
+try:
+    from job_queue import JobQueue, Job
+    from job_worker import JobWorker, default_command_resolver
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.job_queue import JobQueue, Job
+    from scripts.job_worker import JobWorker, default_command_resolver
+
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 SERVER_SCRIPTS = Path(__file__).resolve().parent
@@ -230,10 +254,42 @@ def _startup_banner() -> None:
         logger.info(line)
 
 
+# 队列在导入时不创建，等 lifespan 启动时按 WORKSPACE 实例化。
+# WORKER 持有对全局队列的引用，启停由 lifespan 控制。
+JOB_QUEUE: JobQueue | None = None
+JOB_WORKER: JobWorker | None = None
+# 测试可设为 True 来禁用 worker 自动启动；其他场景应保持 False。
+DISABLE_WORKER = os.environ.get('TM_DISABLE_WORKER', '0') in ('1', 'true', 'True')
+
+
+def _queue_db_path() -> Path:
+    return WS / 'tasks' / 'rag' / 'queue.db'
+
+
+def get_job_queue() -> JobQueue:
+    global JOB_QUEUE
+    if JOB_QUEUE is None:
+        JOB_QUEUE = JobQueue(_queue_db_path())
+    return JOB_QUEUE
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global JOB_WORKER
     _startup_banner()
-    yield
+    queue = get_job_queue()
+    if not DISABLE_WORKER:
+        scripts_dir = SERVER_SCRIPTS  # task_rag_lancedb_ingest.py 等都在这里
+        JOB_WORKER = JobWorker(
+            queue=queue,
+            command_resolver=default_command_resolver(scripts_dir),
+        )
+        JOB_WORKER.start()
+    try:
+        yield
+    finally:
+        if JOB_WORKER is not None:
+            JOB_WORKER.stop(join_timeout=10.0)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -298,13 +354,34 @@ def run(cmd: list[str], timeout_s: int) -> CommandResponse:
         return CommandResponse(command=real_cmd, code=1, stderr=f'command failed: {exc}')
 
 
-def run_or_start(cmd: list[str], timeout_s: int, background: bool | None, wait: bool) -> CommandResponse:
+def run_or_start(
+    cmd: list[str],
+    timeout_s: int,
+    background: bool | None,
+    wait: bool,
+    *,
+    container: str = '',
+) -> CommandResponse:
     if not Path(cmd[0]).exists():
         return CommandResponse(command=cmd, code=127, stderr=f'script not found: {cmd[0]}')
     real_cmd = [sys.executable, *cmd] if cmd[0].endswith('.py') else cmd
     run_in_background = background if background is not None else not wait
     if run_in_background:
+        # 后台路径：在派生子进程前问 BG_TRACKER 是否还有容量，
+        # 防止在压力下被外部循环调用而无限堆叠。
+        ok, reason = BG_TRACKER.has_capacity()
+        if not ok:
+            return CommandResponse(
+                command=real_cmd,
+                code=429,
+                background=False,
+                wait=False,
+                status='rejected',
+                note=f'background job pool full: {reason}',
+                stderr=reason,
+            )
         process = subprocess.Popen(real_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env())
+        BG_TRACKER.register(process.pid, container=container or 'unknown', label=Path(cmd[0]).name)
         return CommandResponse(
             command=real_cmd,
             code=0,
@@ -318,6 +395,37 @@ def run_or_start(cmd: list[str], timeout_s: int, background: bool | None, wait: 
     result.background = False
     result.wait = True
     return result
+
+
+def _admit_or_503(container: str, op: str) -> None:
+    """重型端点统一的准入检查。
+
+    分三步：1) 系统健康预检；2) 后台池容量；3) 全局/容器并发锁由调用方用 GATE.acquire 包裹。
+    任何一步失败都抛 503，附带 Retry-After 让客户端指数退避。
+    """
+    snap = read_system_health()
+    ok, reason = GATE.check_admit(snap)
+    if not ok:
+        logger.warning('admit_denied op=%s container=%s reason=%s', op, container, reason)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                'error': 'system_under_pressure',
+                'op': op,
+                'container': container,
+                'reason': reason,
+                'system': snap.as_dict(),
+            },
+            headers={'Retry-After': '30'},
+        )
+    ok, reason = BG_TRACKER.has_capacity()
+    if not ok:
+        logger.warning('admit_denied op=%s container=%s reason=%s', op, container, reason)
+        raise HTTPException(
+            status_code=503,
+            detail={'error': 'background_pool_full', 'op': op, 'reason': reason},
+            headers={'Retry-After': '15'},
+        )
 
 
 @app.get('/health', response_model=HealthResponse)
@@ -370,6 +478,22 @@ async def health(container: str | None = None) -> HealthResponse:
             documents_text_ready = False
             warnings.append(f'LightRAG probe failed for container={container}: {exc}')
 
+    # 系统健康快照：客户端可据此提前退避，避免请求堆叠
+    sys_snap = read_system_health()
+    admit_ok, admit_reason = GATE.check_admit(sys_snap)
+    if not admit_ok:
+        warnings.append(f'system pressure: {admit_reason}')
+
+    # Queue stats: surface backlog so clients can decide whether to keep posting.
+    try:
+        queue_stats = get_job_queue().stats()
+    except Exception as exc:  # pragma: no cover - defensive
+        queue_stats = {'error': str(exc)}
+        warnings.append(f'job queue inaccessible: {exc}')
+    worker_running = bool(JOB_WORKER and JOB_WORKER.is_running)
+    if not worker_running and not DISABLE_WORKER:
+        warnings.append('background ingest worker is not running')
+
     return HealthResponse(
         status='ok',
         service='transcendence-memory-server',
@@ -397,6 +521,11 @@ async def health(container: str | None = None) -> HealthResponse:
         uptime_seconds=max(0, int(time.time() - SERVER_STARTED_AT)),
         modules=modules_resp,
         configuration_guide=config_guide,
+        system=sys_snap.as_dict(),
+        accepting_ingest=admit_ok,
+        background_jobs_active=BG_TRACKER.count_active(),
+        queue_stats=queue_stats,
+        worker_running=worker_running,
     )
 
 
@@ -542,23 +671,150 @@ def search(req: SearchReq) -> SearchResponse:
     )
 
 
+def _build_ingest_cmd(op: str, container: str, payload: dict) -> list[str]:
+    """Map (op, container, payload) to the script invocation. Mirrors
+    job_worker.default_command_resolver but stays usable from the request handler
+    for the synchronous wait=True path."""
+    if op in ('embed', 'ingest-memory'):
+        cmd = [str(script_path('task_rag_lancedb_ingest.py')), '--container', container]
+        memory_dir = payload.get('memory_dir')
+        archive_dir = payload.get('archive_dir')
+        if memory_dir:
+            cmd += ['--memory-dir', str(memory_dir)]
+        if archive_dir:
+            cmd += ['--archive-dir', str(archive_dir)]
+        return cmd
+    if op == 'ingest-structured':
+        cmd = [
+            str(script_path('task_rag_structured_ingest.py')),
+            '--container', container,
+            '--input', str(payload.get('input_path', '')),
+            '--doc-type', str(payload.get('doc_type', 'structured_json')),
+        ]
+        if payload.get('doc_id'):
+            cmd += ['--doc-id', str(payload['doc_id'])]
+        return cmd
+    raise ValueError(f'unknown op: {op}')
+
+
+def _enqueue_or_run(
+    op: str,
+    container: str,
+    payload: dict,
+    timeout_s: int,
+    wait: bool,
+    label: str = '',
+) -> CommandResponse:
+    """Dispatch one of the three ingest ops, choosing between three modes:
+
+    1. wait=False (default): enqueue into persistent SQLite queue, return job_id.
+       The single background worker drains the queue at a steady, host-friendly
+       pace. Coalescing prevents duplicate enqueues for (op, container).
+
+    2. wait=True with worker running: enqueue + poll queue until done/timeout.
+       Lets a synchronous client share the same coalescing/backoff machinery
+       as background callers.
+
+    3. wait=True with worker disabled (typical in tests): bypass the queue and
+       run the subprocess directly under GATE.acquire(). Preserves the legacy
+       contract where `wait=true` returns the immediate subprocess result.
+    """
+    validate_container_name(container)
+    queue = get_job_queue()
+
+    worker_alive = bool(JOB_WORKER and JOB_WORKER.is_running)
+
+    if not wait:
+        # Background mode: always enqueue, return job_id immediately.
+        job_id = queue.enqueue(op=op, container=container, payload=payload, label=label or op)
+        return CommandResponse(
+            command=[op, container],
+            code=0,
+            background=True,
+            wait=False,
+            pid=job_id,
+            status='enqueued',
+            note=f'Job enqueued (id={job_id}); the background worker will drain it.',
+        )
+
+    if worker_alive:
+        # wait=True with worker: enqueue, then poll queue until job leaves pending/running.
+        job_id = queue.enqueue(op=op, container=container, payload=payload, label=label or op)
+        deadline = time.time() + max(1, timeout_s)
+        while time.time() < deadline:
+            job = queue.get(job_id)
+            if job is None:  # pragma: no cover - shouldn't happen
+                break
+            if job.status in ('done', 'failed', 'cancelled'):
+                return _job_to_command_response(job)
+            time.sleep(0.2)
+        job = queue.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=500, detail=f'job {job_id} disappeared')
+        return _job_to_command_response(job, timed_out_wait=True)
+
+    # wait=True without worker (tests, single-shot deployments): run inline.
+    # GATE.acquire still enforces global single-flight + per-container locking.
+    _admit_or_503(container, op=op)
+    try:
+        cmd = _build_ingest_cmd(op, container, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        with GATE.acquire(container):
+            return run(cmd, timeout_s=timeout_s)
+    except IngestBusyError as e:
+        raise HTTPException(
+            status_code=503,
+            detail={'error': 'ingest_busy', 'reason': str(e)},
+            headers={'Retry-After': '20'},
+        )
+
+
+def _job_to_command_response(job: Job, timed_out_wait: bool = False) -> CommandResponse:
+    """Marshal a Job into the legacy CommandResponse shape.
+
+    code semantics:
+    - done    → result_code from subprocess (typically 0)
+    - failed  → 1
+    - cancelled → 1
+    - running → 0 with status='running' (only when wait timed out)
+    - pending → 0 with status='pending' (only when wait timed out)
+    """
+    if job.status == 'done':
+        code = job.result_code if job.result_code is not None else 0
+    elif job.status in ('failed', 'cancelled'):
+        code = job.result_code if job.result_code is not None else 1
+    else:
+        code = 0
+    note_parts = [f'job_id={job.id}', f'attempts={job.attempts}/{job.max_attempts}']
+    if job.last_error:
+        note_parts.append(f'last_error={job.last_error[:200]}')
+    if timed_out_wait:
+        note_parts.append('wait_timed_out_but_job_still_progressing')
+    return CommandResponse(
+        command=[job.op, job.container],
+        code=code,
+        stdout=job.last_error if job.status == 'done' and job.last_error else '',
+        stderr=job.last_error if job.status != 'done' and job.last_error else '',
+        background=False,
+        wait=True,
+        pid=job.id,
+        status=job.status,
+        note=' | '.join(note_parts),
+    )
+
+
 @app.post('/embed', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def embed(req: ContainerReq) -> CommandResponse:
-    cmd = [str(script_path('task_rag_lancedb_ingest.py')), '--container', req.container]
-    result = run_or_start(cmd, req.timeout_s, req.background, req.wait)
-    # lancedb 0.30.x 在子进程内偶发 listing.rs unreachable! panic（macOS RustPanic /
-    # Linux SIGABRT, rc=-6）。这种崩溃由 race condition 触发，重试一次几乎必稳。
-    # 仅对 wait=True 的同步调用做兜底重试，避免 background 任务被双开。
-    if (
-        result.code in (-6, 134, 1)  # -6 = SIGABRT (POSIX), 134 = 128+6
-        and not result.background
-        and (req.wait or req.background is False)
-    ):
-        retry = run_or_start(cmd, req.timeout_s, req.background, req.wait)
-        if retry.code == 0:
-            retry.note = (retry.note or '') + ' (auto-retried after lancedb panic)'
-            return retry
-    return result
+    return _enqueue_or_run(
+        op='embed',
+        container=req.container,
+        payload={},
+        timeout_s=req.timeout_s,
+        wait=req.wait,
+        label='embed',
+    )
 
 
 @app.post('/build-manifest', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
@@ -568,12 +824,19 @@ def build_manifest(_req: ContainerReq) -> CommandResponse:
 
 @app.post('/ingest-memory', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def ingest_memory(req: IngestMemoryReq) -> CommandResponse:
-    command = [str(script_path('task_rag_lancedb_ingest.py')), '--container', req.container]
+    payload = {}
     if req.memory_dir:
-        command += ['--memory-dir', req.memory_dir]
+        payload['memory_dir'] = req.memory_dir
     if req.archive_dir:
-        command += ['--archive-dir', req.archive_dir]
-    return run_or_start(command, req.timeout_s, req.background, req.wait)
+        payload['archive_dir'] = req.archive_dir
+    return _enqueue_or_run(
+        op='ingest-memory',
+        container=req.container,
+        payload=payload,
+        timeout_s=req.timeout_s,
+        wait=req.wait,
+        label='ingest-memory',
+    )
 
 
 @app.get('/ingest-memory/contract', dependencies=[Depends(verify_auth)])
@@ -604,18 +867,15 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
         for line in lines:
             handle.write(line + '\n')
 
-    # auto_embed: 自动在后台触发索引重建
+    # auto_embed: enqueue a background embed job. The persistent queue coalesces
+    # duplicate enqueues for the same container, so even posting many objects
+    # in a tight loop only yields one pending embed job. The queue worker will
+    # drain it later at a stable, host-friendly pace.
     if req.auto_embed:
-        embed_script = script_path('task_rag_lancedb_ingest.py')
-        if embed_script.exists():
-            run_or_start(
-                [str(embed_script), '--container', req.container],
-                timeout_s=600,
-                background=True,
-                wait=False,
-            )
-
-    index_hint = 'Auto-embed triggered in background.' if req.auto_embed else 'Run /embed for this container to refresh LanceDB after storing new objects.'
+        get_job_queue().enqueue(op='embed', container=req.container, payload={}, label='auto-embed')
+        index_hint = 'Embed job queued; the background worker will index this container shortly.'
+    else:
+        index_hint = 'Run /embed for this container to refresh LanceDB after storing new objects.'
     return ClientIngestResponse(
         container=req.container,
         accepted=len(lines),
@@ -627,15 +887,20 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
 
 @app.post('/ingest-structured', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def ingest_structured(req: StructuredIngestReq) -> CommandResponse:
-    command = [
-        str(script_path('task_rag_structured_ingest.py')),
-        '--container', req.container,
-        '--input', req.input_path,
-        '--doc-type', req.doc_type,
-    ]
+    payload = {
+        'input_path': req.input_path,
+        'doc_type': req.doc_type,
+    }
     if req.doc_id:
-        command += ['--doc-id', req.doc_id]
-    return run_or_start(command, req.timeout_s, req.background, req.wait)
+        payload['doc_id'] = req.doc_id
+    return _enqueue_or_run(
+        op='ingest-structured',
+        container=req.container,
+        payload=payload,
+        timeout_s=req.timeout_s,
+        wait=req.wait,
+        label='ingest-structured',
+    )
 
 
 # --- 辅助函数 ---
@@ -825,15 +1090,90 @@ def delete_memory(container: str, memory_id: str) -> MemoryDeleteResponse:
     )
 
 
-@app.get('/jobs/{pid}', response_model=JobStatusResponse, dependencies=[Depends(verify_auth)])
-def job_status(pid: int) -> JobStatusResponse:
+@app.get('/admin/system-health', dependencies=[Depends(verify_auth)])
+def admin_system_health() -> dict:
+    """运维诊断端点：返回详细的保护层状态。
+
+    与 /health 不同：
+    - /health 暴露最少必要的系统快照供客户端退避决策；
+    - /admin/system-health 提供 background job 明细，方便排查"为什么 ingest 被拒"。
+    """
+    snap = read_system_health()
+    admit_ok, admit_reason = GATE.check_admit(snap)
+    return {
+        'system': snap.as_dict(),
+        'admit_ok': admit_ok,
+        'admit_reason': admit_reason,
+        'gate_config': {
+            'max_concurrent': GATE.config.max_concurrent,
+            'min_available_mem_mb': GATE.config.min_available_mem_mb,
+            'max_load_per_cpu': GATE.config.max_load_per_cpu,
+            'max_swap_used_pct': GATE.config.max_swap_used_pct,
+        },
+        'background_jobs': BG_TRACKER.list_active(),
+        'background_max_alive': BG_TRACKER.max_alive,
+        'retry_cooldown_sec': RETRY_LIMITER.cooldown_sec,
+    }
+
+
+@app.get('/jobs', dependencies=[Depends(verify_auth)])
+def list_jobs(
+    status: str | None = None,
+    container: str | None = None,
+    limit: int = 50,
+) -> dict:
+    """List queue contents. Optional filters: status (pending/running/done/failed/cancelled),
+    container (exact match), limit (1..500)."""
+    if container:
+        validate_container_name(container)
+    limit = max(1, min(500, int(limit)))
     try:
-        os.kill(pid, 0)
-        return JobStatusResponse(pid=pid, running=True, message=f'Process {pid} is running.')
-    except ProcessLookupError:
-        return JobStatusResponse(pid=pid, running=False, exit_code=None, message=f'Process {pid} not found.')
-    except PermissionError:
-        return JobStatusResponse(pid=pid, running=True, message=f'Process {pid} exists (permission denied for signal).')
+        jobs = get_job_queue().list_jobs(status=status, container=container, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    stats = get_job_queue().stats()
+    worker_running = bool(JOB_WORKER and JOB_WORKER.is_running)
+    return {
+        'jobs': [j.to_dict() for j in jobs],
+        'stats': stats,
+        'worker_running': worker_running,
+    }
+
+
+@app.get('/jobs/{job_id}', response_model=JobStatusResponse, dependencies=[Depends(verify_auth)])
+def job_status(job_id: int) -> JobStatusResponse:
+    """Look up a queue job by id. The legacy 'pid' field in the response holds
+    the queue job id (kept for backward-compat with old clients that read it)."""
+    job = get_job_queue().get(job_id)
+    if job is None:
+        return JobStatusResponse(pid=job_id, running=False, exit_code=None,
+                                 message=f'Job {job_id} not found.')
+    running = job.status in ('pending', 'running')
+    exit_code = job.result_code if job.status == 'done' else None
+    parts = [f'status={job.status}', f'attempts={job.attempts}/{job.max_attempts}']
+    if job.last_error:
+        parts.append(f'last_error={job.last_error[:200]}')
+    return JobStatusResponse(
+        pid=job_id,
+        running=running,
+        exit_code=exit_code,
+        message=' '.join(parts),
+    )
+
+
+@app.delete('/jobs/{job_id}', dependencies=[Depends(verify_auth)])
+def cancel_job(job_id: int) -> dict:
+    """Cancel a pending job. Running jobs cannot be cancelled mid-flight."""
+    cancelled = get_job_queue().cancel(job_id)
+    if not cancelled:
+        job = get_job_queue().get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f'Job {job_id} not found.')
+        raise HTTPException(
+            status_code=409,
+            detail=f'Job {job_id} is in status {job.status!r}; only pending jobs can be cancelled.',
+        )
+    return {'cancelled': True, 'job_id': job_id}
 
 
 def _require_lightrag_ready() -> None:
