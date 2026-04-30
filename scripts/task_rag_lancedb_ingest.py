@@ -366,8 +366,10 @@ def rebuild_rows(
     # 1. 打开既有表，检查 schema 兼容性
     table = None
     schema_compatible = False
+    prior_table_existed = False
     try:
         table = db.open_table('chunks')
+        prior_table_existed = True
         schema_compatible = _is_metadata_string_schema(table)
     except Exception:
         table = None
@@ -386,7 +388,9 @@ def rebuild_rows(
                 retain_for_migration.append(item)
         except Exception:
             pass
-        # migration 标记：让 _flush 第一批走 mode='overwrite'
+        # migration 标记：让 _flush 第一批走 mode='overwrite'。
+        # v0.5.9 fix: 即便 retain 为空（旧表全是 REBUILD_DOC_TYPES），仍需要
+        # overwrite 才能避免 `Table 'chunks' already exists`（mode='create' 默认值）。
         table = None  # 重置，下面 _flush 第一次会重建
 
     # 3. v0.5.8: 不再立即 delete REBUILD_DOC_TYPES。改为末尾"删孤儿"模式，
@@ -409,9 +413,13 @@ def rebuild_rows(
         if not items:
             return
         if table is None:
-            # 表不存在 → 第一批 create_table（默认 mode='create'）
-            # 如果是 schema migration 路径，用 mode='overwrite' 清掉旧 dataset
-            mode = 'overwrite' if (is_first_flush and retain_for_migration) else 'create'
+            # 表不存在 → 第一批 create_table（默认 mode='create'）。
+            # schema migration 路径：旧表存在但不兼容（无论 retain 是否为空），
+            # 用 mode='overwrite' 清掉旧 dataset 重建。
+            # v0.5.9 fix: 之前条件 `retain_for_migration` 在旧表全是
+            # REBUILD_DOC_TYPES 时为空，错误走 'create' → 表已存在 ValueError。
+            needs_overwrite = is_first_flush and prior_table_existed and not schema_compatible
+            mode = 'overwrite' if needs_overwrite else 'create'
             table = db.create_table('chunks', data=items, mode=mode)
         else:
             # v0.5.8: upsert by chunkId — 同 chunkId 时 update_all，否则 insert_all。
