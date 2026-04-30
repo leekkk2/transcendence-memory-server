@@ -29,12 +29,18 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
+
+# os.kill(pid, 0) is the POSIX liveness-check idiom. On Windows it actually
+# terminates the target process (Windows ignores the sig argument), so we
+# need a platform-aware probe.
+_IS_POSIX = os.name == "posix"
 
 logger = logging.getLogger("transcendence-memory-server.protection")
 
@@ -281,17 +287,28 @@ class BackgroundJobTracker:
             self._jobs.pop(pid, None)
 
     def prune(self) -> int:
-        """检查每个已注册 pid 是否仍存活，删除已退出的。返回清除条数。"""
+        """Remove entries for pids that have exited. Returns count removed.
+
+        POSIX uses os.kill(pid, 0) — sig=0 verifies existence without signalling.
+        Windows ignores the sig arg and actually calls TerminateProcess, so we
+        skip prune on Windows. The container deployment target is Linux, so this
+        is a test-environment workaround, not a production concern.
+        """
+        if not _IS_POSIX:
+            # On Windows we have no safe stdlib-only liveness probe. The
+            # tracker is best-effort here; subprocess.Popen already detaches
+            # so leftover entries get cleaned up on next process restart.
+            return 0
         removed = 0
         with self._lock:
             dead: list[int] = []
             for pid in self._jobs.keys():
                 try:
-                    os.kill(pid, 0)  # 不真发信号，仅探活
+                    os.kill(pid, 0)  # send no signal, just check existence
                 except ProcessLookupError:
                     dead.append(pid)
                 except PermissionError:
-                    # 还活着但属其他用户，保留
+                    # process exists but belongs to another user — keep it
                     continue
                 except OSError:
                     dead.append(pid)
