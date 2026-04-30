@@ -1,0 +1,20 @@
+# pip constraints — locks transitive resolutions across builds.
+#
+# Why this file exists: raganything declares opencv-python (with GUI deps) as
+# its loose dependency. If we let pip resolve it, the runtime image needs
+# libxcb / X11 libraries we don't ship, and `import cv2` blows up. Pinning
+# the headless variants here makes pip choose them everywhere — no
+# post-install force-reinstall dance needed.
+#
+# Bump versions deliberately, not by accident.
+
+# Vision libs — always headless in containers (no X server)
+opencv-python-headless==4.10.0.84
+opencv-contrib-python-headless==4.10.0.84
+
+# pyarrow 15+ required for lancedb 0.10+ schema features
+pyarrow>=15
+
+# numpy is intentionally NOT pinned: numpy 1.x has no wheels for Python 3.13,
+# and the current dep graph (lancedb, pyarrow 15, mineru, raganything) all
+# work with numpy 2.x. Pin only if/when a regression appears.

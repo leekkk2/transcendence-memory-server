@@ -29,20 +29,40 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         flavor: [lite, full]
+        # arm64 is now validated on every PR/push instead of only at tag time.
+        # Catches arch-specific regressions before release.
+        platform: [linux/amd64, linux/arm64]
     steps:
       - uses: actions/checkout@v4
+      # full+arm64 emulated builds are disk-hungry — clean up runner first
+      - name: Free up disk space (full flavor only)
+        if: matrix.flavor == 'full'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"/PyPy \
+            "$AGENT_TOOLSDIRECTORY"/Ruby "$AGENT_TOOLSDIRECTORY"/go || true
+          sudo docker image prune --all --force || true
+          df -h /
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - name: Build ${{ matrix.flavor }} image
+      - name: Build ${{ matrix.flavor }} image (${{ matrix.platform }})
         uses: docker/build-push-action@v5
         with:
           context: .
           target: ${{ matrix.flavor }}
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           push: false
           load: false
+          # Share cache with publish-docker so we don't rebuild from scratch
+          # at tag time. cache-from is read-only for this validate job; only
+          # publish-docker writes back.
+          cache-from: type=gha,scope=${{ matrix.flavor }}-${{ matrix.platform }}
+          build-args: |
+            TM_VERSION=${{ github.sha }}
 
   build-release-assets:
     needs: test
@@ -152,6 +172,14 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            TM_VERSION=${{ github.ref_name }}
+          # Read+write the GHA cache shared with docker-validate so this job
+          # warm-starts off the validation build instead of from scratch.
+          cache-from: |
+            type=gha,scope=${{ matrix.flavor }}-linux/amd64
+            type=gha,scope=${{ matrix.flavor }}-linux/arm64
+          cache-to: type=gha,scope=${{ matrix.flavor }}-publish,mode=max
 
   github-release:
     needs: [build-release-assets, publish-pypi, publish-docker]

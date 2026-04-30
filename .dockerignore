@@ -1,9 +1,14 @@
-# 版本控制
+# =====================================================================
+# Build-context exclusions. Anything matched here never ends up in the
+# layers we ship — important for both image size and secret hygiene.
+# =====================================================================
+
+# Version control
 .git
 .gitignore
 .gitattributes
 
-# 本地虚拟环境与缓存
+# Python ephemera
 .venv
 venv
 env
@@ -14,44 +19,50 @@ __pycache__
 .pytest_cache
 .mypy_cache
 .ruff_cache
-.tox
 
-# 测试与开发产物
-tests
+# Test / coverage / release artifacts
 htmlcov
 .coverage
 .coverage.*
 coverage.xml
 release-assets
 
-# IDE / 编辑器
+# Editor noise
 .vscode
 .idea
 *.swp
 .DS_Store
 
-# 日志与本地数据
+# Local data and runtime state — never ship into an image
 *.log
-data
-tmp
+data/
+tmp/
 *.lance
 *.db
 
-# 文档与 ops 笔记（除 README 外不进镜像）
-docs
-ops-notes
+# Docs / ops notes / markdown — README is re-included for build metadata
+docs/
+ops-notes/
 *.md
 !README.md
 
-# 容器与编排（除 Dockerfile 自身）
+# Compose files / dockerignore / Dockerfile siblings
 docker-compose*.yml
 .dockerignore
 Dockerfile.*
 
-# CI / GitHub
-.github
+# CI configuration — stays in git, not in image
+.github/
 
-# 环境模板（敏感信息隔离）
+# Env templates (sensitive values isolated; only the example template ships)
 .env
 .env.*
 !.env.example
+
+# Deploy scripts and host-side bits — copied in by deploy/install.sh on the
+# host, never inside the container image.
+deploy/
+
+# Dev-only utilities and legacy scripts
+dev/
+tests/
