@@ -247,12 +247,16 @@ def _is_metadata_string_schema(table) -> bool:
     """检查 LanceDB 表的 metadata 列是不是 string 类型（v0.5.4+ schema）。
 
     旧版（≤v0.5.2）将 metadata 直接存为嵌套 struct，schema 字段不一致会让 add()
-    抛 `Invalid input, field 'X' does not exist in table schema`。
+    抛 `Invalid input, cannot cast field 'metadata' from Utf8 to Struct(...)`。
+
+    Why: v0.5.5/0.5.6 用 `'string' in str(type).lower()` 判断，但
+    `struct<kind: string>` 子串里也含 `'string'` → 误判为兼容 → add() 失败 →
+    rows=0。改用 pyarrow.types.is_string / is_large_string 严格匹配。
     """
     try:
-        field = table.schema.field('metadata')
-        type_str = str(field.type).lower()
-        return 'string' in type_str
+        import pyarrow as pa
+        t = table.schema.field('metadata').type
+        return pa.types.is_string(t) or pa.types.is_large_string(t)
     except Exception:
         return False
 
@@ -339,17 +343,23 @@ def rebuild_rows(
 ) -> dict[str, int]:
     """In-place incremental rebuild + 自动 fragment 清理。
 
-    设计要点（基于 2026-04-29 多次复盘）：
-    - **不再 rmtree**：v0.5.4 用 shutil.rmtree 在 embed 失败时会丢索引（jsonl 是
-      source of truth 没真丢，但用户感知是"数据没了"）。改为 in-place delete +
-      add，失败时旧索引保留，下次 ingest 继续修复。
-    - **delete REBUILD_DOC_TYPES + 增量 add**：retain 行原地保留，新行追加，
-      不重写整表。
+    设计要点（基于 2026-04-29/30 多次复盘）：
+    - **不再 rmtree**：v0.5.4 用 shutil.rmtree 在 embed 失败时会丢索引。改为
+      in-place upsert，失败时旧索引保留，下次 ingest 继续修复。
+    - **upsert via merge_insert + 末尾删孤儿**（v0.5.8 起）：旧版本"先 delete
+      REBUILD_DOC_TYPES → 再 add"，若 embed 全部失败（限速 / 5xx 风暴）旧数据
+      就被永久丢失（2026-04-30 yzjx rows 从 5751 归 0 的根因）。改为：
+        1) 全程不主动 delete 旧行
+        2) 用 merge_insert(chunkId).when_matched_update_all() 写入，幂等
+        3) 所有写入完成后才 delete 孤儿（docType IN REBUILD AND chunkId NOT IN ingested）
+      ingest 任意阶段中断都不会丢已索引数据。
     - **batched flush**：每批 ~batch_size 条 flush，主进程峰值内存 ~KB 而非 GB。
     - **schema 不兼容自动 fallback**：旧表 metadata=struct 时 add() 会失败，
       自动切到 mode='overwrite' 完成一次性 schema migration（仅在跨大版本升级时触发）。
+      v0.5.8 起 _is_metadata_string_schema 用 pyarrow 类型 ID 严格判断，避免
+      `struct<kind: string>` 被字符串子串 contains 误判为兼容。
     - **末尾 optimize**：自动 compact_files + cleanup_old_versions，避免 MVCC
-      fragments 累积（杜绝 yzjx 容器 100 MB 数据膨胀到 2 GB 的旧 bug）。
+      fragments 累积。
     """
     db = lancedb.connect(str(lancedb_dir(container)))
 
@@ -379,13 +389,8 @@ def rebuild_rows(
         # migration 标记：让 _flush 第一批走 mode='overwrite'
         table = None  # 重置，下面 _flush 第一次会重建
 
-    # 3. schema 兼容时只删 REBUILD_DOC_TYPES 那部分，retain 行原地保留
-    if table is not None and schema_compatible:
-        rebuild_types = ", ".join(f"'{t}'" for t in REBUILD_DOC_TYPES)
-        try:
-            table.delete(f"docType IN ({rebuild_types})")
-        except Exception:
-            pass
+    # 3. v0.5.8: 不再立即 delete REBUILD_DOC_TYPES。改为末尾"删孤儿"模式，
+    #    新数据通过 merge_insert upsert 写入，已索引数据失败时不会丢。
 
     if not fresh_rows and not retain_for_migration:
         # 没有新数据也不需要 migration — 仅 compact + 返回
@@ -409,7 +414,16 @@ def rebuild_rows(
             mode = 'overwrite' if (is_first_flush and retain_for_migration) else 'create'
             table = db.create_table('chunks', data=items, mode=mode)
         else:
-            table.add(items)
+            # v0.5.8: upsert by chunkId — 同 chunkId 时 update_all，否则 insert_all。
+            # 这样并发或重试不会写出重复 chunkId，且不会破坏已有数据。
+            try:
+                (table.merge_insert('chunkId')
+                      .when_matched_update_all()
+                      .when_not_matched_insert_all()
+                      .execute(items))
+            except Exception:
+                # merge_insert 不可用时降级 add（理论上不会触发，留作 safety net）
+                table.add(items)
         is_first_flush = False
 
     # 4a. migration 模式下先 flush 旧 retain 行（schema 已 normalize 为 string）
@@ -483,7 +497,29 @@ def rebuild_rows(
                 )
         _flush(buf)
 
-    # 5. 末尾 optimize 清旧 fragments
+    # 5a. v0.5.8: 末尾删孤儿（仅在 schema 兼容路径，且确实写入了新数据时才执行）
+    #     条件：upsert 后用 chunkId NOT IN ingested_set 把"旧的、不在新 fresh
+    #     的 REBUILD_DOC_TYPES 行"清掉。fresh 全部失败时 ingested=0 → 跳过删除，
+    #     旧数据自然保留。
+    if table is not None and schema_compatible and ingested > 0:
+        ingested_ids = [
+            str(row.get('chunkId'))
+            for row in fresh_rows
+            if row.get('chunkId') is not None
+        ]
+        if ingested_ids:
+            rebuild_types_in = ", ".join(f"'{t}'" for t in REBUILD_DOC_TYPES)
+            # 防 SQL 注入（chunkId 由我们自己生成 task_id#section 等格式，但仍 escape 单引号）
+            ids_in = ", ".join("'" + cid.replace("'", "''") + "'" for cid in ingested_ids)
+            try:
+                table.delete(
+                    f"docType IN ({rebuild_types_in}) "
+                    f"AND chunkId NOT IN ({ids_in})"
+                )
+            except Exception as exc:
+                _logger.warning('orphan delete skipped: %s', str(exc)[:200])
+
+    # 5b. optimize 清旧 fragments
     if table is not None:
         _try_optimize(table)
 
