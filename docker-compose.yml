@@ -1,30 +1,70 @@
+# Baseline production-safe compose. Override per-host with docker-compose.override.yml
+# (see docker-compose.override.example.yml for the template).
+#
+# Defaults that differ from older revisions:
+#   * port bound to 127.0.0.1 — anyone wanting external access must override
+#   * read_only rootfs — writes go to /data, /tmp tmpfs, or /home/tm/.cache tmpfs
+#   * pull_policy: always — `docker compose up -d` re-creates after `pull` brings
+#     down a new tag, eliminating "I pulled but the old container is still up"
+#   * healthcheck uses scripts/healthcheck.py (no curl in image)
+
 services:
   rag-server:
-    image: ${TM_IMAGE:?TM_IMAGE 必须设置，例如 docker.io/<dockerhub-user>/transcendence-memory-server:lite。本仓库 docker-compose.yml 不包含 build 段（远端永久禁 build），如需本地构建请用 docker-compose.dev.yml}
+    image: ${TM_IMAGE:?set TM_IMAGE, e.g. docker.io/leekkk2/transcendence-memory-server:0.6.0-lite}
+    pull_policy: always
     ports:
-      - "${TM_PORT:-8711}:8711"
+      - "127.0.0.1:${TM_PORT:-8711}:8711"
     volumes:
+      # Persistent server state: LanceDB tables, memory_objects.jsonl, knowledge graphs.
       - tm-data:/data
+      # mineru model cache. Lite flavor has no mineru install but the volume mount
+      # is harmless (the dir simply stays empty). Keeps deploy commands identical
+      # across flavors.
+      - mineru-models:/home/tm/.cache/mineru
+      # Read-only sync of host's rclone-mirrored archive. This is a *plain*
+      # named volume populated by a host-side rsync timer (see deploy/systemd/
+      # rclone-sync.{service,timer}); the container never sees the FUSE mount
+      # directly, so an unhealthy rclone never blocks container reads.
+      - rclone-archive:/mnt/rclone/example-archive:ro
     env_file:
       - path: .env
         required: false
     environment:
-      - WORKSPACE=/data
+      WORKSPACE: /data
     restart: unless-stopped
+    stop_grace_period: 30s
     mem_limit: ${TM_MEM_LIMIT:-3g}
     memswap_limit: ${TM_MEM_LIMIT:-3g}
     mem_reservation: ${TM_MEM_RESERVATION:-1g}
+    cpus: ${TM_CPUS:-1.5}
+    pids_limit: ${TM_PIDS_LIMIT:-256}
+    oom_score_adj: ${TM_OOM_SCORE_ADJ:-500}
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /home/tm/.cache:size=256m
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8711/health"]
+      test: ["CMD", "python3", "/app/scripts/healthcheck.py"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 20s
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "20m"
+        max-file: "5"
 
 volumes:
+  # Persistent application data — LanceDB tables and memory_objects.jsonl live here.
+  # NEVER recreate this volume during a normal deploy — that's how memories get lost.
   tm-data:
+  # Pre-warmed multimodal model cache (full flavor). Survives image updates so
+  # mineru doesn't re-download multi-hundred-MB models on every pull.
+  mineru-models:
+  # Host-side rsync target. Populated by rclone-sync.timer running on the host;
+  # the container only sees a regular ext4 directory through this volume, never
+  # the FUSE mount itself. Rclone going down can't block container reads.
+  rclone-archive:

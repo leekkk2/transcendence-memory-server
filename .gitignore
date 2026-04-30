@@ -53,6 +53,8 @@ coverage.xml
 .drafts/
 DEPLOY_ISSUES_*.md
 
-# Host-specific compose override (auto-loaded by docker compose)
+# Host-specific compose override (auto-loaded by docker compose). The
+# tracked .example.yml template is exempt — operators copy it on first install.
 docker-compose.override.yml
 docker-compose.override.*.yml
+!docker-compose.override.example.yml

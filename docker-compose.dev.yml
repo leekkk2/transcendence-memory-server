@@ -1,8 +1,27 @@
+# Dev override: build locally + bind-mount source for live editing.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#   BUILD_TARGET=full docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Differences from baseline:
+#   * builds locally instead of pulling
+#   * bind-mounts ./scripts so code changes are picked up by uvicorn --reload
+#   * raises memory headroom (local Docker Desktop usually has plenty)
+#   * relaxes read_only so tests writing to repo paths still work
+
 services:
   rag-server:
     image: transcendence-memory-server:dev-${BUILD_TARGET:-lite}
     build:
       context: .
       target: ${BUILD_TARGET:-lite}
+      args:
+        TM_VERSION: dev-${USER:-local}
+    pull_policy: never
+    volumes:
+      - ./scripts:/app/scripts:ro
     mem_limit: 6g
     memswap_limit: 6g
+    cpus: "0"
+    read_only: false
