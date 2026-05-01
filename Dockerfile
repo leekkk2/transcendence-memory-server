@@ -32,9 +32,14 @@ ENV PIP_NO_CACHE_DIR=1 \
     PIP_CONSTRAINT=/build/constraints.txt
 WORKDIR /build
 
-# Copy only what the dep resolver needs; source code copied later in runtime stage.
-COPY pyproject.toml constraints.txt README.md ./
-COPY src/tm_server/__init__.py ./src/tm_server/__init__.py
+# Copy only the dep manifests; src/ + README content arrive later in runtime
+# stage so doc/code edits don't invalidate this expensive layer.
+# A stub README + minimal __init__ are enough for hatchling to resolve the
+# project metadata without forcing a rebuild on every README touch.
+COPY pyproject.toml constraints.txt ./
+RUN echo "stub for build-time metadata only" > README.md \
+    && mkdir -p src/tm_server \
+    && echo '__version__ = "0.0.0-build"' > src/tm_server/__init__.py
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --constraint constraints.txt .
@@ -76,6 +81,7 @@ LABEL org.opencontainers.image.title="transcendence-memory-server" \
 #   libgl1 / libglib2.0-0 / libgomp1   opencv-headless + mineru
 #   poppler-utils                       mineru PDF text extraction
 #   libmagic1                           python-magic file-type sniffing
+#   gosu                                drop-privilege launcher used by entrypoint
 # No curl — healthcheck is a stdlib Python script (scripts/healthcheck.py).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
@@ -83,6 +89,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         poppler-utils \
         libmagic1 \
+        gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. UID 10001 picked above default-system range to stay clear of
@@ -104,9 +111,13 @@ ENV WORKSPACE=/data \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/scripts:/app/src \
-    PATH="/app/scripts:${PATH}"
+    PATH="/app/scripts:${PATH}" \
+    TM_RUN_AS_UID=10001 \
+    TM_RUN_AS_GID=10001
 
-USER tm
+# Container starts as root so entrypoint.sh can chown /data (handles upgrade
+# from pre-v0.6 images that wrote /data with root-owned files), then drops
+# to UID 10001 via gosu before exec'ing uvicorn. Final process runs as `tm`.
 EXPOSE 8711
 
 # Healthcheck uses Python stdlib (no curl in image). start-period is generous

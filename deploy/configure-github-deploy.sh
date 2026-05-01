@@ -73,9 +73,11 @@ fi
 
 echo "[deploy-config] writing GitHub Secrets"
 gh secret set DEPLOY_HOST    --body "$HOST"
-gh secret set DEPLOY_SSH_KEY --body "$(cat "$KEY_PATH")"
+# Use stdin redirect (not $(cat ...)) so the trailing newline is preserved —
+# ssh-keygen output ends with \n and stricter parsers reject keys without it.
+gh secret set DEPLOY_SSH_KEY < "$KEY_PATH"
 if [ -n "$KNOWN_HOSTS" ]; then
-    gh secret set DEPLOY_KNOWN_HOSTS --body "$KNOWN_HOSTS"
+    printf '%s\n' "$KNOWN_HOSTS" | gh secret set DEPLOY_KNOWN_HOSTS
 fi
 
 echo "[deploy-config] writing GitHub Variables"
@@ -92,21 +94,37 @@ cat <<EOF
 ──────────────────────────────────────────────────────────────────────
 ✓ GitHub side configured.
 
-NEXT — authorize the deploy key on the host (run this on YOUR workstation,
-not in CI; you only need to do it once):
+NEXT — host-side prerequisites (run these on YOUR workstation; ssh into
+the host as a user that already can sudo, just once):
+
+1) Authorize the deploy key:
 
   ssh -p ${PORT} ${USER_NAME}@${HOST} "mkdir -p ~/.ssh && chmod 700 ~/.ssh \\
       && grep -qxF '${PUB_KEY}' ~/.ssh/authorized_keys 2>/dev/null \\
       || echo '${PUB_KEY}' >> ~/.ssh/authorized_keys \\
       && chmod 600 ~/.ssh/authorized_keys"
 
-ALSO ensure the SSH user can run docker + systemctl without a password.
-On the host, as root:
+2) Add the deploy user to the docker group (so docker commands need no sudo).
+   This avoids granting blanket NOPASSWD on /usr/bin/docker, which is
+   equivalent to root (the user could 'docker run --privileged ... -v /:/host').
 
-  sudo tee /etc/sudoers.d/transcendence-memory-deploy >/dev/null <<'SUDOERS'
-  ${USER_NAME} ALL=(root) NOPASSWD: /usr/bin/docker, /bin/systemctl reload rag-everything, /bin/systemctl restart rag-everything, /bin/systemctl start rag-everything, /bin/systemctl stop rag-everything
-  SUDOERS
-  sudo chmod 440 /etc/sudoers.d/transcendence-memory-deploy
+  ssh -p ${PORT} ${USER_NAME}@${HOST} "sudo usermod -aG docker ${USER_NAME} && \\
+      newgrp docker && docker info >/dev/null && echo 'docker group OK'"
+
+3) Allow ONLY the systemctl reload command without password (least privilege).
+   Skip this step if you set DEPLOY_SUDO="" in GitHub variables (deploy will
+   still work via docker group + 'docker compose' directly).
+
+  ssh -p ${PORT} ${USER_NAME}@${HOST} "sudo tee /etc/sudoers.d/transcendence-memory-deploy >/dev/null <<'SUDOERS'
+${USER_NAME} ALL=(root) NOPASSWD: /bin/systemctl reload rag-everything.service, /bin/systemctl restart rag-everything.service
+SUDOERS
+sudo chmod 440 /etc/sudoers.d/transcendence-memory-deploy
+sudo visudo -c -f /etc/sudoers.d/transcendence-memory-deploy"
+
+   If you also want the deploy workflow to use 'sudo docker compose' (the
+   default DEPLOY_SUDO="sudo"), set DEPLOY_SUDO="" in repo variables instead:
+       gh variable set DEPLOY_SUDO --body ""
+   Then the docker group membership above is sufficient.
 
 To test the workflow without waiting for a tag:
 
