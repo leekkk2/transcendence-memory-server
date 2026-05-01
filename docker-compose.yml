@@ -10,7 +10,7 @@
 
 services:
   rag-server:
-    image: ${TM_IMAGE:?set TM_IMAGE, e.g. docker.io/leekkk2/transcendence-memory-server:0.6.0-lite}
+    image: ${TM_IMAGE:?set TM_IMAGE in .env, e.g. docker.io/<your-namespace>/transcendence-memory-server:0.6.1-lite}
     pull_policy: always
     ports:
       - "127.0.0.1:${TM_PORT:-8711}:8711"

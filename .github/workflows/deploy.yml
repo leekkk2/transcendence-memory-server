@@ -125,7 +125,12 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           umask 077
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          # Don't append our own newline — gh secret retains the original
+          # trailing newline from ssh-keygen output. Stricter ssh-keygen builds
+          # reject keys with double-trailing-newline as "invalid format".
+          printf '%s' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          # Ensure exactly one trailing newline (idempotent: appends only if missing).
+          [ -n "$(tail -c1 ~/.ssh/deploy_key)" ] && printf '\n' >> ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
             printf '%s\n' "$DEPLOY_KNOWN_HOSTS" >> ~/.ssh/known_hosts
@@ -207,24 +212,35 @@ jobs:
           # Always operate via docker compose at $DEPLOY_PATH so the cwd matches
           # the compose project; systemd unit (if installed) is just there to
           # restart the stack on host reboot — not used in the deploy hot path.
+          # `env` carries TM_IMAGE through whether or not DEPLOY_SUDO expands.
+          # Avoids `--preserve-env=TM_IMAGE docker ...` becoming the literal
+          # command name when DEPLOY_SUDO is empty (root deploys).
           # `--quiet` suppresses per-layer KB-progress lines (still surfaces
           # actual download progress at MB granularity to stderr).
-          $DEPLOY_SUDO --preserve-env=TM_IMAGE docker compose pull --quiet
-          $DEPLOY_SUDO --preserve-env=TM_IMAGE docker compose up -d
-          # Wait for the container healthcheck to flip green.
-          for i in $(seq 1 30); do
+          env TM_IMAGE="$TM_IMAGE" $DEPLOY_SUDO docker compose pull --quiet
+          env TM_IMAGE="$TM_IMAGE" $DEPLOY_SUDO docker compose up -d
+          # Wait for the container healthcheck to flip green. Budget 180s
+          # (90 ticks × 2s) — covers full-flavor cold start where mineru
+          # imports + lightrag init can push first /health past 60s.
+          for i in $(seq 1 90); do
             status=$($DEPLOY_SUDO docker compose ps --format json 2>/dev/null \
               | python3 -c "import sys,json; \
                   data=[json.loads(l) for l in sys.stdin if l.strip()]; \
                   print(next((d.get('Health') or d.get('State','') for d in data \
                               if d.get('Service')=='rag-server'), 'missing'))" 2>/dev/null \
               || echo "unknown")
-            echo "[wait $i/30] rag-server: $status"
+            echo "[wait $i/90] rag-server: $status"
             case "$status" in
-              healthy|running) break ;;
+              healthy) break ;;
             esac
             sleep 2
           done
+          # Hard-fail the deploy if we never reached healthy (vs just running).
+          if [ "$status" != "healthy" ]; then
+            echo "::error::container did not flip to healthy within 180s (last status: $status)"
+            $DEPLOY_SUDO docker compose logs --tail=80 rag-server || true
+            exit 1
+          fi
           REMOTE
 
       - name: Smoke test
