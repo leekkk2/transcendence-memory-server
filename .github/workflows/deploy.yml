@@ -212,13 +212,24 @@ jobs:
           # Always operate via docker compose at $DEPLOY_PATH so the cwd matches
           # the compose project; systemd unit (if installed) is just there to
           # restart the stack on host reboot — not used in the deploy hot path.
-          # `env` carries TM_IMAGE through whether or not DEPLOY_SUDO expands.
-          # Avoids `--preserve-env=TM_IMAGE docker ...` becoming the literal
-          # command name when DEPLOY_SUDO is empty (root deploys).
-          # `--quiet` suppresses per-layer KB-progress lines (still surfaces
-          # actual download progress at MB granularity to stderr).
-          env TM_IMAGE="$TM_IMAGE" $DEPLOY_SUDO docker compose pull --quiet
-          env TM_IMAGE="$TM_IMAGE" $DEPLOY_SUDO docker compose up -d
+          # Carry TM_IMAGE all the way down to docker compose. Two paths:
+          #   * with sudo: `sudo` strips env by default, so we must whitelist
+          #     TM_IMAGE via --preserve-env=TM_IMAGE.
+          #   * without sudo (root deploys): plain `env TM_IMAGE=... docker ...`
+          #     because --preserve-env is a sudo flag and would become the
+          #     literal command name.
+          # `--quiet` suppresses per-layer KB-progress lines (download progress
+          # still surfaces at MB granularity to stderr).
+          run_compose() {
+            if [ -n "$DEPLOY_SUDO" ]; then
+              $DEPLOY_SUDO --preserve-env=TM_IMAGE "$@"
+            else
+              env TM_IMAGE="$TM_IMAGE" "$@"
+            fi
+          }
+          export TM_IMAGE
+          run_compose docker compose pull --quiet
+          run_compose docker compose up -d
           # Wait for the container healthcheck to flip green. Budget 180s
           # (90 ticks × 2s) — covers full-flavor cold start where mineru
           # imports + lightrag init can push first /health past 60s.
