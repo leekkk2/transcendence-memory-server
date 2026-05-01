@@ -183,12 +183,34 @@ jobs:
             git checkout --detach "$latest"
             DEPLOY_REF="$latest"
           fi
-          echo "::notice::Deploying ref=${DEPLOY_REF} on $(hostname)"
+          # Pin the image tag to the git ref so each deploy is reproducible
+          # and rolling-tag pulls (`:full` / `:lite`) never block the deploy
+          # while a multi-GB layer downloads. We learn `image_base` and the
+          # flavor from .env so user-side image-repo choice is preserved.
+          if [ -f .env ]; then
+            env_image=$(grep -E '^TM_IMAGE=' .env | tail -n1 | cut -d= -f2- || true)
+          else
+            env_image=""
+          fi
+          [ -n "$env_image" ] || { echo "TM_IMAGE not set in .env; aborting"; exit 1; }
+          image_base=$(printf '%s' "$env_image" | sed -E 's/:[^:]+$//')
+          env_tag=$(printf '%s' "$env_image" | awk -F: '{print $NF}')
+          case "$env_tag" in
+            lite|full) flavor="$env_tag" ;;
+            *-lite)    flavor=lite ;;
+            *-full)    flavor=full ;;
+            *)         flavor=lite ;;  # safe default
+          esac
+          version="${DEPLOY_REF#v}"
+          export TM_IMAGE="${image_base}:${version}-${flavor}"
+          echo "::notice::Deploying ref=${DEPLOY_REF} as TM_IMAGE=${TM_IMAGE} on $(hostname)"
           # Always operate via docker compose at $DEPLOY_PATH so the cwd matches
           # the compose project; systemd unit (if installed) is just there to
           # restart the stack on host reboot — not used in the deploy hot path.
-          $DEPLOY_SUDO docker compose pull
-          $DEPLOY_SUDO docker compose up -d
+          # `--quiet` suppresses per-layer KB-progress lines (still surfaces
+          # actual download progress at MB granularity to stderr).
+          $DEPLOY_SUDO --preserve-env=TM_IMAGE docker compose pull --quiet
+          $DEPLOY_SUDO --preserve-env=TM_IMAGE docker compose up -d
           # Wait for the container healthcheck to flip green.
           for i in $(seq 1 30); do
             status=$($DEPLOY_SUDO docker compose ps --format json 2>/dev/null \
