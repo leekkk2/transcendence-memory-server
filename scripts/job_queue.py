@@ -55,6 +55,14 @@ DEFAULT_MAX_ATTEMPTS = len(BACKOFF_SCHEDULE)
 VALID_STATUSES = {"pending", "running", "done", "failed", "cancelled"}
 
 
+class QueueFullError(RuntimeError):
+    """Raised by JobQueue.enqueue when pending+running exceeds max_pending.
+
+    The API layer should translate this into HTTP 429 with a Retry-After hint
+    so a misbehaving client backs off instead of accumulating SQLite rows.
+    """
+
+
 @dataclass
 class Job:
     id: int
@@ -133,14 +141,27 @@ class JobQueue:
                 """
             )
             # Recover from crash: any 'running' job at startup is presumed dead
-            # (the worker that owned it is gone). Reset to pending so it gets
-            # picked up again, with attempts incremented as a soft cap.
+            # (the worker that owned it is gone). Increment attempts so a
+            # poison job (subprocess always SIGKILLed by OOM) doesn't loop
+            # forever on every restart — once attempts reaches max_attempts
+            # we transition it to permanent 'failed' instead of bouncing.
             now = int(time.time())
             cursor = conn.execute(
-                """UPDATE jobs SET status='pending', next_run_at=?, pid=NULL,
-                   last_error=COALESCE(last_error,'')||'\n[recovered after restart]'
-                   WHERE status='running'""",
-                (now,),
+                """UPDATE jobs
+                   SET attempts = attempts + 1,
+                       status = CASE
+                           WHEN attempts + 1 >= max_attempts THEN 'failed'
+                           ELSE 'pending'
+                       END,
+                       next_run_at = ?,
+                       finished_at = CASE
+                           WHEN attempts + 1 >= max_attempts THEN ?
+                           ELSE finished_at
+                       END,
+                       pid = NULL,
+                       last_error = COALESCE(last_error,'') || '\n[recovered after restart]'
+                   WHERE status = 'running'""",
+                (now, now),
             )
             if cursor.rowcount:
                 logger.warning("recovered %d running jobs after restart", cursor.rowcount)
@@ -157,9 +178,14 @@ class JobQueue:
         label: str = "",
         delay_sec: int = 0,
         coalesce: bool = True,
+        max_pending: int | None = None,
     ) -> int:
         """Add a job. If coalesce=True and a pending job for (op, container)
         already exists, returns its existing id without creating a duplicate.
+
+        Raises QueueFullError when the count of pending+running jobs exceeds
+        max_pending — this is the *back-pressure* surface to the API layer,
+        which should turn the error into HTTP 429.
         """
         now = int(time.time())
         next_run = now + max(0, delay_sec)
@@ -180,6 +206,15 @@ class JobQueue:
                         (next_run, row["id"]),
                     )
                     return int(row["id"])
+            if max_pending is not None and max_pending > 0:
+                row = conn.execute(
+                    """SELECT COUNT(*) AS n FROM jobs
+                       WHERE status IN ('pending','running')"""
+                ).fetchone()
+                if int(row["n"]) >= max_pending:
+                    raise QueueFullError(
+                        f"job queue saturated: {row['n']} pending+running >= {max_pending}"
+                    )
             cursor = conn.execute(
                 """INSERT INTO jobs (op, container, payload_json, status,
                        max_attempts, enqueued_at, next_run_at, label)
@@ -315,11 +350,18 @@ class JobQueue:
         return out
 
     def purge_done(self, older_than_sec: int = 7 * 86400) -> int:
+        """Drop terminal-state rows older than the cutoff.
+
+        Without periodic invocation the SQLite db grows monotonically; a write-
+        heavy deployment ends up with millions of done rows that slow every
+        claim_next scan. The single worker invokes this on a fixed cadence
+        (see JobWorker._maybe_purge).
+        """
         cutoff = int(time.time()) - older_than_sec
         with self._conn() as conn:
             cursor = conn.execute(
                 """DELETE FROM jobs
-                   WHERE status IN ('done','cancelled') AND finished_at < ?""",
+                   WHERE status IN ('done','cancelled','failed') AND finished_at < ?""",
                 (cutoff,),
             )
             return cursor.rowcount

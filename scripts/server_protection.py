@@ -56,6 +56,9 @@ class SystemHealthSnapshot:
     swap_used_mb: int | None
     load_1min: float | None
     cpu_count: int | None
+    # cgroup-scoped values (set when running in a memory-limited container)
+    cgroup_mem_limit_mb: int | None = None
+    cgroup_mem_current_mb: int | None = None
 
     @property
     def swap_used_pct(self) -> float | None:
@@ -69,10 +72,35 @@ class SystemHealthSnapshot:
             return None
         return round(self.load_1min / self.cpu_count, 2)
 
+    @property
+    def cgroup_mem_available_mb(self) -> int | None:
+        """Bytes the *container* can still allocate before cgroup OOM kills it.
+
+        This is the value `_admit_or_503` should consult inside a Docker
+        container — host /proc/meminfo lies about how much memory we actually have.
+        """
+        if self.cgroup_mem_limit_mb is None or self.cgroup_mem_current_mb is None:
+            return None
+        return max(0, self.cgroup_mem_limit_mb - self.cgroup_mem_current_mb)
+
+    @property
+    def effective_mem_available_mb(self) -> int | None:
+        """min(host_available, cgroup_available) — the binding constraint.
+
+        Inside a containerized deploy with a 1.5 GB cgroup limit, host can show
+        8 GB free while we're 100 MB from OOM kill. The smaller value wins.
+        """
+        candidates = [m for m in (self.mem_available_mb, self.cgroup_mem_available_mb) if m is not None]
+        return min(candidates) if candidates else None
+
     def as_dict(self) -> dict:
         return {
             "mem_total_mb": self.mem_total_mb,
             "mem_available_mb": self.mem_available_mb,
+            "cgroup_mem_limit_mb": self.cgroup_mem_limit_mb,
+            "cgroup_mem_current_mb": self.cgroup_mem_current_mb,
+            "cgroup_mem_available_mb": self.cgroup_mem_available_mb,
+            "effective_mem_available_mb": self.effective_mem_available_mb,
             "swap_total_mb": self.swap_total_mb,
             "swap_used_mb": self.swap_used_mb,
             "swap_used_pct": self.swap_used_pct,
@@ -103,8 +131,52 @@ def _read_meminfo() -> dict[str, int]:
     return out
 
 
+def _read_cgroup_int(path: str) -> int | None:
+    """Read a single integer from a cgroup pseudo-file. Returns MB, or None.
+
+    Cgroup files are byte counts; we convert to MB for parity with /proc/meminfo
+    handling. The literal string "max" (cgroup v2 unbounded) returns None.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return None
+    if raw == "max" or not raw:
+        return None
+    try:
+        return int(raw) // (1024 * 1024)
+    except ValueError:
+        return None
+
+
+def _read_cgroup_memory() -> tuple[int | None, int | None]:
+    """Return (limit_mb, current_mb) from cgroup v2 (preferred) or v1 (fallback).
+
+    Outside a memory-limited container both values are None — caller should
+    fall back to host /proc/meminfo only.
+    """
+    # cgroup v2 (unified hierarchy — modern Docker, systemd-managed)
+    limit = _read_cgroup_int("/sys/fs/cgroup/memory.max")
+    current = _read_cgroup_int("/sys/fs/cgroup/memory.current")
+    if limit is not None or current is not None:
+        return limit, current
+    # cgroup v1 (older kernels / hosts running cgroupfs=legacy)
+    limit = _read_cgroup_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    current = _read_cgroup_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    # cgroup v1 reports a sentinel ~9223372036854775807 bytes for "unlimited".
+    # That converts to ~8.7 EB; treat anything > 1 PB as unbounded.
+    if limit is not None and limit > 1024 * 1024 * 1024:  # > 1 PB in MB
+        limit = None
+    return limit, current
+
+
 def read_system_health() -> SystemHealthSnapshot:
-    """非阻塞读取系统健康，失败安全（任何字段允许 None）。"""
+    """非阻塞读取系统健康，失败安全（任何字段允许 None）。
+
+    cgroup memory limits 在 1.5 GB 容器里至关重要——host /proc/meminfo 显示
+    宿主机视角，会让 admit gate 误判可用内存。
+    """
     mem = _read_meminfo()
     try:
         load_1min = os.getloadavg()[0]
@@ -117,6 +189,7 @@ def read_system_health() -> SystemHealthSnapshot:
     swap_total = mem.get("SwapTotal")
     swap_free = mem.get("SwapFree")
     swap_used = (swap_total - swap_free) if (swap_total and swap_free is not None) else None
+    cgroup_limit, cgroup_current = _read_cgroup_memory()
     return SystemHealthSnapshot(
         mem_total_mb=mem.get("MemTotal"),
         mem_available_mb=mem.get("MemAvailable"),
@@ -124,6 +197,8 @@ def read_system_health() -> SystemHealthSnapshot:
         swap_used_mb=swap_used,
         load_1min=load_1min,
         cpu_count=cpu_count,
+        cgroup_mem_limit_mb=cgroup_limit,
+        cgroup_mem_current_mb=cgroup_current,
     )
 
 
@@ -169,12 +244,18 @@ class IngestGate:
 
         若任何关键指标缺失（容器探测不到 /proc/meminfo），不阻塞——失败开放，
         因为我们不希望保护层本身误杀生产请求。
+
+        内存判定优先用 *effective* available（min(host_avail, cgroup_avail)），
+        以正确反映容器内的实际可分配内存——host /proc/meminfo 在 1.5 GB 容器
+        里会撒谎说还剩 8 GB，而 cgroup 视角才是 OOM kill 的真实门槛。
         """
         snap = snapshot or read_system_health()
-        if snap.mem_available_mb is not None and snap.mem_available_mb < self.config.min_available_mem_mb:
+        effective_mem = snap.effective_mem_available_mb
+        if effective_mem is not None and effective_mem < self.config.min_available_mem_mb:
+            scope = "container" if snap.cgroup_mem_available_mb == effective_mem else "host"
             return (
                 False,
-                f"system memory pressure: available={snap.mem_available_mb}MB "
+                f"{scope} memory pressure: available={effective_mem}MB "
                 f"< threshold {self.config.min_available_mem_mb}MB",
             )
         if snap.load_per_cpu is not None and snap.load_per_cpu > self.config.max_load_per_cpu:

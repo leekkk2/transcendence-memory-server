@@ -119,14 +119,35 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     )
 
 try:
-    from job_queue import JobQueue, Job
+    from job_queue import JobQueue, Job, QueueFullError
     from job_worker import JobWorker, default_command_resolver
 except ModuleNotFoundError:  # pragma: no cover - package import path
-    from scripts.job_queue import JobQueue, Job
+    from scripts.job_queue import JobQueue, Job, QueueFullError
     from scripts.job_worker import JobWorker, default_command_resolver
 
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env var with safe fallback.
+
+    Used for back-pressure caps (queue depth, RAG concurrency) so operators
+    can tune via TM_* env vars without redeploying the image.
+    """
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Async semaphores for unbounded-cost RAG paths (lightrag write/query, mineru
+# upload). One semaphore per category so they don't starve each other.
+import asyncio as _asyncio
+
+_RAG_WRITE_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_RAG_WRITES', 1))
+_RAG_QUERY_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_RAG_QUERIES', 2))
+_DOC_FILE_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_DOC_FILES', 1))
 SERVER_SCRIPTS = Path(__file__).resolve().parent
 WORKSPACE_SCRIPTS = WS / 'scripts'
 RAG_API_KEY = os.environ.get('RAG_API_KEY', '')
@@ -724,9 +745,26 @@ def _enqueue_or_run(
 
     worker_alive = bool(JOB_WORKER and JOB_WORKER.is_running)
 
+    # Even on the queued path we still apply admit-gate so a flood under
+    # genuine system pressure gets pushback (HTTP 503) instead of inflating
+    # the SQLite queue. Coalescing already collapses duplicate (op, container);
+    # this guards distinct-container fan-outs.
+    _admit_or_503(container, op=op)
+    max_pending = _env_int('TM_QUEUE_MAX_PENDING', 1000)
+
     if not wait:
         # Background mode: always enqueue, return job_id immediately.
-        job_id = queue.enqueue(op=op, container=container, payload=payload, label=label or op)
+        try:
+            job_id = queue.enqueue(
+                op=op, container=container, payload=payload,
+                label=label or op, max_pending=max_pending,
+            )
+        except QueueFullError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={'error': 'queue_full', 'op': op, 'reason': str(exc)},
+                headers={'Retry-After': '60'},
+            )
         return CommandResponse(
             command=[op, container],
             code=0,
@@ -739,7 +777,17 @@ def _enqueue_or_run(
 
     if worker_alive:
         # wait=True with worker: enqueue, then poll queue until job leaves pending/running.
-        job_id = queue.enqueue(op=op, container=container, payload=payload, label=label or op)
+        try:
+            job_id = queue.enqueue(
+                op=op, container=container, payload=payload,
+                label=label or op, max_pending=max_pending,
+            )
+        except QueueFullError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={'error': 'queue_full', 'op': op, 'reason': str(exc)},
+                headers={'Retry-After': '60'},
+            )
         deadline = time.time() + max(1, timeout_s)
         while time.time() < deadline:
             job = queue.get(job_id)
@@ -857,23 +905,42 @@ def ingest_contract() -> dict[str, object]:
 
 @app.post('/ingest-memory/objects', response_model=ClientIngestResponse, dependencies=[Depends(verify_auth)])
 def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
+    validate_container_name(req.container)
     path = memory_objects_path(req.container)
     lines = []
     for obj in req.objects:
         payload = obj.model_dump(mode='json')
         payload['storedAt'] = int(time.time())
         lines.append(json.dumps(payload, ensure_ascii=False))
-    with path.open('a', encoding='utf-8') as handle:
-        for line in lines:
-            handle.write(line + '\n')
+    # POSIX O_APPEND is atomic only for writes < PIPE_BUF (~4 KB). A single
+    # large object can tear if two requests race; a per-container lock
+    # serializes appends on the same JSONL file.
+    container_lock = GATE._container_lock(req.container)  # noqa: SLF001 — intentional reuse
+    with container_lock:
+        with path.open('a', encoding='utf-8') as handle:
+            for line in lines:
+                handle.write(line + '\n')
 
     # auto_embed: enqueue a background embed job. The persistent queue coalesces
     # duplicate enqueues for the same container, so even posting many objects
     # in a tight loop only yields one pending embed job. The queue worker will
     # drain it later at a stable, host-friendly pace.
     if req.auto_embed:
-        get_job_queue().enqueue(op='embed', container=req.container, payload={}, label='auto-embed')
-        index_hint = 'Embed job queued; the background worker will index this container shortly.'
+        try:
+            get_job_queue().enqueue(
+                op='embed', container=req.container, payload={}, label='auto-embed',
+                max_pending=_env_int('TM_QUEUE_MAX_PENDING', 1000),
+            )
+        except QueueFullError as exc:
+            # Don't fail the ingest — the objects ARE persisted. Just inform
+            # the caller they need to /embed manually later.
+            logger.warning('auto_embed dropped (queue full): %s', exc)
+            index_hint = (
+                'Memories persisted but queue is saturated; auto-embed skipped. '
+                'Run /embed manually for this container later.'
+            )
+        else:
+            index_hint = 'Embed job queued; the background worker will index this container shortly.'
     else:
         index_hint = 'Run /embed for this container to refresh LanceDB after storing new objects.'
     return ClientIngestResponse(
@@ -944,22 +1011,62 @@ def _list_container_dirs() -> list[Path]:
     return sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name)
 
 
+_MEMORY_OBJECTS_MAX_BYTES = _env_int('TM_MEMORY_OBJECTS_MAX_BYTES', 256 * 1024 * 1024)  # 256 MB
+
+
+def _check_memory_objects_size(path: Path, op: str) -> None:
+    """Reject ops that would materialize a too-large JSONL into RAM.
+
+    read/write_memory_objects loads the whole file into memory; on a 1.5 GB
+    container a 500 MB JSONL would peak at ~3x file size during write.
+    Tell the operator to compact rather than silently OOM.
+    """
+    if not path.exists():
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size > _MEMORY_OBJECTS_MAX_BYTES:
+        raise HTTPException(
+            status_code=507,  # Insufficient Storage
+            detail={
+                'error': 'memory_objects_too_large',
+                'op': op,
+                'path': str(path),
+                'size_bytes': size,
+                'max_bytes': _MEMORY_OBJECTS_MAX_BYTES,
+                'hint': (
+                    'Stream-rewrite or split this container before further '
+                    'mutations. Override with TM_MEMORY_OBJECTS_MAX_BYTES if '
+                    'your container memory limit allows.'
+                ),
+            },
+        )
+
+
 def read_memory_objects(container: str) -> list[dict]:
-    """读取 container 下的 memory_objects.jsonl，返回 dict 列表。"""
+    """读取 container 下的 memory_objects.jsonl，返回 dict 列表。
+
+    Iterates line-by-line so peak RAM is one parsed row, not the whole file.
+    """
     path = memory_objects_path(container)
+    _check_memory_objects_size(path, op='read_memory_objects')
     if not path.exists():
         return []
-    rows = []
-    for line in path.read_text(encoding='utf-8').splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
+    rows: list[dict] = []
+    with path.open('r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
     return rows
 
 
 def write_memory_objects(container: str, rows: list[dict]) -> Path:
     """原子写入 memory_objects.jsonl（tmp + rename）。"""
     path = memory_objects_path(container)
+    _check_memory_objects_size(path, op='write_memory_objects')
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix('.jsonl.tmp')
     with tmp_path.open('w', encoding='utf-8') as f:
@@ -1190,8 +1297,12 @@ def _require_lightrag_ready() -> None:
 async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
     validate_container_name(req.container)
     _require_lightrag_ready()
-    lightrag = await get_lightrag(req.container)
-    await lightrag.ainsert(req.text)
+    _admit_or_503(req.container, op='documents/text')
+    # Cap concurrent lightrag writes — each call drives many embedding+LLM
+    # invocations and holds the container's KV graph lock.
+    async with _RAG_WRITE_SEM:
+        lightrag = await get_lightrag(req.container)
+        await lightrag.ainsert(req.text)
     return QueryResponse(
         status='ok',
         query='',
@@ -1224,6 +1335,10 @@ async def ingest_document_file(
 
     底层走 RAGAnything.process_document_complete → mineru parser → LightRAG。
     与 /documents/text 共享同一个 container working_dir，写入同一知识图谱。
+
+    Mineru parsing routinely uses 1-2 GB RAM; we admit-gate + serialize via
+    _DOC_FILE_SEM (default concurrency=1) so two simultaneous uploads can't
+    OOM a 1.5 GB container.
     """
     validate_container_name(container)
     _require_lightrag_ready()
@@ -1231,8 +1346,14 @@ async def ingest_document_file(
         raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
 
     filename = _sanitize_upload_filename(file.filename)
+    _admit_or_503(container, op='documents/file')
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix='tm-upload-'))
+    # Stage uploads under /data/scratch (persistent volume, ~no size cap)
+    # rather than /tmp tmpfs (128 MB), since MAX_UPLOAD_BYTES defaults to
+    # 200 MB and mineru's intermediate parse output can be hundreds of MB more.
+    scratch_root = WS / 'scratch' / 'uploads'
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix='tm-upload-', dir=str(scratch_root)))
     saved = tmp_dir / filename
     # 防御性：验证 resolve 后仍在 tmp_dir 内
     if not str(saved.resolve()).startswith(str(tmp_dir.resolve()) + os.sep):
@@ -1241,35 +1362,36 @@ async def ingest_document_file(
 
     total = 0
     try:
-        with saved.open('wb') as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f'file exceeds max upload size {_MAX_UPLOAD_BYTES} bytes',
-                    )
-                f.write(chunk)
+        async with _DOC_FILE_SEM:
+            with saved.open('wb') as f:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f'file exceeds max upload size {_MAX_UPLOAD_BYTES} bytes',
+                        )
+                    f.write(chunk)
 
-        rag = await get_raganything(container)
-        parse_output = tmp_dir / 'parsed'
-        parse_output.mkdir(exist_ok=True)
-        parser_kwargs: dict[str, Any] = {}
-        backend = os.environ.get('RAG_PARSER_BACKEND')
-        if backend:
-            parser_kwargs['backend'] = backend
-        lang = os.environ.get('RAG_PARSER_LANG')
-        if lang:
-            parser_kwargs['lang'] = lang
-        await rag.process_document_complete(
-            file_path=str(saved),
-            output_dir=str(parse_output),
-            parse_method=parse_method or os.environ.get('RAG_PARSE_METHOD', 'auto'),
-            **parser_kwargs,
-        )
+            rag = await get_raganything(container)
+            parse_output = tmp_dir / 'parsed'
+            parse_output.mkdir(exist_ok=True)
+            parser_kwargs: dict[str, Any] = {}
+            backend = os.environ.get('RAG_PARSER_BACKEND')
+            if backend:
+                parser_kwargs['backend'] = backend
+            lang = os.environ.get('RAG_PARSER_LANG')
+            if lang:
+                parser_kwargs['lang'] = lang
+            await rag.process_document_complete(
+                file_path=str(saved),
+                output_dir=str(parse_output),
+                parse_method=parse_method or os.environ.get('RAG_PARSE_METHOD', 'auto'),
+                **parser_kwargs,
+            )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1286,12 +1408,15 @@ async def ingest_document_file(
 async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
     _require_lightrag_ready()
+    _admit_or_503(req.container, op='query')
     from lightrag import QueryParam
-    lightrag = await get_lightrag(req.container)
-    answer = await lightrag.aquery(
-        req.query,
-        param=QueryParam(mode=req.mode, top_k=req.top_k),
-    )
+    # Cap concurrent queries — each runs LLM + embedding fan-out.
+    async with _RAG_QUERY_SEM:
+        lightrag = await get_lightrag(req.container)
+        answer = await lightrag.aquery(
+            req.query,
+            param=QueryParam(mode=req.mode, top_k=req.top_k),
+        )
     return QueryResponse(
         status='ok',
         query=req.query,

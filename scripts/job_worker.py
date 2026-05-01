@@ -40,9 +40,9 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.job_queue import Job, JobQueue
 
 try:
-    from server_protection import GATE, read_system_health
+    from server_protection import BG_TRACKER, GATE, read_system_health
 except ModuleNotFoundError:  # pragma: no cover
-    from scripts.server_protection import GATE, read_system_health
+    from scripts.server_protection import BG_TRACKER, GATE, read_system_health
 
 logger = logging.getLogger("transcendence-memory-server.worker")
 
@@ -80,6 +80,11 @@ class JobWorker:
             "TM_WORKER_PRESSURE_BACKOFF_SEC", 60
         )
         self.job_timeout_sec = job_timeout_sec or _env_int("TM_WORKER_JOB_TIMEOUT_SEC", 1800)
+        # Periodic queue compaction: drop terminal-state rows older than this
+        # so SQLite doesn't grow forever. Cadence-checked once per N ticks.
+        self.purge_interval_sec = _env_int("TM_QUEUE_PURGE_INTERVAL_SEC", 3600)
+        self.purge_retention_sec = _env_int("TM_QUEUE_PURGE_RETENTION_SEC", 7 * 86400)
+        self._last_purge_ts = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -122,6 +127,9 @@ class JobWorker:
                 self._sleep(self.between_jobs_sec)
 
     def _tick(self) -> None:
+        # Periodic queue compaction (no-op when called within retention window).
+        self._maybe_purge()
+
         # Pre-flight: refuse to claim a job if the host is under pressure.
         # The job stays in the queue; we'll check again next tick.
         snap = read_system_health()
@@ -144,6 +152,20 @@ class JobWorker:
         # Steady-pace sleep between jobs — this is the lever that keeps
         # embedding API calls from bursting.
         self._sleep(self.between_jobs_sec)
+
+    def _maybe_purge(self) -> None:
+        if self.purge_interval_sec <= 0:
+            return
+        now = time.time()
+        if (now - self._last_purge_ts) < self.purge_interval_sec:
+            return
+        self._last_purge_ts = now
+        try:
+            removed = self.queue.purge_done(older_than_sec=self.purge_retention_sec)
+            if removed:
+                logger.info("queue purge removed %d old rows", removed)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("queue purge failed: %s", exc)
 
     def _execute(self, job: Job) -> None:
         try:
@@ -173,6 +195,8 @@ class JobWorker:
             self.queue.mark_failed(job.id, f"failed to spawn subprocess: {exc}")
             return
         self.queue.attach_pid(job.id, proc.pid)
+        # Register with the global tracker so admit-gate sees queue jobs too.
+        BG_TRACKER.register(proc.pid, job.container, label=f"queue:{job.op}#{job.id}")
         try:
             stdout, stderr = proc.communicate(timeout=self.job_timeout_sec)
         except subprocess.TimeoutExpired:
@@ -181,11 +205,16 @@ class JobWorker:
                 proc.communicate(timeout=10)
             except Exception:  # pragma: no cover - defensive
                 pass
+            BG_TRACKER.unregister(proc.pid)
             self.queue.mark_failed(
                 job.id,
                 f"timeout after {self.job_timeout_sec}s",
             )
             return
+        finally:
+            # Even on success path we want this; the unregister above for
+            # timeout handles its own path. Re-call here is idempotent.
+            BG_TRACKER.unregister(proc.pid)
         rc = proc.returncode
         if rc == 0:
             note = (stdout or "")[:512]
