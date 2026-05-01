@@ -38,7 +38,7 @@ export EMBEDDING_BASE_URL="https://your-embedding-endpoint/v1"
 export EMBEDDINGS_BASE_URL="https://your-embedding-endpoint/v1"
 
 # 3. 准备运行时目录
-mkdir -p tasks/active tasks/archived tasks/rag/containers/imac memory memory_archive
+mkdir -p tasks/active tasks/archived tasks/rag/containers/home memory memory_archive
 
 # 4. 启动服务
 ./scripts/run_task_rag_server.sh

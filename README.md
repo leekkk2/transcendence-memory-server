@@ -272,32 +272,37 @@ Pair with [transcendence-memory](https://github.com/leekkk2/transcendence-memory
 
 ## Rclone Archive → Searchable Memory Workflow
 
-For EVA-style deployments where historical archive data must remain at its original rclone path while still being searchable through `transcendence-memory-server`, use this pattern:
+If you have historical archive data sitting at an rclone-mirrored path on the host
+and want it searchable through `transcendence-memory-server` without copying the
+files into the server's volumes, use this pattern. Replace `<ARCHIVE_ROOT>` (host
+path) and `<CONTAINER>` (your container name) with your own values.
 
-1. Keep source data in place, e.g. `/mnt/rclone/zweiteng/eva`
-2. Bind-mount the rclone root into the container as read-only with mount propagation. Do this in a host-specific `docker-compose.override.yml` (auto-loaded by `docker compose`, gitignored by this repo) so upstream defaults stay untouched:
+1. Keep source data in place at `<ARCHIVE_ROOT>` — for example `/mnt/rclone/my-archive`.
+2. Bind-mount the rclone root into the container as read-only with mount propagation.
+   Do this in a host-specific `docker-compose.override.yml` (auto-loaded by
+   `docker compose`, gitignored by this repo) so upstream defaults stay untouched:
    ```yaml
    # docker-compose.override.yml (host-only, never committed)
    services:
      rag-server:
        volumes:
-         - /mnt/rclone/zweiteng:/mnt/rclone/zweiteng:ro,slave
+         - <ARCHIVE_ROOT>:/mnt/archive/source:ro,slave
    ```
-3. Expose a canonical in-container source path, e.g.:
+3. Expose a canonical in-container source path:
    ```bash
-   ln -s /mnt/rclone/zweiteng/eva /data/tasks/rag/containers/eva/sources/rclone-eva
+   ln -s /mnt/archive/source /data/tasks/rag/containers/<CONTAINER>/sources/archive
    ```
-4. Materialize retrievable objects into canonical storage (`memory_objects.jsonl`) using the helper script:
+4. Materialize retrievable objects into canonical storage (`memory_objects.jsonl`):
    ```bash
    python3 scripts/sync_rclone_archive_to_memory_objects.py \
-     --origin-root /mnt/rclone/zweiteng/eva \
-     --memory-objects /data/tasks/rag/containers/eva/memory_objects.jsonl
+     --origin-root /mnt/archive/source \
+     --memory-objects /data/tasks/rag/containers/<CONTAINER>/memory_objects.jsonl
    ```
 5. Rebuild LanceDB:
    ```bash
    curl -sS -X POST http://127.0.0.1:8711/embed \
      -H "X-API-KEY: $RAG_API_KEY" -H "Content-Type: application/json" \
-     -d '{"container":"eva","wait":true}'
+     -d '{"container":"<CONTAINER>","wait":true}'
    ```
 
 Why this pattern is recommended:
@@ -305,6 +310,48 @@ Why this pattern is recommended:
 - container access remains read-only and auditable
 - retrieval still goes through the server's canonical `memory_objects.jsonl -> /embed -> LanceDB` path
 - avoids treating raw FUSE/rclone directories as a live database
+
+For production hosts, prefer the host-side `rclone-sync.timer` pattern (see
+[Docker Deployment](docs/deployment/docker-deployment.md#rclone-integration-without-the-deadlock-risk))
+so an unhealthy FUSE mount never blocks container reads.
+
+## Auto-Deploy on Tag (GitHub Actions)
+
+Pushing a `v*.*.*` tag builds and publishes the image, then SSHes to your
+server and rolls it forward. Zero manual steps after the tag.
+
+The deploy workflow (`.github/workflows/deploy.yml`) is **opt-in by secret**:
+forks without `DEPLOY_HOST` / `DEPLOY_SSH_KEY` configured will see it skip
+silently. Configure it once with the bundled helper:
+
+```bash
+# On your workstation, with gh CLI authenticated to your fork:
+bash deploy/configure-github-deploy.sh \
+  --host    your.host.example.com \
+  --user    ubuntu \
+  --port    22 \
+  --path    /opt/transcendence-memory-server \
+  --sudo    sudo
+```
+
+The helper:
+
+1. Generates a dedicated `ed25519` deploy key (separate from your personal key) under `~/.ssh/transcendence-memory-deploy/`.
+2. Pins your host's SSH fingerprint via `ssh-keyscan`.
+3. Writes the required GitHub Secrets (`DEPLOY_HOST`, `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS`) and Variables (`DEPLOY_USER`, `DEPLOY_PORT`, `DEPLOY_PATH`, `DEPLOY_SUDO`, `DEPLOY_SMOKE`) via `gh`.
+4. Prints the one command you must run on your workstation to authorize the new key on the host (and a sudoers snippet for passwordless `docker` + `systemctl reload rag-everything`).
+
+After that, every successful tag-push CI/CD run triggers the deploy automatically.
+Manual redeploy from the Actions tab:
+
+```bash
+gh workflow run deploy.yml -f ref=v0.6.0
+```
+
+**Security posture**: the deploy key is repo-scoped, the workflow runs the
+remote script over a single SSH connection (no third-party action), and the
+host fingerprint is pinned so a forged DNS / MITM attempt fails the connection
+instead of silently re-trusting. The full design is in [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml).
 
 ## Documentation
 
@@ -316,6 +363,7 @@ Why this pattern is recommended:
 - [Health Check](docs/operations/health-check.md)
 - [Troubleshooting](docs/operations/troubleshooting.md)
 - [Development Bootstrap](docs/development-bootstrap.md)
+- [Auto-deploy workflow](.github/workflows/deploy.yml)
 
 ## Contributing
 

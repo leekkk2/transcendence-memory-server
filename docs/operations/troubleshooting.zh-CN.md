@@ -41,7 +41,7 @@ echo $RAG_API_KEY
 curl -sS -i http://127.0.0.1:8711/search \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"imac","query":"test","topk":3}'
+  -d '{"container":"home","query":"test","topk":3}'
 ```
 
 ### search 返回 HTTP 200 但 body 有错误
@@ -86,7 +86,7 @@ curl -sS http://127.0.0.1:8711/health | python3 -m json.tool
 curl -sS -X POST http://127.0.0.1:8711/embed \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"imac","background":false,"wait":true}'
+  -d '{"container":"home","background":false,"wait":true}'
 ```
 
 ### Docker daemon 不可访问

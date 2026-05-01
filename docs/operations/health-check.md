@@ -35,7 +35,7 @@ curl -sS https://your-memory-endpoint.example.com/health
     "query": false,
     "documents_text": false
   },
-  "available_containers": ["imac"],
+  "available_containers": ["home"],
   "warnings": []
 }
 ```
@@ -56,19 +56,19 @@ curl -sS -i http://127.0.0.1:8711/health
 curl -sS -X POST http://127.0.0.1:8711/search \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"imac","query":"test","topk":3}'
+  -d '{"container":"home","query":"test","topk":3}'
 
 # 3. embed
 curl -sS -X POST http://127.0.0.1:8711/embed \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"imac","background":true}'
+  -d '{"container":"home","background":true}'
 
 # 4. typed ingest (as needed)
 curl -sS -X POST http://127.0.0.1:8711/ingest-memory/objects \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"imac","objects":[]}'
+  -d '{"container":"home","objects":[]}'
 ```
 
 ## Service Status Check

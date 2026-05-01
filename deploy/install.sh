@@ -21,11 +21,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_RCLONE_SYNC=1
+# rclone is OPT-IN. Pass --with-rclone-sync to install the rsync timer.
+INSTALL_RCLONE_SYNC=0
 
 for arg in "$@"; do
     case "$arg" in
-        --no-rclone-sync) INSTALL_RCLONE_SYNC=0 ;;
+        --with-rclone-sync) INSTALL_RCLONE_SYNC=1 ;;
+        --no-rclone-sync)   INSTALL_RCLONE_SYNC=0 ;;  # back-compat, default
         *) echo "unknown arg: $arg" >&2; exit 1 ;;
     esac
 done
@@ -56,9 +58,14 @@ echo ""
 echo "Next steps:"
 echo "  cd \$(systemctl cat rag-everything | awk -F= '/WorkingDirectory/ {print \$2}')"
 echo "  cp .env.example .env && \$EDITOR .env             # set your keys"
-echo "  cp docker-compose.override.example.yml docker-compose.override.yml   # tune mem caps if needed"
+echo "  cp docker-compose.override.example.yml docker-compose.override.yml   # optional: per-host tuning"
 echo "  docker compose pull"
 echo "  systemctl start rag-everything"
 if [ "$INSTALL_RCLONE_SYNC" -eq 1 ]; then
     echo "  systemctl start rclone-sync.timer"
+    echo ""
+    echo "Note: rclone-sync default source is /mnt/rclone-archive."
+    echo "To override, create /etc/systemd/system/rclone-sync.service.d/source.conf with:"
+    echo "  [Service]"
+    echo "  Environment=ARCHIVE_SOURCE=/mnt/your-rclone-mount"
 fi

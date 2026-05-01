@@ -67,7 +67,7 @@ Prepare the minimal local directory structure as follows:
 mkdir -p \
   tasks/active \
   tasks/archived \
-  tasks/rag/containers/imac \
+  tasks/rag/containers/home \
   memory \
   memory_archive
 ```

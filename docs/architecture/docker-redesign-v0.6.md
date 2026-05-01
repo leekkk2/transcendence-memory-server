@@ -1,27 +1,26 @@
 # Docker Redesign — v0.6.0
 
-> **Status**: proposed (awaiting approval to implement)
-> **Author**: docker-expert audit, 2026-04-30
+> **Status**: implemented
 > **Scope**: Dockerfile, docker-compose.{yml,prod,dev}, .dockerignore, entrypoint.sh, ci.yml, deploy/systemd unit, docs sync
 > **Goal**: eliminate historical debt, single source of truth, security-hardened, reproducible builds, deploy-only-by-pull
 
 ---
 
-## 1. Why redesign now (incident chain & symptoms)
+## 1. Why redesign (failure-mode catalog)
 
-The 2026-04-29 / 2026-04-30 incidents that took the production host into 100+ load average all share the same root pattern: **the container's defenses against host-level failures are insufficient**. Concrete examples:
+A series of production incidents on hosts running pre-v0.6 deployments shared the same root pattern: **the container's defenses against host-level failures were insufficient**. Concrete failure modes observed in the wild:
 
-| Date | Symptom | Real cause |
-|------|---------|------------|
-| 2026-04-29 build | host OOM during `docker compose build full` on remote | remote build was allowed at all |
-| 2026-04-30 morning | rclone FUSE deadlock → 109 D-state procs → load 118 | container bind-mounts rclone FUSE; when FUSE hangs, container reads pile up in D-state |
-| 2026-04-30 14:49 | docker compose pull workflow stuck → puma D-state cascade | host IO queue saturated by container's foreground ingest |
-| 2026-04-30 17:25 | `rag-everything.service` had failed 520,558 times in a 3-second restart loop | service file pointed at a script path that had been moved months ago; nobody noticed |
-| ongoing | container memory limit `1500m` (override) vs Dockerfile assumption `3g` | dev/prod inconsistency; container starves before host signals back-pressure |
+| Failure mode | Symptom | Real cause |
+|--------------|---------|------------|
+| Remote build allowed | host OOM during `docker compose build full` on a memory-constrained VPS | remote build was permitted in the deploy path at all |
+| FUSE deadlock | rclone FUSE hang → dozens of D-state procs → load > 100 | container bind-mounted rclone FUSE; when FUSE hangs, container reads pile up in D-state |
+| IO saturation | docker compose pull stuck → cascading D-state across other host services | host IO queue saturated by container's foreground ingest |
+| Stale service unit | `rag-everything.service` looped on 203/EXEC for hundreds of thousands of restarts | service file pointed at a script path that had been moved; nobody noticed |
+| Memory drift | container memory limit `1500m` (host override) vs Dockerfile assumption `3g` | dev/prod inconsistency; container starves before host signals back-pressure |
 
-The root problem is **drift across configuration surfaces**: Dockerfile, three compose files, an override on the remote that's not in the repo, a systemd unit pointing at the old native script, hard-coded version paths, and dual sources of truth between `pyproject.toml` and the Dockerfile. Each surface drifts on its own schedule and the failure modes compound.
+The root problem is **drift across configuration surfaces**: Dockerfile, three compose files, an off-repo override on the host, a systemd unit pointing at the old native script, hard-coded version paths, and dual sources of truth between `pyproject.toml` and the Dockerfile. Each surface drifts on its own schedule and the failure modes compound.
 
-A patch-style fix (we've done plenty already in v0.5.10) keeps the existing surfaces and adds new ones. This document proposes a holistic redesign that **collapses surfaces**, **enforces a single source of truth**, and **aligns the local repo with the production deploy path**.
+A patch-style fix (the v0.5.10 line carries plenty of those) keeps the existing surfaces and adds new ones. This document records the holistic redesign that **collapses surfaces**, **enforces a single source of truth**, and **aligns the local repo with the production deploy path**.
 
 ---
 
@@ -29,7 +28,7 @@ A patch-style fix (we've done plenty already in v0.5.10) keeps the existing surf
 
 ### 2.1 HIGH severity
 
-1. **Container runs as root.** No `USER` directive in the Dockerfile. Any RCE in FastAPI = root inside the container. With the bind-mount of `/mnt/rclone/zweiteng:ro,slave`, root in the container can chmod-fight with the mount (limited blast radius because of `:ro`, but still wrong default).
+1. **Container runs as root.** No `USER` directive in the Dockerfile. Any RCE in FastAPI = root inside the container. With a bind-mount of an external archive (e.g. `/mnt/archive:ro,slave`), root in the container can chmod-fight with the mount (limited blast radius because of `:ro`, but still wrong default).
 2. **`opencv-python → opencv-python-headless` swap is fragile.** `pip uninstall + force-reinstall` in builder-full breaks if RAGAnything ever pins `opencv-python==X` exactly. Should use a pip constraints file (`PIP_CONSTRAINT`) so we never resolve `opencv-python` non-headless in the first place.
 3. **Hard-coded `python3.13` site-packages path** in the multi-stage `COPY --from=builder` lines. A Python minor-version bump in the base image silently breaks the build. Use `${PY_SITE_PACKAGES}` ARG resolved by `python -c` at build time.
 4. **No constraints / lockfile.** Each build resolves transitive deps independently. A breaking patch release in a dep can take down a CI build silently.
@@ -61,16 +60,18 @@ A patch-style fix (we've done plenty already in v0.5.10) keeps the existing surf
 24. **`docs/deployment/systemd-deployment.md`** — documents the legacy native path. Replace with "systemd-managed docker compose" doc that matches what we actually use.
 25. **`README.md` exception in `.dockerignore`** is fine, but undocumented.
 
-### 2.4 The rclone bind-mount: feature, not bug
+### 2.4 External archive bind-mounts: feature, with FUSE caveats
 
-The remote override mounts `/mnt/rclone/zweiteng:/mnt/rclone/zweiteng:ro,slave` so the in-container `sync_rclone_archive_to_memory_objects.py` can read from the FUSE-backed remote storage without copying data. This **must stay** — it's how the user gets memories from their rclone-mirrored archive into the RAG index.
+A common deployment pattern bind-mounts an external archive (rclone, NFS, SSHFS, etc.) into the container so `scripts/sync_rclone_archive_to_memory_objects.py` can read from remote storage without copying data. Operators who use this pattern depend on it to feed pre-existing archive data into the RAG index.
 
-But it has consequences:
-- Container reads to `/mnt/rclone/zweiteng/*` are subject to host FUSE health.
-- If rclone FUSE blocks (e.g., the 2026-04-30 incident), in-container processes block in D-state too.
+But a direct FUSE bind-mount has consequences:
+- Container reads to the archive path are subject to host FUSE health.
+- If FUSE blocks, in-container processes block in D-state too.
 - `:slave` propagation is correct (host→container only), but doesn't help with the latency.
 
-**Mitigation**: the queue-worker design from v0.5.10 already mostly addresses this — the rclone-touching ingest is enqueued, not synchronous, so a stuck FUSE no longer blocks `/embed` requests. We just need to make sure: (a) the worker pre-checks FUSE health before claiming jobs that touch `/mnt/rclone/*`, and (b) the systemd unit on host has `RequiresMountsFor=/mnt/rclone/zweiteng` so rclone is up before the container starts.
+**Mitigation in v0.6**: the queue-worker design (introduced in v0.5.10) addresses the synchronous-block problem — archive-touching ingest is enqueued, not blocking. v0.6 also ships a host-side `rclone-sync.timer` (see `deploy/systemd/rclone-sync.service`) that **rsyncs from FUSE into a regular ext4 docker volume** on a 15-minute cadence. The container then mounts that volume — never the FUSE path itself — so FUSE health can never block container reads in D-state.
+
+For hosts that still want a direct FUSE bind-mount, declare `RequiresMountsFor=<your-mount>` via a systemd drop-in so the unit waits for FUSE to be live before starting the container.
 
 ---
 
@@ -263,11 +264,12 @@ volumes:
 # docker-compose.override.example.yml — template, copy to .override.yml on each host
 services:
   rag-server:
-    # If this host mounts rclone at /mnt/rclone/<name> and the RAG sync script
+    # If this host mounts rclone (or any FUSE archive) and the RAG sync script
     # needs to read from it, expose that path read-only into the container.
     # `slave` propagation = host changes propagate to container, but not vice versa.
+    # Replace <HOST_ARCHIVE_PATH> with your actual rclone/NFS/etc. mount.
     volumes:
-      - /mnt/rclone/zweiteng:/mnt/rclone/zweiteng:ro,slave
+      - <HOST_ARCHIVE_PATH>:/mnt/archive:ro,slave
     # Tighten memory if this host runs many other tenants
     mem_limit: 1500m
     memswap_limit: 1500m
@@ -302,13 +304,15 @@ Description=transcendence-memory-server (docker compose stack)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
-RequiresMountsFor=/mnt/rclone/zweiteng   # ← prevents start before rclone FUSE is up
+# Optional: declare any FUSE/network mount the container reads from via drop-in:
+#   /etc/systemd/system/rag-everything.service.d/rclone.conf
+#     [Unit]
+#     RequiresMountsFor=/mnt/your-rclone-mount
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-User=ubuntu
-WorkingDirectory=/home/ubuntu/.openclaw/workspace/gitlab/transcendence-memory-server
+WorkingDirectory=/opt/transcendence-memory-server   # adjust if cloned elsewhere
 ExecStart=/usr/bin/docker compose pull
 ExecStart=/usr/bin/docker compose up -d
 ExecStop=/usr/bin/docker compose stop
@@ -319,9 +323,9 @@ TimeoutStartSec=300
 WantedBy=multi-user.target
 ```
 
-Improvements vs the version we shipped during the incident:
-- `RequiresMountsFor=/mnt/rclone/zweiteng` — systemd waits for the FUSE mount before starting. No more "container starts, ingest tries to read FUSE, FUSE not ready, D-state".
-- `pull` runs before `up -d` so a `systemctl reload rag-everything` is the canonical "deploy latest tag" command.
+Improvements vs ad-hoc unit files seen in the wild:
+- **No hardcoded archive path.** Hosts that bind-mount FUSE-backed storage add a drop-in with `RequiresMountsFor=` so systemd waits for the mount before the container starts — no more "container starts, ingest tries to read FUSE, FUSE not ready, D-state".
+- `pull` runs before `up -d` so `systemctl reload rag-everything` is the canonical "deploy latest tag" command.
 - `TimeoutStartSec=300` for full-flavor first-pull (multimodal image is large).
 
 ### 3.5 New healthcheck script
@@ -443,7 +447,7 @@ Each step is a single commit, in order. No "fix later" placeholders.
 | 9 | Bump `pyproject.toml` + `src/tm_server/__init__.py` to 0.6.0 | version |
 | 10 | Local validation: `docker buildx build --target lite` for amd64 + arm64; smoke run | (build only) |
 | 11 | Tag `v0.6.0`, push to GitHub. Wait for CI to publish images. | git tag |
-| 12 | On remote: copy `deploy/systemd/rag-everything.service` to `/etc/systemd/system/`, `daemon-reload`, ensure `.override.yml` exists with rclone bind, `systemctl reload rag-everything` | remote |
+| 12 | On the deploy host: run `sudo bash deploy/install.sh`, ensure `.env` and any host-specific `docker-compose.override.yml` are in place, then `systemctl reload rag-everything` (or let the auto-deploy workflow do it) | host |
 
 ---
 
@@ -460,7 +464,7 @@ After each step (1–9 local, 10 build, 11 CI, 12 deploy):
 | /health returns 200 | `curl -sk http://127.0.0.1:8711/health` | JSON body w/ `status:ok` |
 | Build cache reuse | second `docker buildx build` (no source change) | < 30 s |
 | Local pytest | `pytest -q` | 77/77 passing |
-| Production smoke | after deploy: `curl -sk https://gitlab.zweiteng.tk` + verify queue worker via /admin/system-health | site 302, worker_running=true |
+| Production smoke | after deploy: `bash deploy/smoke-test.sh` + verify queue worker via `/admin/system-health` | smoke passes, `worker_running=true` |
 
 ---
 
@@ -469,8 +473,7 @@ After each step (1–9 local, 10 build, 11 CI, 12 deploy):
 If anything breaks during deploy step 12:
 
 ```bash
-# On remote
-cd /home/ubuntu/.openclaw/workspace/gitlab/transcendence-memory-server
+# On the host (in your repo working directory, e.g. /opt/transcendence-memory-server)
 git checkout v0.5.10                                   # previous tag
 TM_IMAGE=docker.io/leekkk2/transcendence-memory-server:0.5.10-full \
   docker compose pull && docker compose up -d --force-recreate
@@ -492,16 +495,14 @@ Deliberately deferred to keep this delivery atomic:
 
 ---
 
-## 8. Approval gate
+## 8. Decisions captured
 
-This plan changes 11 files, deletes 1, and creates 7. **Implementation does not begin until you approve §3 (target architecture) and §4 (migration plan).**
+The following design decisions are now part of v0.6 and surfaced here so future
+contributors can challenge them with full context:
 
-Specifically I'd like sign-off on:
-
-1. **The single-flavor-default decision**: `lite` is default; `full` requires explicit opt-in via TM_IMAGE tag.
-2. **The 127.0.0.1-only port binding by default** — anyone wanting remote access must override.
-3. **Deleting `docker-compose.prod.yml`** — the convention shifts to "main compose is production-safe; override.yml customizes per host".
-4. **The `read_only: true` rootfs** — prevents accidental in-container writes outside volumes; tests may need adjustment.
-5. **Tracked systemd unit at `deploy/systemd/`** — replaces the ad-hoc unit file we wrote during the incident.
-
-Reply with approval, change requests, or specific concerns. After approval I'll execute steps 1–9 in a single PR-style series of commits, then run step 10 locally before tagging.
+1. **Single-flavor default**: `lite` is default; `full` requires explicit opt-in via `TM_IMAGE` tag.
+2. **127.0.0.1-only port binding by default** — anyone wanting remote access must override.
+3. **`docker-compose.prod.yml` deleted** — the convention is "main compose is production-safe; `override.yml` customizes per host".
+4. **`read_only: true` rootfs** — prevents accidental in-container writes outside volumes; tests adjusted accordingly.
+5. **Tracked systemd unit at `deploy/systemd/`** — replaces ad-hoc unit files maintained per host.
+6. **rclone archive bind-mount is opt-in** — baseline compose does not bind any external archive; operators that want it copy `docker-compose.override.example.yml` and add a `<HOST_ARCHIVE_PATH>:/mnt/archive:ro,slave` line.

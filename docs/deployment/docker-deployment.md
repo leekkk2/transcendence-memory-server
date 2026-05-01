@@ -46,38 +46,66 @@ Set `TM_IMAGE` in `.env` (or export in the shell) to lock the chosen flavor:
 TM_IMAGE=docker.io/leekkk2/transcendence-memory-server:0.6.0-full
 ```
 
-## Rclone integration (without the deadlock risk)
+## Rclone / FUSE archive integration (opt-in)
 
-If your host has rclone-mounted archives that should feed into the RAG index,
-the v0.6.0 design **never bind-mounts the FUSE path into the container**.
-Instead, a host-side systemd timer (`rclone-sync.timer`) rsyncs from the FUSE
-mount into a regular ext4 docker volume, which the container reads as a plain
-read-only mount.
+If your host has an existing rclone (or other FUSE/network) archive that should
+feed into the RAG index, v0.6 ships an **opt-in** sync pattern that **never
+bind-mounts the FUSE path directly into the container**.
 
-This is what prevents the 2026-04-30 deadlock: when rclone misbehaves, the
-sync timer skips a tick and retries later, but the container keeps serving
-requests because it's reading from a regular filesystem, not from FUSE.
+A host-side systemd timer (`rclone-sync.timer`) rsyncs from the FUSE mount into
+a regular ext4 docker volume, and the container reads that volume as a plain
+read-only mount. This decoupling prevents the FUSE-deadlock failure mode: when
+the FUSE mount misbehaves, the sync timer skips a tick and retries later, but
+the container keeps serving requests because it's reading from a regular
+filesystem, not from FUSE.
 
 | Component | Lives on | Triggered by |
 |-----------|----------|--------------|
 | `rclone-sync.service` | host systemd | `rclone-sync.timer` (every 15min) |
 | Docker volume `rclone-archive` | host disk (managed by Docker) | populated by sync.service |
-| Container mount `/mnt/rclone/zweiteng:ro` | inside the container | docker compose |
+| Container mount `/mnt/archive:ro` | inside the container | docker compose override |
 
-The sync service has a 5-minute hard timeout and runs at IO-idle priority, so
-it can't itself trigger the kind of host saturation we saw before.
+The sync service has a 5-minute hard timeout and runs at IO-idle priority, so it
+can't itself trigger host saturation.
 
-To install:
-
-```bash
-sudo bash deploy/install.sh                   # installs both rag-everything and rclone-sync
-```
-
-To skip rclone-sync (host doesn't use rclone):
+### Default: no rclone
 
 ```bash
-sudo bash deploy/install.sh --no-rclone-sync
+sudo bash deploy/install.sh                  # only installs rag-everything.service
 ```
+
+### Enable rclone-sync
+
+1. Mount your rclone source somewhere on the host (default expected path: `/mnt/rclone-archive`).
+2. Install with `--with-rclone-sync`:
+   ```bash
+   sudo bash deploy/install.sh --with-rclone-sync
+   ```
+3. (Optional) Override the default source path via systemd drop-in:
+   ```bash
+   sudo systemctl edit rclone-sync.service
+   ```
+   Then add:
+   ```ini
+   [Unit]
+   RequiresMountsFor=/mnt/your-rclone-mount
+
+   [Service]
+   Environment=ARCHIVE_SOURCE=/mnt/your-rclone-mount
+   ```
+4. Enable the volume in `docker-compose.override.yml`:
+   ```yaml
+   services:
+     rag-server:
+       volumes:
+         - rclone-archive:/mnt/archive:ro
+   volumes:
+     rclone-archive:
+   ```
+5. Start the timer:
+   ```bash
+   sudo systemctl start rclone-sync.timer
+   ```
 
 ## Memory backups
 
@@ -133,7 +161,7 @@ read-only rootfs and bumps memory caps to dev-friendly levels.
 - `/tmp` — tmpfs (128 MB)
 - `/home/tm/.cache` — tmpfs (256 MB)
 - `/home/tm/.cache/mineru` — `mineru-models` named volume (full only)
-- `/mnt/rclone/zweiteng` — `rclone-archive` named volume (read-only)
+- `/mnt/archive` — only if rclone-archive is enabled via override (opt-in)
 
 If anything in the container tries to write outside these paths, it fails fast.
 This catches accidental temp-file writes that would otherwise bloat the

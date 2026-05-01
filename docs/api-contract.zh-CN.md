@@ -69,7 +69,7 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 {
   "query": "string",
   "topk": 5,
-  "container": "imac",
+  "container": "home",
   "timeout_s": 120
 }
 ```
@@ -83,7 +83,7 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
   "code": 0,
   "query": "string",
   "topk": 5,
-  "container": "imac",
+  "container": "home",
   "initialized": true,
   "message": null,
   "results": [
@@ -91,7 +91,7 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
       "score": 0.12,
       "taskId": "TASK-20260329-004",
       "docType": "client_ingest",
-      "sourcePath": "tasks/rag/containers/imac/memory_objects.jsonl",
+      "sourcePath": "tasks/rag/containers/home/memory_objects.jsonl",
       "text": "..."
     }
   ],
@@ -108,7 +108,7 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 
 ```json
 {
-  "container": "imac",
+  "container": "home",
   "timeout_s": 120,
   "background": false,
   "wait": true
@@ -128,7 +128,7 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 
 ```json
 {
-  "container": "imac",
+  "container": "home",
   "memory_dir": null,
   "archive_dir": null,
   "timeout_s": 120,
@@ -165,7 +165,7 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 
 ```json
 {
-  "container": "imac",
+  "container": "home",
   "objects": [
     {
       "id": "memory-001",
@@ -185,10 +185,10 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 
 ```json
 {
-  "container": "imac",
+  "container": "home",
   "accepted": 1,
-  "stored_path": "/workspace/tasks/rag/containers/imac/memory_objects.jsonl",
-  "stored_paths": ["/workspace/tasks/rag/containers/imac/memory_objects.jsonl"],
+  "stored_path": "/workspace/tasks/rag/containers/home/memory_objects.jsonl",
+  "stored_paths": ["/workspace/tasks/rag/containers/home/memory_objects.jsonl"],
   "index_hint": "Run /embed for this container to refresh LanceDB after storing new objects."
 }
 ```
@@ -240,13 +240,13 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
 {
   "token": "eyJlbmRwb2ludCI6Imh0dHBzOi8vcmFnLmV4YW1wbGUuY29tIiwiYXBpX2tleSI6InNrLXh4eCIsImNvbnRhaW5lciI6ImltYWMifQ==",
   "endpoint": "https://rag.example.com",
-  "container": "imac",
+  "container": "home",
   "note": "Base64 编码的连接令牌，附带引导提示和显式配对认证材料，用于 AI 辅助设置。",
   "pairing_auth": {
     "mode": "api_key",
     "endpoint": "https://rag.example.com",
     "api_key": "sk-xxx",
-    "container": "imac",
+    "container": "home",
     "accepted_headers": ["X-API-KEY", "Authorization: Bearer <api_key>"],
     "token_transport": "base64-json(endpoint, api_key, container)",
     "config_path": "~/.transcendence-memory/config.toml"
@@ -256,7 +256,7 @@ uvicorn task_rag_server:app --app-dir scripts --host 0.0.0.0 --port 8711
       {
         "id": "confirm_container",
         "title": "确认 container",
-        "prompt": "我准备把你连接到 container \"imac\"。如果你想改成别的命名空间，请现在告诉我。",
+        "prompt": "我准备把你连接到 container \"home\"。如果你想改成别的命名空间，请现在告诉我。",
         "reason": "让用户在导入前确认最终写入的 container。"
       }
     ],

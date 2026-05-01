@@ -21,11 +21,10 @@ services:
       # is harmless (the dir simply stays empty). Keeps deploy commands identical
       # across flavors.
       - mineru-models:/home/tm/.cache/mineru
-      # Read-only sync of host's rclone-mirrored archive. This is a *plain*
-      # named volume populated by a host-side rsync timer (see deploy/systemd/
-      # rclone-sync.{service,timer}); the container never sees the FUSE mount
-      # directly, so an unhealthy rclone never blocks container reads.
-      - rclone-archive:/mnt/rclone/zweiteng:ro
+      # NOTE: external archive bind-mount (rclone, NFS, SSHFS, etc.) is OPT-IN.
+      # If you want to feed an existing on-host archive into the RAG index, copy
+      # docker-compose.override.example.yml → docker-compose.override.yml and
+      # uncomment the rclone-archive volume there.
     env_file:
       - path: .env
         required: false
@@ -64,7 +63,4 @@ volumes:
   # Pre-warmed multimodal model cache (full flavor). Survives image updates so
   # mineru doesn't re-download multi-hundred-MB models on every pull.
   mineru-models:
-  # Host-side rsync target. Populated by rclone-sync.timer running on the host;
-  # the container only sees a regular ext4 directory through this volume, never
-  # the FUSE mount itself. Rclone going down can't block container reads.
-  rclone-archive:
+  # `rclone-archive` (opt-in) is declared in docker-compose.override.example.yml.
