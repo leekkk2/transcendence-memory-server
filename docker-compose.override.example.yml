@@ -7,16 +7,42 @@
 # Use this file for:
 #   * memory caps tuned to the actual VPS
 #   * extra environment variables specific to this deployment
-#   * NOT for rclone bind-mounts — those went away in v0.6.0 (see
-#     deploy/systemd/rclone-sync.* for the new sync-to-volume design).
+#   * OPT-IN: external archive (rclone, NFS, SSHFS, ...) mounted into the container
 
 services:
   rag-server:
     # Tighter memory cap if this host is multi-tenant. The baseline 3g default
     # in docker-compose.yml is reasonable for dedicated boxes; multi-tenant
-    # hosts (e.g. shared Oracle Cloud) want more headroom for other tenants.
+    # hosts (e.g. shared cloud VPS) want more headroom for other tenants.
     mem_limit: 1500m
     memswap_limit: 1500m
+
+    # ─────────────────────────────────────────────────────────────────────
+    # OPT-IN: external archive bind-mount
+    # ─────────────────────────────────────────────────────────────────────
+    # Uncomment if you want the container to read from an existing host
+    # archive (e.g. an rclone-mirrored remote). Two options:
+    #
+    # Option A (recommended): host-side rsync timer copies FUSE → docker
+    # volume, container reads the volume. Decouples container from FUSE
+    # health. Set up via `sudo bash deploy/install.sh` (installs the
+    # rclone-sync.timer) plus this volume entry:
+    #
+    # volumes:
+    #   - rclone-archive:/mnt/archive:ro
+    #
+    # Option B: direct bind-mount of the FUSE/network path. Simpler but
+    # FUSE deadlocks will block container reads in D-state. Add a
+    # systemd drop-in `RequiresMountsFor=` so the container waits for the
+    # mount before starting:
+    #
+    # volumes:
+    #   - <HOST_ARCHIVE_PATH>:/mnt/archive:ro,slave
+
     # Add host-specific env, e.g. an external observability endpoint.
     # environment:
     #   OTEL_EXPORTER_OTLP_ENDPOINT: http://prometheus.internal:4317
+
+# Required when Option A above is used:
+# volumes:
+#   rclone-archive:

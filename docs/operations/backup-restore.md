@@ -39,7 +39,7 @@ find $WORKSPACE -name "memory_objects.jsonl" -exec cp {} backup/ \;
 curl -sS -X POST http://127.0.0.1:8711/embed \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"host-z","background":false,"wait":true}'
+  -d '{"container":"home","background":false,"wait":true}'
 ```
 
 ## 注意事项

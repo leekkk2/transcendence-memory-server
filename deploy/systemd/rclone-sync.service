@@ -15,14 +15,21 @@
 [Unit]
 Description=Sync rclone mirror into transcendence-memory rclone-archive volume
 Documentation=https://github.com/leekkk2/transcendence-memory-server
-RequiresMountsFor=/mnt/rclone/example-archive
 After=docker.service rag-everything.service
+# If your host bind-mounts an rclone (or other FUSE) archive, declare it via
+# drop-in: /etc/systemd/system/rclone-sync.service.d/source.conf
+#   [Unit]
+#   RequiresMountsFor=/mnt/your-rclone-mount
+#   [Service]
+#   Environment=ARCHIVE_SOURCE=/mnt/your-rclone-mount
 # Don't fail the timer when the docker volume isn't created yet (first-time install).
 # rsync will create the destination dir if needed.
 
 [Service]
 Type=oneshot
 User=root
+# Default source path — override via drop-in `Environment=ARCHIVE_SOURCE=...`.
+Environment=ARCHIVE_SOURCE=/mnt/rclone-archive
 # Hard timeout — if rclone FUSE deadlocks, kill rsync after 5 minutes and let
 # the next timer tick try again. Without this, a stuck rsync would hold a
 # lock indefinitely.
@@ -36,12 +43,12 @@ Nice=10
 #   --timeout=60  per-file IO timeout — bounds individual stuck reads
 #   --partial-dir prevents half-transferred files from poisoning the cache
 #
-# Source: the rclone FUSE mount. Destination: the docker volume mountpoint
-# (resolved via `docker volume inspect`). We use rsync into the resolved path
-# so the container sees changes without needing a container restart.
+# Source: the rclone FUSE mount (from $ARCHIVE_SOURCE). Destination: the docker
+# volume mountpoint (resolved via `docker volume inspect`). We rsync into the
+# resolved path so the container sees changes without needing a container restart.
 ExecStart=/bin/bash -c '\
     set -euo pipefail; \
-    SRC=/mnt/rclone/example-archive; \
+    SRC="${ARCHIVE_SOURCE:-/mnt/rclone-archive}"; \
     DEST_PATH=$$(/usr/bin/docker volume inspect --format "{{.Mountpoint}}" \
         transcendence-memory-server_rclone-archive 2>/dev/null || true); \
     if [ -z "$$DEST_PATH" ]; then \
