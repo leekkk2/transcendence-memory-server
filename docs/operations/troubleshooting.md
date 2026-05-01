@@ -41,7 +41,7 @@ echo $RAG_API_KEY
 curl -sS -i http://127.0.0.1:8711/search \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"host-z","query":"test","topk":3}'
+  -d '{"container":"home","query":"test","topk":3}'
 ```
 
 ### search returns HTTP 200 but body contains errors
@@ -86,7 +86,7 @@ Confirm that embed/indexing has completed and the target container is initialize
 curl -sS -X POST http://127.0.0.1:8711/embed \
   -H "X-API-KEY: $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"container":"host-z","background":false,"wait":true}'
+  -d '{"container":"home","background":false,"wait":true}'
 ```
 
 ### Docker daemon inaccessible

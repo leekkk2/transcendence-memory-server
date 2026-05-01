@@ -1,0 +1,228 @@
+name: Deploy
+
+# Auto-deploy after a successful CI/CD release publish.
+#
+# Trigger model:
+#   1. The CI/CD workflow completes (any tag-push run that publishes images).
+#   2. We re-check that the run was on a tag and that it succeeded.
+#   3. If DEPLOY_HOST + DEPLOY_SSH_KEY secrets exist, SSH to the host and run
+#      `git fetch && git checkout <tag> && docker compose pull && systemctl reload`.
+#   4. Smoke-test the result (deploy/smoke-test.sh) and fail the workflow if it
+#      doesn't pass.
+#
+# Designed to be fork-safe: forks without deploy secrets configured will see
+# this workflow no-op (skip the deploy step) instead of failing.
+#
+# Required configuration on the deploy host (one-time):
+#   * Repo cloned at $DEPLOY_PATH (default /opt/transcendence-memory-server)
+#   * deploy/install.sh has been run (installs systemd unit)
+#   * The SSH user has NOPASSWD sudo for: docker, systemctl reload rag-everything
+#     (or run the workflow as root if you accept that posture)
+#
+# Required GitHub secrets:
+#   DEPLOY_HOST          — hostname or IP of the deploy target
+#   DEPLOY_SSH_KEY       — PEM-formatted private key (matching an authorized_keys
+#                          entry on the host); generate with `ssh-keygen -t ed25519`
+#   DEPLOY_KNOWN_HOSTS   — output of `ssh-keyscan <host>` to pin the host fingerprint
+#                          (skip with caveat — see "Trust on first use" below)
+#
+# Required GitHub variables (vars.*; not secrets — non-sensitive):
+#   DEPLOY_USER          — SSH user (default: ubuntu)
+#   DEPLOY_PORT          — SSH port (default: 22)
+#   DEPLOY_PATH          — repo path on host (default: /opt/transcendence-memory-server)
+#   DEPLOY_SUDO          — "sudo" or empty (default: sudo)
+#   DEPLOY_SMOKE         — "true" or "false" — run smoke test post-deploy (default: true)
+
+on:
+  workflow_run:
+    workflows: ["CI/CD"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to deploy (default: latest tag)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.gate.outputs.should_deploy }}
+      ref: ${{ steps.gate.outputs.ref }}
+    steps:
+      - name: Resolve trigger and gate the deploy
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          DISPATCH_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          should_deploy=false
+          ref=""
+          case "$EVENT_NAME" in
+            workflow_run)
+              # Only deploy when the upstream CI/CD succeeded on a tag push.
+              if [ "$WORKFLOW_RUN_CONCLUSION" = "success" ] \
+                 && [ "$WORKFLOW_RUN_EVENT" = "push" ] \
+                 && [[ "$WORKFLOW_RUN_HEAD_BRANCH" == v* ]]; then
+                should_deploy=true
+                ref="$WORKFLOW_RUN_HEAD_BRANCH"
+              else
+                echo "::notice::CI/CD run was not a successful tag push — skipping deploy."
+              fi
+              ;;
+            workflow_dispatch)
+              should_deploy=true
+              ref="${DISPATCH_REF:-}"
+              ;;
+          esac
+          echo "should_deploy=${should_deploy}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "decision: should_deploy=${should_deploy} ref='${ref}'"
+
+  deploy:
+    needs: preflight
+    if: needs.preflight.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    # Optional: bind to a "production" environment so you can add manual approval,
+    # branch restrictions, and per-env secrets. Configure in repo settings.
+    environment:
+      name: production
+    steps:
+      - name: Detect required secrets (fork-safe)
+        id: detect
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY_PRESENT: ${{ secrets.DEPLOY_SSH_KEY != '' }}
+        run: |
+          if [ -z "${DEPLOY_HOST:-}" ] || [ "${DEPLOY_SSH_KEY_PRESENT}" != "true" ]; then
+            echo "::warning::DEPLOY_HOST or DEPLOY_SSH_KEY not configured — skipping auto-deploy."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH
+        if: steps.detect.outputs.configured == 'true'
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+            chmod 644 ~/.ssh/known_hosts
+            echo "::notice::Pinned host fingerprint from DEPLOY_KNOWN_HOSTS secret."
+          else
+            # Fallback: trust-on-first-use via ssh-keyscan. Less safe (MITM
+            # window on first deploy) but unblocks fork users without an
+            # extra setup step. To upgrade: run `ssh-keyscan <host>` locally
+            # and store its output as the DEPLOY_KNOWN_HOSTS secret.
+            echo "::warning::DEPLOY_KNOWN_HOSTS not set — using ssh-keyscan (TOFU)."
+            ssh-keyscan -p "$DEPLOY_PORT" -T 10 "$DEPLOY_HOST" \
+              >> ~/.ssh/known_hosts 2>/dev/null
+            chmod 644 ~/.ssh/known_hosts
+          fi
+
+      - name: Deploy
+        if: steps.detect.outputs.configured == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/transcendence-memory-server' }}
+          DEPLOY_SUDO: ${{ vars.DEPLOY_SUDO || 'sudo' }}
+          DEPLOY_REF: ${{ needs.preflight.outputs.ref }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(
+            -i ~/.ssh/deploy_key
+            -p "$DEPLOY_PORT"
+            -o BatchMode=yes
+            -o ConnectTimeout=20
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=4
+            -o StrictHostKeyChecking=accept-new
+          )
+          # Stream the remote script so we see progress live in the Actions UI.
+          ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            DEPLOY_PATH="$DEPLOY_PATH" \
+            DEPLOY_SUDO="$DEPLOY_SUDO" \
+            DEPLOY_REF="$DEPLOY_REF" \
+            'bash -se' <<'REMOTE'
+          set -euo pipefail
+          : "${DEPLOY_PATH:?}"
+          : "${DEPLOY_SUDO:=}"
+          : "${DEPLOY_REF:=}"
+          cd "$DEPLOY_PATH"
+          git fetch --tags --prune origin
+          if [ -n "$DEPLOY_REF" ]; then
+            git checkout --detach "$DEPLOY_REF"
+          else
+            # Default: checkout the most recent tag (newest by version sort).
+            latest=$(git tag --sort=-v:refname | head -n1)
+            [ -n "$latest" ] || { echo "no tags found in repo; aborting"; exit 1; }
+            git checkout --detach "$latest"
+            DEPLOY_REF="$latest"
+          fi
+          echo "::notice::Deploying ref=${DEPLOY_REF} on $(hostname)"
+          # Always operate via docker compose at $DEPLOY_PATH so the cwd matches
+          # the compose project; systemd unit (if installed) is just there to
+          # restart the stack on host reboot — not used in the deploy hot path.
+          $DEPLOY_SUDO docker compose pull
+          $DEPLOY_SUDO docker compose up -d
+          # Wait for the container healthcheck to flip green.
+          for i in $(seq 1 30); do
+            status=$($DEPLOY_SUDO docker compose ps --format json 2>/dev/null \
+              | python3 -c "import sys,json; \
+                  data=[json.loads(l) for l in sys.stdin if l.strip()]; \
+                  print(next((d.get('Health') or d.get('State','') for d in data \
+                              if d.get('Service')=='rag-server'), 'missing'))" 2>/dev/null \
+              || echo "unknown")
+            echo "[wait $i/30] rag-server: $status"
+            case "$status" in
+              healthy|running) break ;;
+            esac
+            sleep 2
+          done
+          REMOTE
+
+      - name: Smoke test
+        if: |
+          steps.detect.outputs.configured == 'true' &&
+          (vars.DEPLOY_SMOKE == '' || vars.DEPLOY_SMOKE == 'true')
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/transcendence-memory-server' }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
+              -o BatchMode=yes -o ConnectTimeout=20 \
+              -o StrictHostKeyChecking=accept-new \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "cd '${DEPLOY_PATH}' && bash deploy/smoke-test.sh"
+
+      - name: Cleanup SSH artifacts
+        if: always() && steps.detect.outputs.configured == 'true'
+        run: |
+          rm -f ~/.ssh/deploy_key ~/.ssh/known_hosts || true

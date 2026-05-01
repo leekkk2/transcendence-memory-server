@@ -67,7 +67,7 @@ export GOOGLE_EMBEDDING_BASE_URL="https://generativelanguage.googleapis.com/v1be
 mkdir -p \
   tasks/active \
   tasks/archived \
-  tasks/rag/containers/host-z \
+  tasks/rag/containers/home \
   memory \
   memory_archive
 ```

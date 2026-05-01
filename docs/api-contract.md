@@ -69,7 +69,7 @@ Request:
 {
   "query": "string",
   "topk": 5,
-  "container": "host-z",
+  "container": "home",
   "timeout_s": 120
 }
 ```
@@ -83,7 +83,7 @@ Response shape:
   "code": 0,
   "query": "string",
   "topk": 5,
-  "container": "host-z",
+  "container": "home",
   "initialized": true,
   "message": null,
   "results": [
@@ -91,7 +91,7 @@ Response shape:
       "score": 0.12,
       "taskId": "TASK-20260329-004",
       "docType": "client_ingest",
-      "sourcePath": "tasks/rag/containers/host-z/memory_objects.jsonl",
+      "sourcePath": "tasks/rag/containers/home/memory_objects.jsonl",
       "text": "..."
     }
   ],
@@ -108,7 +108,7 @@ Request:
 
 ```json
 {
-  "container": "host-z",
+  "container": "home",
   "timeout_s": 120,
   "background": false,
   "wait": true
@@ -128,7 +128,7 @@ Request:
 
 ```json
 {
-  "container": "host-z",
+  "container": "home",
   "memory_dir": null,
   "archive_dir": null,
   "timeout_s": 120,
@@ -165,7 +165,7 @@ Request:
 
 ```json
 {
-  "container": "host-z",
+  "container": "home",
   "objects": [
     {
       "id": "memory-001",
@@ -185,10 +185,10 @@ Response shape:
 
 ```json
 {
-  "container": "host-z",
+  "container": "home",
   "accepted": 1,
-  "stored_path": "/workspace/tasks/rag/containers/host-z/memory_objects.jsonl",
-  "stored_paths": ["/workspace/tasks/rag/containers/host-z/memory_objects.jsonl"],
+  "stored_path": "/workspace/tasks/rag/containers/home/memory_objects.jsonl",
+  "stored_paths": ["/workspace/tasks/rag/containers/home/memory_objects.jsonl"],
   "index_hint": "Run /embed for this container to refresh LanceDB after storing new objects."
 }
 ```
@@ -240,13 +240,13 @@ Response shape:
 {
   "token": "eyJlbmRwb2ludCI6Imh0dHBzOi8vcmFnLmV4YW1wbGUuY29tIiwiYXBpX2tleSI6InNrLXh4eCIsImNvbnRhaW5lciI6ImltYWMifQ==",
   "endpoint": "https://rag.example.com",
-  "container": "host-z",
+  "container": "home",
   "note": "Base64-encoded connection token plus onboarding prompts and explicit pairing auth material for AI-assisted setup.",
   "pairing_auth": {
     "mode": "api_key",
     "endpoint": "https://rag.example.com",
     "api_key": "sk-xxx",
-    "container": "host-z",
+    "container": "home",
     "accepted_headers": ["X-API-KEY", "Authorization: Bearer <api_key>"],
     "token_transport": "base64-json(endpoint, api_key, container)",
     "config_path": "~/.transcendence-memory/config.toml"
@@ -256,7 +256,7 @@ Response shape:
       {
         "id": "confirm_container",
         "title": "确认 container",
-        "prompt": "我准备把你连接到 container \"host-z\"。如果你想改成别的命名空间，请现在告诉我。",
+        "prompt": "我准备把你连接到 container \"home\"。如果你想改成别的命名空间，请现在告诉我。",
         "reason": "让用户在导入前确认最终写入的 container。"
       }
     ],
