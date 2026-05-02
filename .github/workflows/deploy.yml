@@ -235,15 +235,20 @@ jobs:
           $DEPLOY_SUDO docker image prune -f >/dev/null 2>&1 || true
           # Keep at most the in-use image tag + the new pinned tag we are
           # about to fetch. `image_base` is parsed from .env above.
+          # Single awk pass (instead of `grep -v` chain) so a 0-match step
+          # never returns non-zero and trips `set -euo pipefail`.
           if [ -n "${image_base:-}" ]; then
-            $DEPLOY_SUDO docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
-              | awk -v base="$image_base" '$1 ~ base {print $1}' \
-              | grep -v -F ":${TM_IMAGE##*:}" \
-              | grep -vE ':(latest|lite|full)$' \
-              | while read -r old; do
-                  echo "[prune] removing old image: $old"
-                  $DEPLOY_SUDO docker rmi "$old" 2>/dev/null || true
-                done
+            ( $DEPLOY_SUDO docker images --format '{{.Repository}}:{{.Tag}}' \
+                | awk -v base="$image_base" -v keep="$TM_IMAGE" '
+                    index($0, base) == 1 \
+                    && $0 != keep \
+                    && $0 !~ /:(latest|lite|full)$/ { print }
+                  ' \
+                | while read -r old; do
+                    echo "[prune] removing old image: $old"
+                    $DEPLOY_SUDO docker rmi "$old" 2>/dev/null || true
+                  done
+            ) || true
           fi
           run_compose docker compose pull --quiet
           run_compose docker compose up -d
