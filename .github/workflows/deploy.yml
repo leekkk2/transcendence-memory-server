@@ -228,6 +228,23 @@ jobs:
             fi
           }
           export TM_IMAGE
+          # Pre-pull cleanup: drop untagged dangling images and old transcendence
+          # tags that are not currently in use. Without this, every release
+          # accretes a 6+ GB layer set on disk and we eventually hit ENOSPC
+          # mid-pull. Errors are tolerated (doesn't block the deploy).
+          $DEPLOY_SUDO docker image prune -f >/dev/null 2>&1 || true
+          # Keep at most the in-use image tag + the new pinned tag we are
+          # about to fetch. `image_base` is parsed from .env above.
+          if [ -n "${image_base:-}" ]; then
+            $DEPLOY_SUDO docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+              | awk -v base="$image_base" '$1 ~ base {print $1}' \
+              | grep -v -F ":${TM_IMAGE##*:}" \
+              | grep -vE ':(latest|lite|full)$' \
+              | while read -r old; do
+                  echo "[prune] removing old image: $old"
+                  $DEPLOY_SUDO docker rmi "$old" 2>/dev/null || true
+                done
+          fi
           run_compose docker compose pull --quiet
           run_compose docker compose up -d
           # Wait for the container healthcheck to flip green. Budget 180s
