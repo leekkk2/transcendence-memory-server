@@ -129,34 +129,27 @@ class ConfigurationGuide(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """公开健康端点 — LB-style 最小响应。
+
+    诊断细节（容器列表、阈值数值、队列深度、配置 key、原始系统指标）请改用
+    需鉴权的 /admin/system-health。本响应刻意不暴露任何具体数值、绝对路径、
+    容器名或环境变量名，避免给匿名访问者积累指纹/侦察信息。
+    """
     status: Literal['ok']
     service: str
     architecture: str
     build_flavor: Literal['lite', 'full']
     multimodal_capable: bool
     degraded_reasons: list[str] = Field(default_factory=list)
-    workspace: str
-    containers_root: str
-    auth_configured: bool
-    embedding_configured: bool
-    lancedb_available: bool
-    scripts_present: dict[str, bool]
-    runtime_ready: dict[str, bool]
-    available_containers: list[str]
-    warnings: list[str]
-    uptime_seconds: int
-    modules: dict[str, ModuleStatusResponse] | None = None
-    configuration_guide: ConfigurationGuide | None = None
-    # 自我保护层暴露的系统快照与准入状态。客户端据此判断是否需要退避。
-    system: dict | None = None
-    # GateConfig 当前生效的阈值（TM_MIN_AVAILABLE_MEM_MB 等 env 解析后），
-    # 与 system 对比即可判断本次 503 触发的是哪条阈值，无需查日志。
-    thresholds: dict | None = None
+    runtime_ready: dict[str, bool] = Field(default_factory=dict)
     accepting_ingest: bool = True
-    background_jobs_active: int = 0
-    # Persistent job queue snapshot. queue_stats keys: pending/running/done/failed/cancelled.
-    queue_stats: dict | None = None
     worker_running: bool = False
+    uptime_seconds: int = 0
+    # 每维度压力标签（'ok' / 'pressure'），不暴露阈值或数值。
+    # 客户端可据此提前退避；具体数值见 /admin/system-health。
+    system_status: dict[str, str] = Field(default_factory=dict)
+    # 已脱敏的可用性提示（不含数值/路径/容器名）。完整原文见 /admin/system-health。
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ClientIngestResponse(BaseModel):
