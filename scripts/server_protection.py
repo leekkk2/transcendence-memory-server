@@ -212,6 +212,14 @@ class GateConfig:
     max_load_per_cpu: float = 4.0
     max_swap_used_pct: float = 90.0
 
+    def as_dict(self) -> dict:
+        return {
+            "max_concurrent": self.max_concurrent,
+            "min_available_mem_mb": self.min_available_mem_mb,
+            "max_load_per_cpu": self.max_load_per_cpu,
+            "max_swap_used_pct": self.max_swap_used_pct,
+        }
+
 
 def _config_from_env() -> GateConfig:
     return GateConfig(

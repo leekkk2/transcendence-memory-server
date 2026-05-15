@@ -5,17 +5,42 @@
 # docker-compose.yml without explicit -f flags.
 #
 # Use this file for:
-#   * memory caps tuned to the actual VPS
+#   * memory / cpu caps tuned to the actual VPS
 #   * extra environment variables specific to this deployment
 #   * OPT-IN: external archive (rclone, NFS, SSHFS, ...) mounted into the container
+#
+# ─────────────────────────────────────────────────────────────────────
+# Sizing: choose ONE preset from the table below that matches this host.
+# Full tuning guide + symptom-to-fix mapping: see docs/SIZING.md.
+# ─────────────────────────────────────────────────────────────────────
+#
+#   Host RAM   | mem_limit | TM_MIN_AVAILABLE_MEM_MB | cpus | Notes
+#   -----------+-----------+-------------------------+------+----------------------
+#   ≤ 4 GB     | 1500m     | 400                     | 1.0  | Shared / free-tier VPS
+#   8 GB       | 3g (base) | 800 (default)           | 1.5  | Mid-tier dedicated
+#   16 GB      | 6g        | 1000                    | 2.0  | Standard dedicated
+#   32 GB+     | 12g       | 1500                    | 3.0  | High-throughput multi-tenant
+#
+# Trap: leaving mem_limit at 1500m on a 16-32 GB host wastes RAM AND triggers
+# spurious 503 `system_under_pressure`. The gate compares against in-container
+# available (cgroup-relative), not host available, so a tight container cap
+# fires the threshold even though the host is idle.
 
 services:
   rag-server:
-    # Tighter memory cap if this host is multi-tenant. The baseline 3g default
-    # in docker-compose.yml is reasonable for dedicated boxes; multi-tenant
-    # hosts (e.g. shared cloud VPS) want more headroom for other tenants.
-    mem_limit: 1500m
-    memswap_limit: 1500m
+    # ↓ Pick values that match a row from the table above.
+    # The values shown below are the 16 GB-host preset (most common dedicated VPS).
+    mem_limit: 6g
+    memswap_limit: 6g      # equals mem_limit ⇒ swap disabled inside container
+    cpus: 2.0
+
+    # Optional: scale protection thresholds with the box. Defaults target 8 GB.
+    # Full env list: scripts/server_protection.py.
+    environment:
+      TM_MIN_AVAILABLE_MEM_MB: "1000"   # 503 trips when in-container available < this
+      TM_MAX_LOAD_PER_CPU: "4.0"        # 503 trips when load_1min / host_cpus > this
+      # TM_MAX_CONCURRENT_INGESTS: "1"  # global single-flight; raise to 2-3 on 4+ cpu hosts
+      # TM_MAX_SWAP_USED_PCT: "90"      # 503 trips when host swap usage > this %
 
     # ─────────────────────────────────────────────────────────────────────
     # OPT-IN: external archive bind-mount
