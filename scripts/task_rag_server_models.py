@@ -149,6 +149,9 @@ class HealthResponse(BaseModel):
     configuration_guide: ConfigurationGuide | None = None
     # 自我保护层暴露的系统快照与准入状态。客户端据此判断是否需要退避。
     system: dict | None = None
+    # GateConfig 当前生效的阈值（TM_MIN_AVAILABLE_MEM_MB 等 env 解析后），
+    # 与 system 对比即可判断本次 503 触发的是哪条阈值，无需查日志。
+    thresholds: dict | None = None
     accepting_ingest: bool = True
     background_jobs_active: int = 0
     # Persistent job queue snapshot. queue_stats keys: pending/running/done/failed/cancelled.
