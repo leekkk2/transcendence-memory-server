@@ -62,7 +62,17 @@ hosts who copied it verbatim got two failures:
 2. Spurious 503s on `/embed` and `/query` once container usage reached
    ~700 MB, despite the host being idle
 
-Symptom in `/health`:
+Symptom (anonymous `/health` — labels only, no numbers):
+
+```json
+{
+  "warnings": ["memory pressure"],
+  "system_status": {"memory": "pressure", "load": "ok", "swap": "ok"},
+  "accepting_ingest": false
+}
+```
+
+Drill down via authenticated `/admin/system-health` (sends `X-API-KEY`):
 
 ```json
 {
@@ -84,16 +94,18 @@ Fix: bump `mem_limit` to the table value, restart container, no code change.
 | HTTP 503 `system load high: load_per_cpu=X > threshold 4.0` | Other tenants pegging host CPUs | Raise `cpus` (lets container compete better) OR raise `TM_MAX_LOAD_PER_CPU` (accept risk) |
 | HTTP 503 `swap pressure: swap_used_pct=X% > threshold 90%` | Host swap thrash (rare; usually means RAM exhaustion) | Find the offender; do NOT just raise threshold |
 | Container OOM-killed (exit 137) | `mem_limit` too low for peak ingestion (full flavor, multimodal) | Raise `mem_limit`; verify by watching `docker stats` during ingest |
-| `accepting_ingest: false` permanently | One of the above thresholds is wedged | Read `system` + `thresholds` from `/health` — the warning line names the failing rule |
+| `accepting_ingest: false` permanently | One of the above thresholds is wedged | Read `system` + `thresholds` from authenticated `/admin/system-health` — the warning line there names the failing rule with raw values |
 
-## Cross-checking thresholds via `/health`
+## Cross-checking thresholds via `/admin/system-health` (auth required)
 
-The `/health` response includes the **currently-active** thresholds under
-`thresholds:` (parsed from env at process start). To verify your overrides
-landed:
+The public `/health` endpoint deliberately suppresses raw threshold values and
+cgroup numbers — they're useful diagnostic data but also fingerprinting fuel
+for anonymous probes. The full snapshot lives behind the `RAG_API_KEY`-gated
+`/admin/system-health` instead:
 
 ```bash
-curl -s http://localhost:8711/health | jq '{thresholds, system: .system | {cgroup_mem_limit_mb, cgroup_mem_available_mb, load_per_cpu}}'
+curl -s -H "X-API-KEY: $RAG_API_KEY" http://localhost:8711/admin/system-health \
+  | jq '{thresholds, system: .system | {cgroup_mem_limit_mb, cgroup_mem_available_mb, load_per_cpu}}'
 ```
 
 Expected output after applying the 16 GB preset:
@@ -119,6 +131,11 @@ If `thresholds.min_available_mem_mb` still shows `800` after you set
 typical cause is `environment:` placed under the wrong service or compose
 not picking up the override file. Run `docker compose config` to see what
 compose actually resolved.
+
+The public `/health` still tells you **which** dimension is under pressure
+(via `system_status: {memory: "pressure", ...}` and a label-only
+`warnings: ["memory pressure"]`), it just won't tell anonymous callers the
+exact numbers — call the admin endpoint for the digits.
 
 ## Related
 
