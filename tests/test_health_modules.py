@@ -96,6 +96,36 @@ def test_health_returns_build_fields(tmp_path, monkeypatch):
     assert 'degraded_reasons' in data
 
 
+def test_health_returns_thresholds(tmp_path, monkeypatch):
+    """health 端点应返回当前生效的保护阈值，便于运维诊断 503 触发了哪条。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/health')
+    data = resp.json()
+    assert 'thresholds' in data
+    t = data['thresholds']
+    for key in ('max_concurrent', 'min_available_mem_mb', 'max_load_per_cpu', 'max_swap_used_pct'):
+        assert key in t, f'thresholds missing key: {key}'
+    # 默认值（无 env 覆盖）
+    assert t['min_available_mem_mb'] == 800
+    assert t['max_load_per_cpu'] == 4.0
+
+
+def test_health_thresholds_reflect_env_override(tmp_path, monkeypatch):
+    """运维侧 env 改阈值后 /health 应立刻反映，否则失去诊断价值。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch, {
+        'TM_MIN_AVAILABLE_MEM_MB': '1500',
+        'TM_MAX_LOAD_PER_CPU': '6.0',
+    })
+    client = TestClient(server.app)
+    resp = client.get('/health')
+    data = resp.json()
+    assert data['thresholds']['min_available_mem_mb'] == 1500
+    assert data['thresholds']['max_load_per_cpu'] == 6.0
+
+
 def test_health_warns_when_vlm_used_in_lite_build(tmp_path, monkeypatch):
     """lite 构建下启用 VLM 时应返回降级原因。"""
     workspace = make_workspace(tmp_path)

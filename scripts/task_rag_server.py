@@ -543,6 +543,7 @@ async def health(container: str | None = None) -> HealthResponse:
         modules=modules_resp,
         configuration_guide=config_guide,
         system=sys_snap.as_dict(),
+        thresholds=GATE.config.as_dict(),
         accepting_ingest=admit_ok,
         background_jobs_active=BG_TRACKER.count_active(),
         queue_stats=queue_stats,
