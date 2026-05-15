@@ -449,8 +449,39 @@ def _admit_or_503(container: str, op: str) -> None:
         )
 
 
-@app.get('/health', response_model=HealthResponse)
-async def health(container: str | None = None) -> HealthResponse:
+def _gate_status_labels(snap, config) -> dict[str, str]:
+    """每个压力维度返回 'ok' / 'pressure'，不带数值。
+
+    用途：公开 /health 想给客户端一个"是否需要退避"信号，但又不能像鉴权端点
+    那样直接交出阈值 + 实测值（攻击者会用来构造边缘 DoS）。
+    """
+    out: dict[str, str] = {}
+    eff_mem = snap.effective_mem_available_mb
+    if eff_mem is not None:
+        out['memory'] = 'pressure' if eff_mem < config.min_available_mem_mb else 'ok'
+    if snap.load_per_cpu is not None:
+        out['load'] = 'pressure' if snap.load_per_cpu > config.max_load_per_cpu else 'ok'
+    if snap.swap_used_pct is not None:
+        out['swap'] = 'pressure' if snap.swap_used_pct > config.max_swap_used_pct else 'ok'
+    return out
+
+
+def _redact_admit_reason(reason: str) -> str:
+    """把 'memory pressure: available=747MB < threshold 800MB' 缩成 'memory pressure'。"""
+    if 'memory pressure' in reason:
+        return 'memory pressure'
+    if 'system load high' in reason:
+        return 'load pressure'
+    if 'swap pressure' in reason:
+        return 'swap pressure'
+    return 'system under pressure'
+
+
+async def _collect_health_state(container: str | None) -> dict:
+    """收集 health 状态的唯一来源。公开 /health 取最小子集，鉴权 /admin/system-health 拿全集。
+
+    返回 dict 中所有 key 都填充；调用方决定哪些字段返给用户。
+    """
     containers = WS / 'tasks' / 'rag' / 'containers'
     scripts_present = {
         'search': script_path('task_rag_search.py').exists(),
@@ -459,21 +490,27 @@ async def health(container: str | None = None) -> HealthResponse:
     }
     embedding_configured = bool(os.environ.get('EMBEDDING_API_KEY'))
     lancedb_available = importlib.util.find_spec('lancedb') is not None
-    warnings: list[str] = []
+
+    # 双轨 warnings：公开版脱敏（不带数值/路径/key 名），admin 版保留原文
+    public_warnings: list[str] = []
+    sensitive_warnings: list[str] = []
     if not RAG_API_KEY:
-        warnings.append('RAG_API_KEY is not configured.')
+        public_warnings.append('auth not configured')
+        sensitive_warnings.append('RAG_API_KEY is not configured.')
     if not embedding_configured:
-        warnings.append('EMBEDDING_API_KEY is not configured.')
+        public_warnings.append('embedding not configured')
+        sensitive_warnings.append('EMBEDDING_API_KEY is not configured.')
     if not lancedb_available:
-        warnings.append('lancedb runtime is unavailable.')
+        public_warnings.append('lancedb runtime unavailable')
+        sensitive_warnings.append('lancedb runtime is unavailable.')
     if not containers.exists():
-        warnings.append('containers root does not exist yet; it will be created on first ingest.')
+        sensitive_warnings.append('containers root does not exist yet; it will be created on first ingest.')
 
-    # 架构检测
     arch = detect_architecture()
-    warnings.extend(arch.degraded_reasons)
+    # degraded_reasons 是业务侧降级原因（如"lite build VLM 不可用"），不含数值/路径，公开安全
+    public_warnings.extend(arch.degraded_reasons)
+    sensitive_warnings.extend(arch.degraded_reasons)
 
-    # 模块状态
     modules_resp = {
         name: ModuleStatusResponse(
             enabled=mod.enabled,
@@ -497,57 +534,86 @@ async def health(container: str | None = None) -> HealthResponse:
             await get_lightrag(container)
         except Exception as exc:
             documents_text_ready = False
-            warnings.append(f'LightRAG probe failed for container={container}: {exc}')
+            public_warnings.append('LightRAG probe failed')
+            sensitive_warnings.append(f'LightRAG probe failed for container={container}: {exc}')
 
-    # 系统健康快照：客户端可据此提前退避，避免请求堆叠
     sys_snap = read_system_health()
     admit_ok, admit_reason = GATE.check_admit(sys_snap)
     if not admit_ok:
-        warnings.append(f'system pressure: {admit_reason}')
+        public_warnings.append(_redact_admit_reason(admit_reason))
+        sensitive_warnings.append(f'system pressure: {admit_reason}')
 
-    # Queue stats: surface backlog so clients can decide whether to keep posting.
     try:
         queue_stats = get_job_queue().stats()
     except Exception as exc:  # pragma: no cover - defensive
         queue_stats = {'error': str(exc)}
-        warnings.append(f'job queue inaccessible: {exc}')
+        public_warnings.append('job queue inaccessible')
+        sensitive_warnings.append(f'job queue inaccessible: {exc}')
     worker_running = bool(JOB_WORKER and JOB_WORKER.is_running)
     if not worker_running and not DISABLE_WORKER:
-        warnings.append('background ingest worker is not running')
+        public_warnings.append('background ingest worker not running')
+        sensitive_warnings.append('background ingest worker is not running')
 
+    runtime_ready = {
+        'search': scripts_present['search'] and embedding_configured and lancedb_available,
+        'embed': scripts_present['lancedb_ingest'] and embedding_configured and lancedb_available,
+        'ingest_memory': scripts_present['lancedb_ingest'] and embedding_configured and lancedb_available,
+        'ingest_objects': True,
+        'ingest_structured': scripts_present['structured_ingest'] and embedding_configured and lancedb_available,
+        'query': documents_text_ready,
+        'documents_text': documents_text_ready,
+    }
+    avail_containers = sorted(p.name for p in containers.iterdir() if p.is_dir()) if containers.exists() else []
+
+    return {
+        # ──── 公开（HealthResponse 用）────
+        'status': 'ok',
+        'service': 'transcendence-memory-server',
+        'architecture': arch.name,
+        'build_flavor': arch.build_flavor,
+        'multimodal_capable': arch.multimodal_capable,
+        'degraded_reasons': arch.degraded_reasons,
+        'runtime_ready': runtime_ready,
+        'accepting_ingest': admit_ok,
+        'worker_running': worker_running,
+        'uptime_seconds': max(0, int(time.time() - SERVER_STARTED_AT)),
+        'system_status': _gate_status_labels(sys_snap, GATE.config),
+        'public_warnings': public_warnings,
+        # ──── 仅鉴权端点（admin_system_health 用）────
+        'workspace': str(WS),
+        'containers_root': str(containers),
+        'auth_configured': bool(RAG_API_KEY),
+        'embedding_configured': embedding_configured,
+        'lancedb_available': lancedb_available,
+        'scripts_present': scripts_present,
+        'available_containers': avail_containers,
+        'modules': modules_resp,
+        'configuration_guide': config_guide,
+        'system': sys_snap.as_dict(),
+        'thresholds': GATE.config.as_dict(),
+        'admit_reason': admit_reason,
+        'background_jobs_active': BG_TRACKER.count_active(),
+        'queue_stats': queue_stats,
+        'sensitive_warnings': sensitive_warnings,
+    }
+
+
+@app.get('/health', response_model=HealthResponse)
+async def health(container: str | None = None) -> HealthResponse:
+    state = await _collect_health_state(container)
     return HealthResponse(
-        status='ok',
-        service='transcendence-memory-server',
-        architecture=arch.name,
-        build_flavor=arch.build_flavor,
-        multimodal_capable=arch.multimodal_capable,
-        degraded_reasons=arch.degraded_reasons,
-        workspace=str(WS),
-        containers_root=str(containers),
-        auth_configured=bool(RAG_API_KEY),
-        embedding_configured=embedding_configured,
-        lancedb_available=lancedb_available,
-        scripts_present=scripts_present,
-        runtime_ready={
-            'search': scripts_present['search'] and embedding_configured and lancedb_available,
-            'embed': scripts_present['lancedb_ingest'] and embedding_configured and lancedb_available,
-            'ingest_memory': scripts_present['lancedb_ingest'] and embedding_configured and lancedb_available,
-            'ingest_objects': True,
-            'ingest_structured': scripts_present['structured_ingest'] and embedding_configured and lancedb_available,
-            'query': documents_text_ready,
-            'documents_text': documents_text_ready,
-        },
-        available_containers=sorted(path.name for path in containers.iterdir() if path.is_dir()) if containers.exists() else [],
-        warnings=warnings,
-        uptime_seconds=max(0, int(time.time() - SERVER_STARTED_AT)),
-        modules=modules_resp,
-        configuration_guide=config_guide,
-        system=sys_snap.as_dict(),
-        thresholds=GATE.config.as_dict(),
-        accepting_ingest=admit_ok,
-        background_jobs_active=BG_TRACKER.count_active(),
-        queue_stats=queue_stats,
-        worker_running=worker_running,
+        status=state['status'],
+        service=state['service'],
+        architecture=state['architecture'],
+        build_flavor=state['build_flavor'],
+        multimodal_capable=state['multimodal_capable'],
+        degraded_reasons=state['degraded_reasons'],
+        runtime_ready=state['runtime_ready'],
+        accepting_ingest=state['accepting_ingest'],
+        worker_running=state['worker_running'],
+        uptime_seconds=state['uptime_seconds'],
+        system_status=state['system_status'],
+        warnings=state['public_warnings'],
     )
 
 
@@ -1199,29 +1265,31 @@ def delete_memory(container: str, memory_id: str) -> MemoryDeleteResponse:
 
 
 @app.get('/admin/system-health', dependencies=[Depends(verify_auth)])
-def admin_system_health() -> dict:
-    """运维诊断端点：返回详细的保护层状态。
+async def admin_system_health(container: str | None = None) -> dict:
+    """运维诊断端点：返回 /health 公开字段 + 全部敏感诊断信息。
 
-    与 /health 不同：
-    - /health 暴露最少必要的系统快照供客户端退避决策；
-    - /admin/system-health 提供 background job 明细，方便排查"为什么 ingest 被拒"。
+    与公开 /health 的关系：
+    - /health 是 LB-style 最小响应：状态布尔、压力标签、脱敏 warnings；
+    - 本端点是 /health 的超集，额外暴露：
+        * 容器列表 (`available_containers`)、绝对路径 (`workspace`, `containers_root`)
+        * 完整配置摘要 (`configuration_guide`, `modules` 含 required/missing keys)
+        * 原始系统快照 (`system` 含 cgroup_mem 数值) + 阈值 (`thresholds`)
+        * 队列计数 (`queue_stats`) + 后台 job 明细 (`background_jobs`)
+        * 未脱敏的 `warnings`（含触发数值，便于排"为什么 ingest 被拒"）
+
+    出于安全考虑这些信息只对持有 RAG_API_KEY 的运维方公开。
     """
-    snap = read_system_health()
-    admit_ok, admit_reason = GATE.check_admit(snap)
-    return {
-        'system': snap.as_dict(),
-        'admit_ok': admit_ok,
-        'admit_reason': admit_reason,
-        'gate_config': {
-            'max_concurrent': GATE.config.max_concurrent,
-            'min_available_mem_mb': GATE.config.min_available_mem_mb,
-            'max_load_per_cpu': GATE.config.max_load_per_cpu,
-            'max_swap_used_pct': GATE.config.max_swap_used_pct,
-        },
-        'background_jobs': BG_TRACKER.list_active(),
-        'background_max_alive': BG_TRACKER.max_alive,
-        'retry_cooldown_sec': RETRY_LIMITER.cooldown_sec,
-    }
+    state = await _collect_health_state(container)
+    # admin 视图：取全部字段，但把 'public_warnings' 和 'sensitive_warnings' 折叠成单一 warnings
+    out = {k: v for k, v in state.items() if k not in ('public_warnings', 'sensitive_warnings')}
+    out['warnings'] = state['sensitive_warnings']
+    # 兼容旧 admin 调用方：保留 admit_ok / gate_config 字段名
+    out['admit_ok'] = state['accepting_ingest']
+    out['gate_config'] = state['thresholds']
+    out['background_jobs'] = BG_TRACKER.list_active()
+    out['background_max_alive'] = BG_TRACKER.max_alive
+    out['retry_cooldown_sec'] = RETRY_LIMITER.cooldown_sec
+    return out
 
 
 @app.get('/jobs', dependencies=[Depends(verify_auth)])
