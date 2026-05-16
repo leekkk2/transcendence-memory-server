@@ -213,3 +213,167 @@ def test_admin_configuration_guide_lists_keys(tmp_path, monkeypatch):
     assert 'missing' in guide
     assert 'optional' in guide
     assert 'RAG_API_KEY' in guide['configured']
+
+
+# ────────────────── Profiles 相关：/admin/profiles + /admin/probe-embedding ──────────────────
+#
+# 这些测试 stub 出 EmbeddingRegistry 单例，避免依赖真实 profiles.yaml / 网络。
+# 关键安全契约：api_key 真值禁止落入 response；公开 /health 禁止暴露 profile 名 / 计数。
+
+
+def _install_fake_registry(server, monkeypatch):
+    """注入一个最小可用的 fake registry，覆盖 embeddings/rerankers/routes/default_route。
+
+    pyproject 的 pythonpath = ['src', 'scripts'] 让 `scripts.embedding_registry` 与
+    顶层 `embedding_registry` 同时被识别为两个独立模块对象，各自持有 `_registry` 单例。
+    Server 端点先 try 顶层、再 fall back 到 `scripts.*`，所以两份都要打补丁，否则测
+    试只 patch 其中一份会落到另一份的 legacy fallback。
+    """
+    from scripts.profiles_loader import EmbeddingProfile, RerankerProfile, Route, ProfileSet
+    from scripts import embedding_registry as er
+    import embedding_registry as er_top  # pyproject pythonpath 让这条 import 生效
+
+    emb_primary = EmbeddingProfile(
+        name='gemini-3072', provider='openai_compatible',
+        model='gemini-embedding-001', dim=3072,
+        base_url='https://newapi.example/v1', api_key='SECRET-DO-NOT-LEAK',
+        max_token_size=8192, request_dim=None, timeout_s=60.0, max_retries=3,
+    )
+    emb_fb = EmbeddingProfile(
+        name='openai-3072', provider='openai_compatible',
+        model='text-embedding-3-large', dim=3072,
+        base_url='https://api.openai.com/v1', api_key='ANOTHER-SECRET',
+        max_token_size=8192, request_dim=3072, timeout_s=60.0, max_retries=3,
+    )
+    rrk = RerankerProfile(
+        name='cohere-rerank', provider='cohere_compatible',
+        model='rerank-multilingual-v3.0',
+        base_url='https://api.cohere.com/v1', api_key='RRK-SECRET',
+        timeout_s=30.0, min_score=0.2,
+    )
+    route_imac = Route(embedding='gemini-3072', embedding_fallbacks=('openai-3072',))
+    default_route = Route(embedding='gemini-3072')
+    ps = ProfileSet(
+        embeddings={'gemini-3072': emb_primary, 'openai-3072': emb_fb},
+        rerankers={'cohere-rerank': rrk},
+        routes=[({'exact': 'imac'}, route_imac)],
+        default_route=default_route,
+    )
+    fake = er.EmbeddingRegistry(ps)
+    monkeypatch.setattr(er, '_registry', fake)
+    monkeypatch.setattr(er_top, '_registry', fake)
+    return ps
+
+
+def test_admin_profiles_requires_auth(tmp_path, monkeypatch):
+    """/admin/profiles 无 key 应被拒。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/admin/profiles')
+    assert resp.status_code in (401, 403, 422), f'unexpected status: {resp.status_code}'
+
+
+def test_admin_profiles_returns_full_detail(tmp_path, monkeypatch):
+    """带 key 时应返回 embeddings + rerankers + routes + default_route 全部字段。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/admin/profiles', headers=auth_headers())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert 'embeddings' in data
+    assert 'rerankers' in data
+    assert 'routes' in data
+    assert 'default_route' in data
+    # embeddings/rerankers 都至少有 1 条
+    names = {e['name'] for e in data['embeddings']}
+    assert {'gemini-3072', 'openai-3072'}.issubset(names)
+    rrk_names = {r['name'] for r in data['rerankers']}
+    assert 'cohere-rerank' in rrk_names
+    # routes 至少 1 条、含 match dict
+    assert len(data['routes']) == 1
+    assert data['routes'][0]['match'] == {'exact': 'imac'}
+    assert data['routes'][0]['embedding'] == 'gemini-3072'
+    assert data['routes'][0]['embedding_fallbacks'] == ['openai-3072']
+    # default_route 含 embedding 字段
+    assert data['default_route']['embedding'] == 'gemini-3072'
+
+
+def test_admin_profiles_redacts_api_key(tmp_path, monkeypatch):
+    """response 必须**不含** api_key 真值字段，但**应该**含 api_key_configured: bool。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/admin/profiles', headers=auth_headers())
+    data = resp.json()
+    # 字段级：每条 embedding/reranker 不含 api_key，但有 api_key_configured
+    for e in data['embeddings']:
+        assert 'api_key' not in e, f'embedding leaks api_key field: {e}'
+        assert 'api_key_configured' in e and isinstance(e['api_key_configured'], bool)
+    for r in data['rerankers']:
+        assert 'api_key' not in r, f'reranker leaks api_key field: {r}'
+        assert 'api_key_configured' in r and isinstance(r['api_key_configured'], bool)
+    # 文本级：fake registry 注入的几个 SECRET 字符串不应出现在序列化结果中
+    raw = resp.text
+    for needle in ('SECRET-DO-NOT-LEAK', 'ANOTHER-SECRET', 'RRK-SECRET'):
+        assert needle not in raw, f'api_key value leaked in response body: {needle!r}'
+
+
+def test_admin_probe_embedding_unknown_profile(tmp_path, monkeypatch):
+    """未知 profile name → 404，避免吞掉客户端配置错误。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.post('/admin/probe-embedding?profile=nonexistent', headers=auth_headers())
+    assert resp.status_code == 404
+    assert 'nonexistent' in resp.json()['detail']
+
+
+def test_admin_probe_embedding_requires_auth(tmp_path, monkeypatch):
+    """/admin/probe-embedding 无 key 应被拒。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.post('/admin/probe-embedding?profile=anything')
+    assert resp.status_code in (401, 403, 422), f'unexpected status: {resp.status_code}'
+
+
+def test_admin_system_health_includes_profile_summary(tmp_path, monkeypatch):
+    """/admin/system-health 应包含 profiles.embeddings_count / rerankers_count。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/admin/system-health', headers=auth_headers())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert 'profiles' in data, 'admin response missing profiles summary'
+    profiles = data['profiles']
+    assert profiles is not None
+    assert profiles['embeddings_count'] == 2
+    assert profiles['rerankers_count'] == 1
+    assert profiles['default_route_embedding'] == 'gemini-3072'
+
+
+def test_public_health_does_not_leak_profile_names(tmp_path, monkeypatch):
+    """公开 /health 不应含 'profiles' / 'embedding_model' 等多模型相关字段。
+
+    向后保护 user 之前对 /health 做的安全收口 — profiles summary 是 admin-only。
+    """
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/health')
+    data = resp.json()
+    forbidden = ('profiles', 'embedding_model', 'embeddings_count', 'default_route_embedding')
+    for f in forbidden:
+        assert f not in data, f'/health leaks multi-model field: {f}'
+    # 字符串级：profile 名也不应出现在 /health body
+    raw = resp.text
+    for needle in ('gemini-3072', 'openai-3072', 'cohere-rerank'):
+        assert needle not in raw, f'/health leaks profile name: {needle!r}'

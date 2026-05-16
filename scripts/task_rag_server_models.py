@@ -11,7 +11,33 @@ DEFAULT_CONTAINER = 'imac'
 PatternMode = Literal['substring', 'prefix', 'glob']
 
 
-class SearchReq(BaseModel):
+class _WithModelOverride(BaseModel):
+    """Mixin: optional per-request model overrides (Phase 1+2).
+
+    用 mixin 而不是基类继承链，避免和 ContainerReq 的字段顺序冲突。
+    Phase 1 真实生效的是 embedding_model（ingest 路径）；reranker_model / rerank
+    字段先接受参数但 Phase 1 不做行为变更，Phase 2 才接到 LightRAG QueryParam。
+    """
+
+    embedding_model: str | None = Field(
+        None,
+        description=(
+            "Override the route's default embedding profile for this request. "
+            "Must be a profile name declared in profiles.yaml. Phase 1 supports "
+            "this on ingest endpoints (warning: choice persists in LanceDB)."
+        ),
+    )
+    reranker_model: str | None = Field(
+        None,
+        description='Override reranker profile. Phase 2 feature.',
+    )
+    rerank: bool | None = Field(
+        None,
+        description='Enable/disable reranker for this request. Defaults to route config. Phase 2 feature.',
+    )
+
+
+class SearchReq(_WithModelOverride):
     query: str = Field(..., min_length=1)
     topk: int = Field(default=5, ge=1, le=100)
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
@@ -31,7 +57,7 @@ class SearchReq(BaseModel):
     timeout_s: int = Field(default=600, ge=1, le=1800)
 
 
-class ContainerReq(BaseModel):
+class ContainerReq(_WithModelOverride):
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
     timeout_s: int = Field(default=600, ge=1, le=1800)
     background: bool | None = None
@@ -58,7 +84,7 @@ class IngestObject(BaseModel):
     metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
 
-class ClientIngestReq(BaseModel):
+class ClientIngestReq(_WithModelOverride):
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
     objects: list[IngestObject] = Field(..., min_length=1)
     auto_embed: bool = Field(default=True, description='Automatically trigger background embed after ingest')
@@ -248,13 +274,13 @@ class JobStatusResponse(BaseModel):
     message: str
 
 
-class DocumentTextReq(BaseModel):
+class DocumentTextReq(_WithModelOverride):
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
     text: str = Field(..., min_length=1)
     description: str | None = None
 
 
-class QueryReq(BaseModel):
+class QueryReq(_WithModelOverride):
     query: str = Field(..., min_length=1)
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
     mode: str = "hybrid"
