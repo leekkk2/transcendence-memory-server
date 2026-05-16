@@ -1421,15 +1421,34 @@ async def admin_probe_embedding(profile: str) -> dict:
     """对一条 embedding profile 做单 token 活检。返回 latency + dim。
 
     返回结构：
-      - ok=true  → {ok, profile, latency_ms, dim}
-      - ok=false → {ok, profile, latency_ms, error}（error 截断 200 字符防泄漏）
+      - ok=true  → {ok, profile, latency_ms, dim, breaker_reset}
+      - ok=false → {ok, profile, latency_ms, error, breaker_reset=false}
+        （error 截断 200 字符防泄漏）
     未知 profile name → 404；不允许吞掉客户端配置错误。
+
+    v0.9.0：探活成功后**显式重置该 profile 的 circuit breaker** — 让运维
+    能手动「拔保险丝」而不必等 30s 自动 half-open。`breaker_reset` 字段
+    明确告知调用方是否真的清掉了一条已存在的 breaker 状态（False 表示
+    该 profile 从未触发过 breaker，等价于 no-op）。失败时不重置，让
+    breaker 计数照常累加。
     """
     try:
         try:
-            from embedding_registry import get_registry, _http_embed
+            from embedding_registry import (
+                get_registry,
+                _http_embed,
+                reset_breaker,
+                _breaker_mark_failure,
+                _is_fallback_eligible,
+            )
         except ModuleNotFoundError:  # pragma: no cover - package import path
-            from scripts.embedding_registry import get_registry, _http_embed
+            from scripts.embedding_registry import (
+                get_registry,
+                _http_embed,
+                reset_breaker,
+                _breaker_mark_failure,
+                _is_fallback_eligible,
+            )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f'embedding registry unavailable: {exc}')
     reg = get_registry()
@@ -1445,18 +1464,28 @@ async def admin_probe_embedding(profile: str) -> dict:
             dim = int(result.shape[1])  # numpy ndarray 路径
         except AttributeError:
             dim = len(result[0]) if result else 0
+        # 探活成功 → 拔保险丝。reset_breaker 返回 True 表示曾经 open，
+        # False 表示从未触发；两者都视为「成功」，但客户端能区分语义
+        breaker_reset = reset_breaker(profile)
         return {
             'ok': True,
             'profile': profile,
             'latency_ms': int((time.monotonic() - t0) * 1000),
             'dim': dim,
+            'breaker_reset': breaker_reset,
         }
     except Exception as exc:
+        # 探活失败 → 不重置 breaker，并按 fallback-eligible 语义累加计数。
+        # 4xx 非 429（用户配置错）不计入 breaker — 与 _http_embed_with_fallback
+        # 行为一致：「我们配错了」不该污染上游可用性指标。
+        if _is_fallback_eligible(exc):
+            _breaker_mark_failure(profile)
         return {
             'ok': False,
             'profile': profile,
             'latency_ms': int((time.monotonic() - t0) * 1000),
             'error': str(exc)[:200],
+            'breaker_reset': False,
         }
 
 
