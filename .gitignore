@@ -58,3 +58,7 @@ DEPLOY_ISSUES_*.md
 docker-compose.override.yml
 docker-compose.override.*.yml
 !docker-compose.override.example.yml
+
+# v0.7.0+ multi-embedding config — references env names, but operators may
+# inadvertently inline secrets; the example template is the only tracked form.
+/config/profiles.yaml
