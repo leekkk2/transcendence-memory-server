@@ -16,6 +16,9 @@
 ## API
 - [API Contract](api-contract.md)
 
+## Multi-Model (v0.7.0+)
+- [Multi-Model Guide](MULTI_MODEL_GUIDE.md) — plug-in any OpenAI-compatible embedding, route by container, per-request override
+
 ## 开发
 - [Development Bootstrap](development-bootstrap.md)
 
