@@ -203,3 +203,42 @@ def test_default_command_resolver_maps_known_ops(queue_module, worker_module, tm
     )
     with pytest.raises(ValueError):
         resolver(job_unknown)
+
+
+def test_default_env_resolver_injects_container(queue_module, worker_module, tmp_path):
+    """v0.10.1 regression：默认 env_resolver 必须把 job.container 注入 CONTAINER env，
+    否则 worker subprocess 走 default route 而非按 container 路由的 profile。"""
+    queue = queue_module.JobQueue(tmp_path / "q.db")
+    job = queue_module.Job(
+        id=1, op="noop", container="myapp_openai", payload={},
+        status="pending", attempts=0, max_attempts=1,
+        enqueued_at=0, next_run_at=0,
+        started_at=None, finished_at=None, result_code=None,
+        last_error=None, pid=None, label="test",
+    )
+    worker = worker_module.JobWorker(
+        queue=queue,
+        command_resolver=lambda _j: ["true"],
+    )
+    env = worker.env_resolver(job)
+    assert env["CONTAINER"] == "myapp_openai", (
+        "默认 env_resolver 必须注入 job.container 到 CONTAINER env"
+    )
+
+
+def test_default_env_resolver_handles_empty_container(queue_module, worker_module, tmp_path):
+    """job.container 为 None / 空时不应 KeyError，注入空字符串让下游走 default route。"""
+    queue = queue_module.JobQueue(tmp_path / "q.db")
+    job = queue_module.Job(
+        id=1, op="noop", container=None, payload={},
+        status="pending", attempts=0, max_attempts=1,
+        enqueued_at=0, next_run_at=0,
+        started_at=None, finished_at=None, result_code=None,
+        last_error=None, pid=None, label="test",
+    )
+    worker = worker_module.JobWorker(
+        queue=queue,
+        command_resolver=lambda _j: ["true"],
+    )
+    env = worker.env_resolver(job)
+    assert env["CONTAINER"] == ""

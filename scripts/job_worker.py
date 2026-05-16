@@ -73,7 +73,14 @@ class JobWorker:
     ) -> None:
         self.queue = queue
         self.command_resolver = command_resolver
-        self.env_resolver = env_resolver or (lambda _job: os.environ.copy())
+        # v0.10.1 fix：worker subprocess 必须拿到 job.container，下游
+        # task_rag_runtime._resolve_profile_for_worker() 和 task_rag_lancedb_ingest
+        # 才能按 container 走对应 embedding profile。v0.7.0~v0.10.0 此处默认
+        # env_resolver 漏注入 CONTAINER，导致所有 worker 退化到 default route，
+        # 多 profile 路由（含 per-request override 之外的 glob/regex/exact）全部失效。
+        self.env_resolver = env_resolver or (
+            lambda job: {**os.environ, "CONTAINER": (job.container or "")}
+        )
         self.idle_interval_sec = idle_interval_sec or _env_int("TM_WORKER_IDLE_SEC", 5)
         self.between_jobs_sec = between_jobs_sec or _env_int("TM_WORKER_INTERVAL_SEC", 10)
         self.pressure_backoff_sec = pressure_backoff_sec or _env_int(
