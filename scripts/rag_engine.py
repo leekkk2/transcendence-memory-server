@@ -38,9 +38,12 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("EMBEDDING_API_KEY
 WS = Path(os.environ.get("WORKSPACE", Path(__file__).resolve().parents[1]))
 RAG_SEARCH_MODE = os.environ.get("RAG_SEARCH_MODE", "hybrid")
 
-# cache key = (container, route_sig)；route_sig 由 registry 给出，
-# 形如 "embed:gemini-3072"。container 切换 route / profile 时不会复用旧 instance。
-_lightrag_instances: dict[tuple[str, str], Any] = {}
+# cache key = (container, emb_sig, rrk_sig)；两 sig 都由 registry 给出。
+#   emb_sig: "embed:gemini-3072" 或 "embed:primary+fb1+fb2"
+#   rrk_sig: "rerank:cohere-v3" 或 "" 当 route 未配置 reranker
+# Phase 2：rrk_sig 进 cache key 让 reranker 切换强制重建 LightRAG instance，避免
+# 复用旧 rerank_model_func 闭包导致行为不一致。
+_lightrag_instances: dict[tuple[str, str, str], Any] = {}
 _lightrag_locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
 
@@ -134,15 +137,23 @@ async def _get_lock(container: str) -> asyncio.Lock:
         return _lightrag_locks[container]
 
 
-def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
-    """通过 registry 解析 container 对应 route 并构造 EmbeddingFunc。
+def _resolve_route_emb_rrk(
+    container: str,
+) -> tuple[Any, Any, str, Any, str, float | None]:
+    """通过 registry 解析 container -> route -> (embedding_func, rerank_func)。
 
-    返回 (route, route_sig, embedding_func)。
-    抽出独立 helper 是为了 rag_engine / raganything_engine 都能用同一段逻辑，
-    并便于未来注入 reranker 时复用同一个 route 对象。
+    Phase 2 升级版（取代旧 _resolve_route_and_embedding）：同时解析 reranker
+    并返回构造好的 rerank_func + signature + min_score。如果 route 未配置
+    reranker，rerank_func 为 None、rrk_sig 为 ""。
+
+    Returns:
+        (route, embedding_func, emb_sig, rerank_func, rrk_sig, min_score)
+        - rerank_func: None 或 async callable（lightrag rerank_model_func 兼容签名）
+        - rrk_sig: "" 当无 reranker，否则 "rerank:{profile_name}"
+        - min_score: None 或 float，profile.min_score（注入 LightRAG min_rerank_score）
     """
-    # 延迟 import：embedding_registry 由 agent-α 实现；当 module-level import
-    # 失败（例如本地开发未提供 profiles.yaml）时直接报错而非启动时挂掉。
+    # 延迟 import：embedding_registry 由 v0.7.0 agent-α 实现；当 module-level
+    # import 失败（例如本地开发未提供 profiles.yaml）时直接报错而非启动时挂掉。
     try:
         from .embedding_registry import get_registry
     except ImportError:  # pragma: no cover - 兼容 sys.path 注入 scripts/ 的部署
@@ -150,19 +161,43 @@ def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
 
     registry = get_registry()
     route = registry.resolve(container)
-    embedding_func, route_sig = registry.build_embedding_func(route)
-    return route, route_sig, embedding_func
+    embedding_func, emb_sig = registry.build_embedding_func(route)
+
+    rerank_func: Any = None
+    rrk_sig = ""
+    min_score: float | None = None
+    if route.reranker is not None:
+        try:
+            from .reranker_registry import get_reranker_registry
+        except ImportError:  # pragma: no cover - 兼容 sys.path 注入 scripts/ 的部署
+            from reranker_registry import get_reranker_registry  # type: ignore
+        rrk_registry = get_reranker_registry()
+        rrk_profile = rrk_registry.get_profile(route.reranker)
+        rerank_func, rrk_sig = rrk_registry.build_rerank_func(rrk_profile)
+        min_score = rrk_profile.min_score
+
+    return route, embedding_func, emb_sig, rerank_func, rrk_sig, min_score
+
+
+# v0.7.0 旧 helper 名称向后兼容（其他模块/测试可能持有引用）。
+# Phase 2 内部统一用 _resolve_route_emb_rrk，旧函数仅作为薄壳。
+def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
+    route, embedding_func, emb_sig, _rrk, _rrk_sig, _min = _resolve_route_emb_rrk(container)
+    return route, emb_sig, embedding_func
 
 
 async def get_lightrag(container: str) -> Any:
     """获取（必要时创建并初始化）container 对应的 LightRAG 实例。
 
-    cache key 升级为 (container, route_sig)：
+    cache key 升级为 (container, emb_sig, rrk_sig)：
       - container 切换 route（如 yaml hot-reload 后路由变更）时不复用旧 instance
-      - route_sig 含 embedding profile 名 + dim，dim 变化必触发新建
+      - emb_sig 含 embedding profile 名 + dim，dim 变化必触发新建
+      - rrk_sig 含 reranker profile 名（或 "" 表示无 reranker）；reranker 切换
+        强制新建 instance，避免复用旧 rerank_model_func 闭包
     """
-    route, route_sig, embedding_func = _resolve_route_and_embedding(container)
-    cache_key = (container, route_sig)
+    route, embedding_func, emb_sig, rerank_func, rrk_sig, min_score = \
+        _resolve_route_emb_rrk(container)
+    cache_key = (container, emb_sig, rrk_sig)
 
     instance = _lightrag_instances.get(cache_key)
     if instance is not None:
@@ -180,31 +215,44 @@ async def get_lightrag(container: str) -> Any:
         working_dir = _container_working_dir(container)
         working_dir.mkdir(parents=True, exist_ok=True)
 
-        instance = LightRAG(
+        # 只在 route 实际配置 reranker 时才传 rerank_model_func / min_rerank_score；
+        # 否则保持 v0.7.0 行为完全等价 — 不动 LightRAG 默认值。
+        lightrag_kwargs: dict[str, Any] = dict(
             working_dir=str(working_dir),
             llm_model_func=_llm_func,
             embedding_func=embedding_func,
-            # Phase 2 will inject rerank_model_func + min_rerank_score here
         )
+        if rerank_func is not None:
+            lightrag_kwargs["rerank_model_func"] = rerank_func
+            if min_score is not None:
+                lightrag_kwargs["min_rerank_score"] = min_score
+
+        instance = LightRAG(**lightrag_kwargs)
         await instance.initialize_storages()
         await initialize_pipeline_status()
 
         _lightrag_instances[cache_key] = instance
         logger.info(
-            "LightRAG instance initialized for container=%s route=%s at %s",
-            container, route_sig, working_dir,
+            "LightRAG instance initialized for container=%s emb=%s rrk=%s at %s",
+            container, emb_sig, rrk_sig or "<none>", working_dir,
         )
         return instance
 
 
 def clear_rag_cache() -> None:
-    """Test helper — also clears registry so reload picks up new env / yaml."""
+    """Test helper — also clears registries so reload picks up new env / yaml."""
     _lightrag_instances.clear()
     _lightrag_locks.clear()
     # 同步清 registry：测试切换 env / profiles.yaml 后必须让 registry 重新加载，
-    # 否则 build_embedding_func 仍返回旧 profile 对应的闭包。
+    # 否则 build_*_func 仍返回旧 profile 对应的闭包。embedding 与 reranker
+    # 各自缓存 ProfileSet，两边都要清。
     try:
         from .embedding_registry import clear_registry
     except ImportError:  # pragma: no cover
         from embedding_registry import clear_registry  # type: ignore
     clear_registry()
+    try:
+        from .reranker_registry import clear_reranker_registry
+    except ImportError:  # pragma: no cover
+        from reranker_registry import clear_reranker_registry  # type: ignore
+    clear_reranker_registry()

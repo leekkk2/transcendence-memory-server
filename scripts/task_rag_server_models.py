@@ -285,6 +285,15 @@ class QueryReq(_WithModelOverride):
     container: str = Field(default=DEFAULT_CONTAINER, min_length=1)
     mode: str = "hybrid"
     top_k: int = Field(default=60, ge=1, le=500)
+    chunk_top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=500,
+        description=(
+            'Number of chunks to keep after rerank (LightRAG QueryParam.chunk_top_k). '
+            'Defaults to route.chunk_top_k when rerank enabled. Phase 2 feature.'
+        ),
+    )
 
 
 class QueryResponse(BaseModel):
