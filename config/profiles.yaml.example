@@ -1,0 +1,87 @@
+# transcendence-memory-server multi-embedding configuration
+# Copy this to config/profiles.yaml (or set TM_PROFILES_FILE env to your path).
+# Without this file, server falls back to legacy EMBEDDING_MODEL/DIM/BASE_URL/API_KEY env (v0.6.x behavior).
+#
+# Security: api_key_env is **indirection** — yaml never holds the secret value itself.
+# Set the actual env var (e.g. GEMINI_API_KEY=sk-...) in docker-compose .env or systemd.
+
+version: 1
+
+embeddings:
+  # === 用户实际场景：双 model 并存 ===
+
+  # Gemini via gemini-balance gateway (newapi) — 3072 dim, free-tier quota constrained
+  - name: gemini-3072
+    provider: openai_compatible
+    model: gemini-embedding-001
+    dim: 3072
+    base_url: https://llm.example.com/v1
+    api_key_env: GEMINI_API_KEY            # env value: sk-... (newapi key with gemini channel access)
+    max_token_size: 8192
+    request_dim: null                       # native 3072
+    timeout_s: 60
+    max_retries: 3
+
+  # OpenAI text-embedding-3-small via example-app (newapi channel #44) — 1024 dim
+  # Note: channel #44 reverse-mapping has been removed; this profile gets real OpenAI-compatible output.
+  - name: openai-small-1024
+    provider: openai_compatible
+    model: text-embedding-3-small
+    dim: 1024                              # ⚠ example-app normalizes everything to 1024, not OpenAI's native 1536
+    base_url: https://llm.example.com/v1
+    api_key_env: NEWAPI_API_KEY            # same newapi key works for both channels
+    max_token_size: 8192
+    timeout_s: 60
+    max_retries: 3
+
+  # Native OpenAI for orgs with real OpenAI key — 3072 dim
+  - name: openai-large-3072
+    provider: openai_compatible
+    model: text-embedding-3-large
+    dim: 3072
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    request_dim: 3072                       # explicit for Matryoshka safety
+    timeout_s: 60
+    max_retries: 3
+
+rerankers:
+  # example-app Cohere-style reranker (newapi channel #44)
+  - name: example-app-bge
+    provider: cohere_compatible
+    model: text-reranker
+    base_url: https://llm.example.com/v1
+    api_key_env: NEWAPI_API_KEY
+    timeout_s: 30
+    min_score: 0.0
+
+  # Cohere native (commercial)
+  - name: cohere-v3
+    provider: cohere_compatible
+    model: rerank-v3.5
+    base_url: https://api.cohere.com/v2
+    api_key_env: COHERE_API_KEY
+    timeout_s: 30
+    min_score: 0.0
+
+routes:
+  # 示例 1: 重要 container 用 Gemini，需要时降级到 OpenAI（Phase 3 实际生效）
+  - match: {exact: host-z}
+    embedding: gemini-3072
+    embedding_fallbacks: [openai-large-3072]     # ⚠ loader 强制 dim 必须相同
+    reranker: example-app-bge
+    rerank: {enabled: true, chunk_top_k: 30, top_k: 8}
+
+  # 示例 2: glob 匹配某类 container
+  - match: {glob: "test-*"}
+    embedding: openai-small-1024
+
+  # 示例 3: 正则
+  - match: {regex: "^v[0-9]+_.*$"}
+    embedding: openai-large-3072
+
+  # 兜底：所有未命中以上的 container 用 gemini-3072（必须恰好 1 个 default）
+  - match: {default: true}
+    embedding: gemini-3072
+    reranker: example-app-bge
+    rerank: {enabled: false}                   # default 不开 rerank，按需 per-call 启用

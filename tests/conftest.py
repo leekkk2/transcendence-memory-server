@@ -47,6 +47,23 @@ def load_server(workspace: Path, monkeypatch, extra_env: dict[str, str] | None =
     sys.modules.pop("scripts.job_queue", None)
     sys.modules.pop("job_worker", None)
     sys.modules.pop("scripts.job_worker", None)
+    sys.modules.pop("raganything_engine", None)
+    sys.modules.pop("scripts.raganything_engine", None)
+    sys.modules.pop("task_rag_runtime", None)
+    sys.modules.pop("scripts.task_rag_runtime", None)
+    # v0.7.0：embedding_registry / profiles_loader 有 module-level 单例 _registry。
+    # **不清 module**（class identity 不能换，否则 isinstance/test monkeypatch 会失效）；
+    # 仅清单例缓存 → 下次 get_registry() 重读 env / yaml。
+    if "scripts.embedding_registry" in sys.modules:
+        try:
+            sys.modules["scripts.embedding_registry"].clear_registry()
+        except Exception:  # pragma: no cover
+            pass
+    elif "embedding_registry" in sys.modules:
+        try:
+            sys.modules["embedding_registry"].clear_registry()
+        except Exception:  # pragma: no cover
+            pass
 
     return importlib.import_module("scripts.task_rag_server")
 

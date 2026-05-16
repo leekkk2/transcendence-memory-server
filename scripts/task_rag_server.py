@@ -338,17 +338,25 @@ async def _enforce_upload_limit(request, call_next):
     return await call_next(request)
 
 
-def child_env() -> dict[str, str]:
+def child_env(embedding_override: str | None = None) -> dict[str, str]:
+    """子进程 env 构造。
+
+    embedding_override：来自 request 的 `embedding_model`。worker (task_rag_runtime)
+    resolve 时若读到 `TM_EMBEDDING_PROFILE_OVERRIDE`，优先用它取代 route 默认 profile。
+    Phase 1 的最小注入面：env var，不动 worker CLI 签名。
+    """
     env = os.environ.copy()
     if env.get('EMBEDDING_BASE_URL') and not env.get('EMBEDDINGS_BASE_URL'):
         env['EMBEDDINGS_BASE_URL'] = env['EMBEDDING_BASE_URL']
     # Force UTF-8 for subprocess JSON I/O so Windows pipes can safely carry non-ASCII text.
     env.setdefault('PYTHONUTF8', '1')
     env.setdefault('PYTHONIOENCODING', 'utf-8')
+    if embedding_override:
+        env['TM_EMBEDDING_PROFILE_OVERRIDE'] = embedding_override
     return env
 
 
-def run(cmd: list[str], timeout_s: int) -> CommandResponse:
+def run(cmd: list[str], timeout_s: int, *, embedding_override: str | None = None) -> CommandResponse:
     script = Path(cmd[0])
     if not script.exists():
         return CommandResponse(command=cmd, code=127, stderr=f'script not found: {script}')
@@ -361,7 +369,7 @@ def run(cmd: list[str], timeout_s: int) -> CommandResponse:
             encoding='utf-8',
             errors='replace',
             timeout=timeout_s,
-            env=child_env(),
+            env=child_env(embedding_override),
         )
         return CommandResponse(command=real_cmd, code=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
     except subprocess.TimeoutExpired as exc:
@@ -382,6 +390,7 @@ def run_or_start(
     wait: bool,
     *,
     container: str = '',
+    embedding_override: str | None = None,
 ) -> CommandResponse:
     if not Path(cmd[0]).exists():
         return CommandResponse(command=cmd, code=127, stderr=f'script not found: {cmd[0]}')
@@ -401,7 +410,10 @@ def run_or_start(
                 note=f'background job pool full: {reason}',
                 stderr=reason,
             )
-        process = subprocess.Popen(real_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env())
+        process = subprocess.Popen(
+            real_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=child_env(embedding_override),
+        )
         BG_TRACKER.register(process.pid, container=container or 'unknown', label=Path(cmd[0]).name)
         return CommandResponse(
             command=real_cmd,
@@ -412,7 +424,7 @@ def run_or_start(
             status='started',
             note='Background ingest started.',
         )
-    result = run(cmd, timeout_s=timeout_s)
+    result = run(cmd, timeout_s=timeout_s, embedding_override=embedding_override)
     result.background = False
     result.wait = True
     return result
@@ -565,6 +577,23 @@ async def _collect_health_state(container: str | None) -> dict:
     }
     avail_containers = sorted(p.name for p in containers.iterdir() if p.is_dir()) if containers.exists() else []
 
+    # ── profile summary（仅 admin 用）。失败不阻塞 health，记 sensitive warning。
+    # 公开 /health 不取这个字段，避免泄漏 profile 名 → 加固 user 已收口的安全契约。
+    profiles_summary: dict | None = None
+    try:
+        try:
+            from embedding_registry import get_registry as _get_registry
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.embedding_registry import get_registry as _get_registry
+        ps = _get_registry().profiles
+        profiles_summary = {
+            'embeddings_count': len(ps.embeddings),
+            'rerankers_count': len(ps.rerankers),
+            'default_route_embedding': ps.default_route.embedding if ps.default_route else None,
+        }
+    except Exception as exc:  # pragma: no cover - 配置错误会被 admin 看见
+        sensitive_warnings.append(f'profiles registry unavailable: {exc}')
+
     return {
         # ──── 公开（HealthResponse 用）────
         'status': 'ok',
@@ -594,6 +623,7 @@ async def _collect_health_state(container: str | None) -> dict:
         'admit_reason': admit_reason,
         'background_jobs_active': BG_TRACKER.count_active(),
         'queue_stats': queue_stats,
+        'profiles': profiles_summary,
         'sensitive_warnings': sensitive_warnings,
     }
 
@@ -646,10 +676,17 @@ def _resolve_search_targets(req: SearchReq) -> list[str]:
     return [req.container]
 
 
-def _run_single_search(query: str, topk: int, container: str, timeout_s: int) -> tuple[CommandResponse, dict]:
+def _run_single_search(
+    query: str,
+    topk: int,
+    container: str,
+    timeout_s: int,
+    embedding_override: str | None = None,
+) -> tuple[CommandResponse, dict]:
     result = run(
         [str(script_path('task_rag_search.py')), '--query', query, '--topk', str(topk), '--container', container],
         timeout_s,
+        embedding_override=embedding_override,
     )
     try:
         payload = json.loads(result.stdout) if result.stdout.strip() else {}
@@ -693,7 +730,10 @@ def search(req: SearchReq) -> SearchResponse:
     any_initialized = False
 
     def _do(name: str) -> tuple[str, CommandResponse, dict]:
-        cmd_result, payload = _run_single_search(req.query, per_container_topk, name, req.timeout_s)
+        cmd_result, payload = _run_single_search(
+            req.query, per_container_topk, name, req.timeout_s,
+            embedding_override=req.embedding_model,
+        )
         return name, cmd_result, payload
 
     if len(targets) == 1:
@@ -792,6 +832,7 @@ def _enqueue_or_run(
     timeout_s: int,
     wait: bool,
     label: str = '',
+    embedding_override: str | None = None,
 ) -> CommandResponse:
     """Dispatch one of the three ingest ops, choosing between three modes:
 
@@ -811,6 +852,12 @@ def _enqueue_or_run(
     queue = get_job_queue()
 
     worker_alive = bool(JOB_WORKER and JOB_WORKER.is_running)
+
+    # 把 embedding_model 透传到 payload，worker 在落 job → resolver 时也能读到。
+    # 即便当前 worker 不消费该字段（β 后续合并），队列向后兼容，多余 key 不影响。
+    if embedding_override:
+        payload = dict(payload)
+        payload.setdefault('embedding_model', embedding_override)
 
     # Even on the queued path we still apply admit-gate so a flood under
     # genuine system pressure gets pushback (HTTP 503) instead of inflating
@@ -877,7 +924,7 @@ def _enqueue_or_run(
         raise HTTPException(status_code=400, detail=str(exc))
     try:
         with GATE.acquire(container):
-            return run(cmd, timeout_s=timeout_s)
+            return run(cmd, timeout_s=timeout_s, embedding_override=embedding_override)
     except IngestBusyError as e:
         raise HTTPException(
             status_code=503,
@@ -929,6 +976,7 @@ def embed(req: ContainerReq) -> CommandResponse:
         timeout_s=req.timeout_s,
         wait=req.wait,
         label='embed',
+        embedding_override=req.embedding_model,
     )
 
 
@@ -951,6 +999,7 @@ def ingest_memory(req: IngestMemoryReq) -> CommandResponse:
         timeout_s=req.timeout_s,
         wait=req.wait,
         label='ingest-memory',
+        embedding_override=req.embedding_model,
     )
 
 
@@ -993,9 +1042,13 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
     # in a tight loop only yields one pending embed job. The queue worker will
     # drain it later at a stable, host-friendly pace.
     if req.auto_embed:
+        # 把 per-request 的 embedding 覆盖也带到 auto-embed payload，保持与显式 /embed 一致
+        embed_payload: dict = {}
+        if req.embedding_model:
+            embed_payload['embedding_model'] = req.embedding_model
         try:
             get_job_queue().enqueue(
-                op='embed', container=req.container, payload={}, label='auto-embed',
+                op='embed', container=req.container, payload=embed_payload, label='auto-embed',
                 max_pending=_env_int('TM_QUEUE_MAX_PENDING', 1000),
             )
         except QueueFullError as exc:
@@ -1034,6 +1087,7 @@ def ingest_structured(req: StructuredIngestReq) -> CommandResponse:
         timeout_s=req.timeout_s,
         wait=req.wait,
         label='ingest-structured',
+        embedding_override=req.embedding_model,
     )
 
 
@@ -1292,6 +1346,120 @@ async def admin_system_health(container: str | None = None) -> dict:
     return out
 
 
+@app.get('/admin/profiles', dependencies=[Depends(verify_auth)])
+async def admin_profiles() -> dict:
+    """列出已加载的 embedding / reranker profile + 容器路由表。
+
+    所有 api_key 必须脱敏：只返回 `api_key_configured: bool`，**绝不**把真值写入响应。
+    这是 /admin/system-health 已有的安全契约的延伸 — 鉴权端点也禁止直接吐 secret。
+    """
+    try:
+        try:
+            from embedding_registry import get_registry
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.embedding_registry import get_registry
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f'embedding registry unavailable: {exc}')
+    try:
+        reg = get_registry()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'failed to load profiles: {exc}')
+    ps = reg.profiles
+    return {
+        'embeddings': [
+            {
+                'name': p.name,
+                'provider': p.provider,
+                'model': p.model,
+                'dim': p.dim,
+                'base_url': p.base_url,
+                'api_key_configured': bool(p.api_key),
+                'max_token_size': p.max_token_size,
+                'request_dim': p.request_dim,
+                'timeout_s': p.timeout_s,
+                'max_retries': p.max_retries,
+            }
+            for p in ps.embeddings.values()
+        ],
+        'rerankers': [
+            {
+                'name': r.name,
+                'provider': r.provider,
+                'model': r.model,
+                'base_url': r.base_url,
+                'api_key_configured': bool(r.api_key),
+                'timeout_s': r.timeout_s,
+                'min_score': r.min_score,
+            }
+            for r in ps.rerankers.values()
+        ],
+        'routes': [
+            {
+                'match': matcher,
+                'embedding': route.embedding,
+                'embedding_fallbacks': list(route.embedding_fallbacks),
+                'reranker': route.reranker,
+                'rerank_enabled': route.rerank_enabled,
+                'chunk_top_k': route.chunk_top_k,
+                'top_k': route.top_k,
+            }
+            for matcher, route in ps.routes
+        ],
+        'default_route': {
+            'embedding': ps.default_route.embedding,
+            'embedding_fallbacks': list(ps.default_route.embedding_fallbacks),
+            'reranker': ps.default_route.reranker,
+            'rerank_enabled': ps.default_route.rerank_enabled,
+            'chunk_top_k': ps.default_route.chunk_top_k,
+            'top_k': ps.default_route.top_k,
+        } if ps.default_route else None,
+    }
+
+
+@app.post('/admin/probe-embedding', dependencies=[Depends(verify_auth)])
+async def admin_probe_embedding(profile: str) -> dict:
+    """对一条 embedding profile 做单 token 活检。返回 latency + dim。
+
+    返回结构：
+      - ok=true  → {ok, profile, latency_ms, dim}
+      - ok=false → {ok, profile, latency_ms, error}（error 截断 200 字符防泄漏）
+    未知 profile name → 404；不允许吞掉客户端配置错误。
+    """
+    try:
+        try:
+            from embedding_registry import get_registry, _http_embed
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.embedding_registry import get_registry, _http_embed
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f'embedding registry unavailable: {exc}')
+    reg = get_registry()
+    try:
+        p = reg.get_profile(profile)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f'profile {profile!r} not found')
+    t0 = time.monotonic()
+    try:
+        result = await _http_embed(p, ['probe'])
+        # numpy 或 list-of-list 都兼容：取第一条 embedding 的长度作为 dim
+        try:
+            dim = int(result.shape[1])  # numpy ndarray 路径
+        except AttributeError:
+            dim = len(result[0]) if result else 0
+        return {
+            'ok': True,
+            'profile': profile,
+            'latency_ms': int((time.monotonic() - t0) * 1000),
+            'dim': dim,
+        }
+    except Exception as exc:
+        return {
+            'ok': False,
+            'profile': profile,
+            'latency_ms': int((time.monotonic() - t0) * 1000),
+            'error': str(exc)[:200],
+        }
+
+
 @app.get('/jobs', dependencies=[Depends(verify_auth)])
 def list_jobs(
     status: str | None = None,
@@ -1367,6 +1535,15 @@ async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
     validate_container_name(req.container)
     _require_lightrag_ready()
     _admit_or_503(req.container, op='documents/text')
+    # embedding_model override 在 in-process LightRAG 路径暂不生效（Phase 1+：
+    # 需要 β 的 registry-based cache key 才能切换 instance）。当前接受字段以保持
+    # API 兼容，但若客户端真的指定了 override，记一行 warning 提示无效。
+    if req.embedding_model:
+        logger.warning(
+            'documents/text received embedding_model=%r but in-process LightRAG path '
+            'does not honor per-request override in Phase 1; using route default.',
+            req.embedding_model,
+        )
     # Cap concurrent lightrag writes — each call drives many embedding+LLM
     # invocations and holds the container's KV graph lock.
     async with _RAG_WRITE_SEM:
@@ -1399,6 +1576,7 @@ async def ingest_document_file(
     container: str = Form(...),
     file: UploadFile = File(...),
     parse_method: str | None = Form(default=None),
+    embedding_model: str | None = Form(default=None),
 ) -> QueryResponse:
     """多模态文档入库：PDF / Office / 图片 / HTML / Markdown 等。
 
@@ -1416,6 +1594,13 @@ async def ingest_document_file(
 
     filename = _sanitize_upload_filename(file.filename)
     _admit_or_503(container, op='documents/file')
+    if embedding_model:
+        # 与 /documents/text 同样的 Phase 1 限制：in-process RAGAnything 还未接到 registry 切换
+        logger.warning(
+            'documents/file received embedding_model=%r but in-process RAGAnything path '
+            'does not honor per-request override in Phase 1; using route default.',
+            embedding_model,
+        )
 
     # Stage uploads under /data/scratch (persistent volume, ~no size cap)
     # rather than /tmp tmpfs (128 MB), since MAX_UPLOAD_BYTES defaults to
@@ -1478,6 +1663,14 @@ async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
     _require_lightrag_ready()
     _admit_or_503(req.container, op='query')
+    # Phase 1：accept embedding_model / reranker_model / rerank 字段以兼容客户端 spec，
+    # 但 in-process LightRAG 暂不切换 instance；Phase 2 接到 LightRAG QueryParam。
+    if req.embedding_model or req.reranker_model or req.rerank is not None:
+        logger.info(
+            'query received model overrides (embedding=%r reranker=%r rerank=%r) — '
+            'Phase 1 accepts but does not switch instance; effective in Phase 2.',
+            req.embedding_model, req.reranker_model, req.rerank,
+        )
     from lightrag import QueryParam
     # Cap concurrent queries — each runs LLM + embedding fan-out.
     async with _RAG_QUERY_SEM:
