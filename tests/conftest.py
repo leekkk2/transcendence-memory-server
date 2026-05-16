@@ -64,6 +64,17 @@ def load_server(workspace: Path, monkeypatch, extra_env: dict[str, str] | None =
             sys.modules["embedding_registry"].clear_registry()
         except Exception:  # pragma: no cover
             pass
+    # v0.8.0：reranker_registry 同款单例，同样只清缓存不清 module。
+    if "scripts.reranker_registry" in sys.modules:
+        try:
+            sys.modules["scripts.reranker_registry"].clear_reranker_registry()
+        except Exception:  # pragma: no cover
+            pass
+    elif "reranker_registry" in sys.modules:
+        try:
+            sys.modules["reranker_registry"].clear_reranker_registry()
+        except Exception:  # pragma: no cover
+            pass
 
     return importlib.import_module("scripts.task_rag_server")
 

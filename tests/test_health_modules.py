@@ -301,6 +301,44 @@ def test_admin_profiles_returns_full_detail(tmp_path, monkeypatch):
     assert data['default_route']['embedding'] == 'gemini-3072'
 
 
+def test_admin_profiles_reranker_fields_complete(tmp_path, monkeypatch):
+    """v0.8.0：/admin/profiles 返回的 reranker 项必含 model/provider/base_url/
+    timeout_s/min_score 字段，并保留 api_key_configured 安全契约。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/admin/profiles', headers=auth_headers())
+    data = resp.json()
+    assert data['rerankers'], 'expected at least one reranker entry'
+    r = data['rerankers'][0]
+    # v0.8.0 必含字段集 — 客户端可据此渲染 reranker 列表 UI
+    for field in ('name', 'provider', 'model', 'base_url', 'timeout_s',
+                  'min_score', 'api_key_configured'):
+        assert field in r, f'rerankers[0] missing field {field!r}: {r}'
+    # api_key 真值不可出现
+    assert 'api_key' not in r
+
+
+def test_admin_profiles_route_reranker_fields_present(tmp_path, monkeypatch):
+    """v0.8.0：route 视图必带 reranker / rerank_enabled / chunk_top_k / top_k
+    字段，让客户端能预知服务端 rerank 策略。"""
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+    client = TestClient(server.app)
+    resp = client.get('/admin/profiles', headers=auth_headers())
+    data = resp.json()
+    # default_route 也带这些字段（dataclass 默认值兜底，schema 必稳）
+    dr = data['default_route']
+    for field in ('reranker', 'rerank_enabled', 'chunk_top_k', 'top_k'):
+        assert field in dr, f'default_route missing field {field!r}: {dr}'
+    # routes[0] 同样字段集
+    if data['routes']:
+        for field in ('reranker', 'rerank_enabled', 'chunk_top_k', 'top_k'):
+            assert field in data['routes'][0], f'routes[0] missing field {field!r}'
+
+
 def test_admin_profiles_redacts_api_key(tmp_path, monkeypatch):
     """response 必须**不含** api_key 真值字段，但**应该**含 api_key_configured: bool。"""
     workspace = make_workspace(tmp_path)

@@ -53,8 +53,9 @@ VLM_API_KEY = os.environ.get("VLM_API_KEY") or _RAG_LLM_API_KEY
 
 _SUPPORTED_PARSERS = {"mineru", "docling"}
 
-# cache key = (container, route_sig)，与 rag_engine._lightrag_instances 对齐
-_instances: dict[tuple[str, str], Any] = {}
+# cache key = (container, emb_sig, rrk_sig)，与 rag_engine._lightrag_instances 对齐。
+# Phase 2：rrk_sig 进 cache key 让 reranker 切换强制重建 RAGAnything instance。
+_instances: dict[tuple[str, str, str], Any] = {}
 _locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
 
@@ -122,11 +123,17 @@ async def _get_lock(container: str) -> asyncio.Lock:
         return _locks[container]
 
 
-def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
-    """通过 registry 解析 container -> route -> EmbeddingFunc。
+def _resolve_route_emb_rrk(
+    container: str,
+) -> tuple[Any, Any, str, str]:
+    """通过 registry 解析 container -> route -> (embedding_func, rrk_sig)。
 
-    与 rag_engine._resolve_route_and_embedding 同结构；故意不互相依赖
-    （避免循环 import），代价是少量重复。
+    Phase 2：仅取 emb_sig + rrk_sig 用于 cache key 计算；RAGAnything 内部
+    嵌的 LightRAG 由 rag_engine.get_lightrag 单独注入 rerank_func，本模块
+    不重复传 rerank_func（避免与底层 LightRAG instance 行为冲突）。
+
+    与 rag_engine._resolve_route_emb_rrk 同结构；故意不互相依赖（避免循环
+    import），代价是少量重复，换取模块独立可加载。
     """
     try:
         from .embedding_registry import get_registry
@@ -135,15 +142,18 @@ def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
 
     registry = get_registry()
     route = registry.resolve(container)
-    embedding_func, route_sig = registry.build_embedding_func(route)
-    return route, route_sig, embedding_func
+    embedding_func, emb_sig = registry.build_embedding_func(route)
+    rrk_sig = f"rerank:{route.reranker}" if route.reranker else ""
+    return route, embedding_func, emb_sig, rrk_sig
 
 
 async def get_raganything(container: str) -> Any:
     """获取 / 创建 container 对应的 RAGAnything 实例，复用已有 LightRAG。"""
     # 先解析 route，决定 cache key；同时拿到 EmbeddingFunc 注入给 RAGAnything。
-    route, route_sig, embedding_func = _resolve_route_and_embedding(container)
-    cache_key = (container, route_sig)
+    # rerank 由底层 LightRAG instance 持有（get_lightrag 已注入），此处只用
+    # rrk_sig 算 cache key，避免 RAGAnything 重复构造 rerank_func。
+    route, embedding_func, emb_sig, rrk_sig = _resolve_route_emb_rrk(container)
+    cache_key = (container, emb_sig, rrk_sig)
 
     instance = _instances.get(cache_key)
     if instance is not None:
@@ -194,8 +204,8 @@ async def get_raganything(container: str) -> Any:
 
         _instances[cache_key] = instance
         logger.info(
-            "RAGAnything instance ready for container=%s route=%s at %s (parser=%s)",
-            container, route_sig, working_dir, config.parser,
+            "RAGAnything instance ready for container=%s emb=%s rrk=%s at %s (parser=%s)",
+            container, emb_sig, rrk_sig or "<none>", working_dir, config.parser,
         )
         return instance
 
