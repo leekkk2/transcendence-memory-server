@@ -4,6 +4,15 @@
 纯文本入库与查询直接使用 LightRAG，不依赖 RAGAnything 的多模态 parser。
 多模态（PDF/图像/表格）场景若有需要，应在独立入口中显式加载 RAGAnything，
 且该入口必须保证 parser 已正确安装。
+
+v0.7.0 multi-embedding 升级（2026-05-16）：
+  - 删除 module-level 全局 BASE_URL/API_KEY/EMBEDDING_MODEL/EMBEDDING_DIM
+    以及 _embed_func。embedding 逻辑迁移到 scripts/embedding_registry.py，
+    由 EmbeddingRegistry 按 container -> route 动态解析与构造 EmbeddingFunc。
+  - get_lightrag(container) cache key 升级为 (container, route_sig)，
+    避免在 route / profile 切换后命中过期 LightRAG instance（embedding_dim
+    可能不同，复用旧 instance 会导致 LanceDB 向量维度 mismatch）。
+  - LLM 调用保持不变（与 embedding 解耦），call_openai_chat / _llm_func 保留。
 """
 from __future__ import annotations
 
@@ -15,100 +24,25 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = os.environ.get("EMBEDDING_BASE_URL") or os.environ.get("EMBEDDINGS_BASE_URL") or "https://api.openai.com/v1"
-API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "gemini-embedding-001")
-EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "3072"))
+# LLM 仍由 env 直接驱动（multi-LLM 升级是后续 phase，本次只动 embedding）。
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", BASE_URL)
-LLM_API_KEY = os.environ.get("LLM_API_KEY", API_KEY)
+# LLM_BASE_URL / LLM_API_KEY 历史上 fallback 到 EMBEDDING_BASE_URL / EMBEDDING_API_KEY；
+# 保留 fallback 以避免现有 .env 配置（很多部署只配了一对 base/key）失效。
+LLM_BASE_URL = (
+    os.environ.get("LLM_BASE_URL")
+    or os.environ.get("EMBEDDING_BASE_URL")
+    or os.environ.get("EMBEDDINGS_BASE_URL")
+    or "https://api.openai.com/v1"
+)
+LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("EMBEDDING_API_KEY", "")
 WS = Path(os.environ.get("WORKSPACE", Path(__file__).resolve().parents[1]))
 RAG_SEARCH_MODE = os.environ.get("RAG_SEARCH_MODE", "hybrid")
 
-_lightrag_instances: dict[str, Any] = {}
+# cache key = (container, route_sig)；route_sig 由 registry 给出，
+# 形如 "embed:gemini-3072"。container 切换 route / profile 时不会复用旧 instance。
+_lightrag_instances: dict[tuple[str, str], Any] = {}
 _lightrag_locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
-
-
-# 默认值与 task_rag_runtime.py 保持一致：单条最坏耗时控制在 ~3 分钟内，
-# 防止 retry 期间主调用方持有大对象导致内存压力堆积。
-_EMBED_MAX_RETRIES = int(os.environ.get("EMBEDDING_MAX_RETRIES", "3"))
-_EMBED_RETRY_BASE_DELAY = float(os.environ.get("EMBEDDING_RETRY_BASE_DELAY", "1.5"))
-_EMBED_RETRY_MAX_DELAY = float(os.environ.get("EMBEDDING_RETRY_MAX_DELAY", "30"))
-_EMBED_TIMEOUT = float(os.environ.get("EMBEDDING_TIMEOUT", "60"))
-
-
-def _parse_retry_after(value: str | None) -> float | None:
-    if not value:
-        return None
-    import time
-    from email.utils import parsedate_to_datetime
-    value = value.strip()
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        pass
-    try:
-        dt = parsedate_to_datetime(value)
-        if dt is None:
-            return None
-        return max(0.0, dt.timestamp() - time.time())
-    except (TypeError, ValueError):
-        return None
-
-
-def _embed_backoff(attempt: int, retry_after: float | None) -> float:
-    import random
-    base = min(_EMBED_RETRY_BASE_DELAY * (2 ** attempt), _EMBED_RETRY_MAX_DELAY)
-    jitter = base * random.uniform(-0.25, 0.25)
-    delay = max(0.5, base + jitter)
-    if retry_after is not None:
-        delay = max(delay, min(retry_after, _EMBED_RETRY_MAX_DELAY))
-    return delay
-
-
-async def _embed_func(texts: list[str]):
-    """Embedding 调用，对 5xx / 429 / 连接错误执行指数退避重试，尊重 Retry-After。"""
-    import httpx
-    import numpy as np
-
-    url = f"{BASE_URL.rstrip('/')}/embeddings"
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-    payload = {"model": EMBEDDING_MODEL, "input": texts}
-
-    last_exc: Exception | None = None
-    async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
-        for attempt in range(_EMBED_MAX_RETRIES):
-            retry_after: float | None = None
-            try:
-                resp = await client.post(url, json=payload, headers=headers)
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                    raise httpx.HTTPStatusError(
-                        f"embedding upstream {resp.status_code}",
-                        request=resp.request,
-                        response=resp,
-                    )
-                resp.raise_for_status()
-                data = resp.json()["data"]
-                sorted_data = sorted(data, key=lambda x: x["index"])
-                return np.array([d["embedding"] for d in sorted_data], dtype="float32")
-            except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError):
-                    code = exc.response.status_code
-                    if not (code == 429 or code >= 500):
-                        raise
-                last_exc = exc
-                if attempt == _EMBED_MAX_RETRIES - 1:
-                    break
-                delay = _embed_backoff(attempt, retry_after)
-                logger.warning(
-                    "Embedding call failed (attempt %d/%d): %s; retrying in %.1fs",
-                    attempt + 1, _EMBED_MAX_RETRIES, exc, delay,
-                )
-                await asyncio.sleep(delay)
-    assert last_exc is not None
-    raise last_exc
 
 
 _LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
@@ -200,42 +134,77 @@ async def _get_lock(container: str) -> asyncio.Lock:
         return _lightrag_locks[container]
 
 
+def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
+    """通过 registry 解析 container 对应 route 并构造 EmbeddingFunc。
+
+    返回 (route, route_sig, embedding_func)。
+    抽出独立 helper 是为了 rag_engine / raganything_engine 都能用同一段逻辑，
+    并便于未来注入 reranker 时复用同一个 route 对象。
+    """
+    # 延迟 import：embedding_registry 由 agent-α 实现；当 module-level import
+    # 失败（例如本地开发未提供 profiles.yaml）时直接报错而非启动时挂掉。
+    try:
+        from .embedding_registry import get_registry
+    except ImportError:  # pragma: no cover - 兼容 sys.path 注入 scripts/ 的部署
+        from embedding_registry import get_registry  # type: ignore
+
+    registry = get_registry()
+    route = registry.resolve(container)
+    embedding_func, route_sig = registry.build_embedding_func(route)
+    return route, route_sig, embedding_func
+
+
 async def get_lightrag(container: str) -> Any:
-    """获取（必要时创建并初始化）container 对应的 LightRAG 实例。"""
-    instance = _lightrag_instances.get(container)
+    """获取（必要时创建并初始化）container 对应的 LightRAG 实例。
+
+    cache key 升级为 (container, route_sig)：
+      - container 切换 route（如 yaml hot-reload 后路由变更）时不复用旧 instance
+      - route_sig 含 embedding profile 名 + dim，dim 变化必触发新建
+    """
+    route, route_sig, embedding_func = _resolve_route_and_embedding(container)
+    cache_key = (container, route_sig)
+
+    instance = _lightrag_instances.get(cache_key)
     if instance is not None:
         return instance
 
     lock = await _get_lock(container)
     async with lock:
-        instance = _lightrag_instances.get(container)
+        instance = _lightrag_instances.get(cache_key)
         if instance is not None:
             return instance
 
         from lightrag import LightRAG
         from lightrag.kg.shared_storage import initialize_pipeline_status
-        from lightrag.utils import EmbeddingFunc
 
         working_dir = _container_working_dir(container)
-        embedding_func = EmbeddingFunc(
-            embedding_dim=EMBEDDING_DIM,
-            max_token_size=8192,
-            func=_embed_func,
-        )
+        working_dir.mkdir(parents=True, exist_ok=True)
 
         instance = LightRAG(
             working_dir=str(working_dir),
             llm_model_func=_llm_func,
             embedding_func=embedding_func,
+            # Phase 2 will inject rerank_model_func + min_rerank_score here
         )
         await instance.initialize_storages()
         await initialize_pipeline_status()
 
-        _lightrag_instances[container] = instance
-        logger.info("LightRAG instance initialized for container=%s at %s", container, working_dir)
+        _lightrag_instances[cache_key] = instance
+        logger.info(
+            "LightRAG instance initialized for container=%s route=%s at %s",
+            container, route_sig, working_dir,
+        )
         return instance
 
 
 def clear_rag_cache() -> None:
+    """Test helper — also clears registry so reload picks up new env / yaml."""
     _lightrag_instances.clear()
     _lightrag_locks.clear()
+    # 同步清 registry：测试切换 env / profiles.yaml 后必须让 registry 重新加载，
+    # 否则 build_embedding_func 仍返回旧 profile 对应的闭包。
+    try:
+        from .embedding_registry import clear_registry
+    except ImportError:  # pragma: no cover
+        from embedding_registry import clear_registry  # type: ignore
+    clear_registry()

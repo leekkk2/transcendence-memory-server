@@ -184,9 +184,15 @@ def collect_memory_objects(container: str) -> list[dict[str, Any]]:
 
 
 # 所有 row 的统一 schema 字段集 — 保证 streaming add 时 schema 一致
+# v0.7.0 新增 3 个 embedding metadata 字段，便于多 model 共存时追溯每条 row 的 embedding 出处：
+#   - embedding_model：实际调用的 model 名（如 'gemini-embedding-001'）
+#   - embedding_dim：实际写入的 vector 维度（如 3072）
+#   - embedding_profile：profiles.yaml 里 profile name（如 'gemini-3072'），便于反查路由配置
+# 老 LanceDB 表无这 3 列时，PyArrow 读出来为 null，写入路径会按需做 schema migration（见 _is_metadata_string_schema）。
 _ROW_SCHEMA_FIELDS: tuple[str, ...] = (
     'chunkId', 'taskId', 'docType', 'sourcePath', 'section', 'text',
     'container', 'title', 'source', 'tags', 'metadata',
+    'embedding_model', 'embedding_dim', 'embedding_profile',
 )
 
 
@@ -214,7 +220,12 @@ def _normalize_metadata_inplace(row: dict[str, Any]) -> None:
 
 
 def _normalize_row(row: dict[str, Any], container: str) -> dict[str, Any]:
-    """补齐缺失字段，保证混合来源（task_card / memory / client_ingest）的 schema 一致。"""
+    """补齐缺失字段，保证混合来源（task_card / memory / client_ingest）的 schema 一致。
+
+    v0.7.0：新增 embedding_model / embedding_dim / embedding_profile 字段。
+    embed_text 调用前 row 还没有这些字段，默认空串 / 0；embed 后 _flush 路径
+    通过 _annotate_embedding_meta() 回填真实值，便于按 model 追溯。
+    """
     item: dict[str, Any] = {}
     for field in _ROW_SCHEMA_FIELDS:
         item[field] = row.get(field)
@@ -225,8 +236,54 @@ def _normalize_row(row: dict[str, Any], container: str) -> dict[str, Any]:
         item['title'] = ''
     if item.get('source') is None:
         item['source'] = ''
+    # v0.7.0 embedding metadata 默认值：embed 成功后会被覆盖；失败 / 历史 row 保留默认
+    if item.get('embedding_model') is None:
+        item['embedding_model'] = ''
+    if item.get('embedding_dim') is None:
+        item['embedding_dim'] = 0
+    if item.get('embedding_profile') is None:
+        item['embedding_profile'] = ''
     _normalize_metadata_inplace(item)
     return item
+
+
+def _resolve_embedding_meta(container: str) -> tuple[str, int, str]:
+    """查询当前 container 对应的 embedding profile 元数据（model / dim / profile_name）。
+
+    v0.7.0 多 model 框架：profiles.yaml 加载后通过 embedding_registry 路由；
+    若 v0.7.0 模块尚未上线（α 任务未合入或 yaml 不存在），按 legacy env 回退到空串占位。
+    本函数从不抛异常 — 任何失败路径都返回三元组占位值，保证 ingest 不被元数据采集阻塞。
+    """
+    # 软导入：α 完成前 embedding_registry 不存在，老 env 路径仍可用
+    try:
+        from embedding_registry import get_registry  # type: ignore[import-not-found]
+    except Exception:
+        try:
+            from scripts.embedding_registry import get_registry  # type: ignore[import-not-found]
+        except Exception:
+            return ('', 0, '')
+    try:
+        registry = get_registry()
+        route = registry.resolve(container)
+        profile = registry.get_profile(route.embedding)
+        return (
+            str(getattr(profile, 'model', '') or ''),
+            int(getattr(profile, 'dim', 0) or 0),
+            str(getattr(profile, 'name', '') or ''),
+        )
+    except Exception:
+        return ('', 0, '')
+
+
+def _annotate_embedding_meta(item: dict[str, Any], meta: tuple[str, int, str]) -> None:
+    """把 (model, dim, profile_name) 回填到 row。仅当 item 未显式设值时覆盖。"""
+    model, dim, profile = meta
+    if not item.get('embedding_model'):
+        item['embedding_model'] = model
+    if not item.get('embedding_dim'):
+        item['embedding_dim'] = dim
+    if not item.get('embedding_profile'):
+        item['embedding_profile'] = profile
 
 
 def load_existing_rows(container: str) -> list[dict[str, Any]]:
@@ -252,6 +309,11 @@ def _is_metadata_string_schema(table) -> bool:
     Why: v0.5.5/0.5.6 用 `'string' in str(type).lower()` 判断，但
     `struct<kind: string>` 子串里也含 `'string'` → 误判为兼容 → add() 失败 →
     rows=0。改用 pyarrow.types.is_string / is_large_string 严格匹配。
+
+    v0.7.0 注意：新增 embedding_model / embedding_dim / embedding_profile 3 列在
+    老表中不存在，但 LanceDB merge_insert / add 路径会在首次写入时自动扩 schema（实测
+    LanceDB ≥0.4 支持），因此此函数 *只* 判断 metadata 列是否 string 兼容；新 3 列
+    的迁移由 LanceDB 表内部 schema evolution 处理，不在这里强制触发 overwrite。
     """
     try:
         import pyarrow as pa
@@ -442,15 +504,19 @@ def rebuild_rows(
             buf = []
 
     # 4b. Pass 1：embed + flush 新 fresh rows，单条失败记录到 retry queue 不阻塞
+    # v0.7.0：每次 rebuild 解析一次当前 container 的 embedding profile 元数据，写入每条 row。
+    # 解析失败时返回三元组占位（空串 / 0），保持 v0.6.x 行为不变。
     pacer = IngestPacer(threshold=3, base=2.0, max_delay=30.0)
     failed_pass1: list[dict[str, Any]] = []
     HARD_FAIL_LIMIT = 20  # 连续 20 条失败说明上游真断了，整体 raise 让下次重跑
     consecutive_fails = 0
+    embedding_meta = _resolve_embedding_meta(container)
 
     for row in fresh_rows:
         item = _normalize_row(row, container)
         try:
             item['vector'] = embed_text(item['text']).tolist()
+            _annotate_embedding_meta(item, embedding_meta)
             pacer.on_success()
             consecutive_fails = 0
             buf.append(item)
@@ -489,6 +555,7 @@ def rebuild_rows(
             item = _normalize_row(row, container)
             try:
                 item['vector'] = embed_text(item['text']).tolist()
+                _annotate_embedding_meta(item, embedding_meta)
                 buf.append(item)
                 ingested += 1
                 if len(buf) >= batch_size:

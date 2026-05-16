@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Worker runtime — per-container subprocess 的 embedding 调用入口。
+
+v0.7.0 multi-embedding 升级（2026-05-16）：
+  - 删除 module-level API_KEY / MODEL / EMBEDDINGS_BASE_URL 等全局常量。
+  - 改为按 worker 启动时的 CONTAINER env 通过 EmbeddingRegistry 解析对应
+    profile（per-container 进程 = per-route），调用 OpenAI-style /embeddings。
+  - 保留 Google `AIza*` 原生 endpoint fallback 作为现有 special path（当
+    profile.api_key 以 AIza 开头时走 generativelanguage.googleapis.com）。
+"""
 from __future__ import annotations
 
 import logging
@@ -13,17 +22,21 @@ import numpy as np
 import requests
 
 
+# 保证 worker subprocess（python /path/to/task_rag_runtime.py）能 import 同目录的
+# embedding_registry / profiles_loader — 即使没作为 package 被 import。
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 TASKS = WS / 'tasks'
 
-API_KEY = os.getenv('EMBEDDING_API_KEY', '')
-MODEL = os.getenv('EMBEDDING_MODEL', 'gemini-embedding-001')
-EMBEDDINGS_BASE_URL = (
-    os.getenv('EMBEDDING_BASE_URL')
-    or os.getenv('EMBEDDINGS_BASE_URL')
-    or 'https://api.openai.com/v1'
+# Google native endpoint 模板（fallback path 用，本身不依赖 profile）。
+GOOGLE_BASE_URL = os.getenv(
+    'GOOGLE_EMBEDDING_BASE_URL',
+    'https://generativelanguage.googleapis.com/v1beta/models',
 )
-GOOGLE_BASE_URL = os.getenv('GOOGLE_EMBEDDING_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/models')
 
 # 重试配置：上游限速时（429/5xx）走指数退避 + 抖动。
 # 单条 chunk 最坏耗时 = MAX_RETRIES * (TIMEOUT + 平均退避)，控制在 ~3 分钟内，
@@ -84,16 +97,66 @@ def _backoff_delay(attempt: int, retry_after: float | None) -> float:
     return delay
 
 
-def embed_text(text: str) -> np.ndarray:
-    if not API_KEY:
-        raise RuntimeError('EMBEDDING_API_KEY not set')
+def _resolve_profile_for_worker():
+    """根据 CONTAINER / TM_EMBEDDING_PROFILE_OVERRIDE env 拿 registry profile。
 
-    url = f'{EMBEDDINGS_BASE_URL.rstrip("/")}/embeddings'
+    优先级（高 → 低）：
+      1. TM_EMBEDDING_PROFILE_OVERRIDE — γ 的 server 端点 per-request override 注入
+      2. CONTAINER env → registry.resolve(container).embedding
+      3. TM_WORKER_CONTAINER env（旧别名）
+      4. 缺失时走 registry.default_route — 向后兼容 legacy env-only 部署
+         （这条 fallback 保证旧测试 / 旧 docker-compose 不指定 CONTAINER 时仍能工作）
+    """
+    try:
+        from embedding_registry import get_registry  # type: ignore
+    except Exception:  # pragma: no cover
+        try:
+            from scripts.embedding_registry import get_registry  # type: ignore
+        except Exception:
+            from .embedding_registry import get_registry  # type: ignore
+
+    registry = get_registry()
+
+    override = os.environ.get('TM_EMBEDDING_PROFILE_OVERRIDE', '').strip()
+    if override:
+        return registry.get_profile(override)
+
+    container = os.environ.get('CONTAINER') or os.environ.get('TM_WORKER_CONTAINER')
+    if container:
+        route = registry.resolve(container)
+        return registry.get_profile(route.embedding)
+
+    # 缺失 → 用 default route（registry 总有一个 default，legacy env 路径会合成 'legacy' profile）
+    return registry.get_profile(registry._profiles.default_route.embedding)
+
+
+def embed_text(text: str) -> np.ndarray:
+    """单条文本 embedding 调用，专供 worker 使用。
+
+    路由：CONTAINER env -> registry.resolve -> profile -> /embeddings 调用。
+    fallback：若 profile.api_key 以 'AIza' 开头（个人 Google API Key），
+    在 OpenAI-style 调用全部失败后改走 Google native endpoint。
+    """
+    profile = _resolve_profile_for_worker()
+
+    api_key = profile.api_key
+    if not api_key:
+        raise RuntimeError(
+            f"profile {profile.name!r} has no api_key (check api_key_env)"
+        )
+
+    base_url = profile.base_url
+    model = profile.model
+    url = f'{base_url.rstrip("/")}/embeddings'
     headers = {
-        'Authorization': f'Bearer {API_KEY}',
+        'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
     }
-    payload = {'model': MODEL, 'input': text}
+    payload: dict = {'model': model, 'input': text}
+    # Matryoshka：profile.request_dim 指定时传 OpenAI `dimensions=N`
+    request_dim = getattr(profile, 'request_dim', None)
+    if request_dim:
+        payload['dimensions'] = int(request_dim)
 
     last_err: Exception | None = None
     for attempt in range(_EMBED_MAX_RETRIES):
@@ -129,8 +192,9 @@ def embed_text(text: str) -> np.ndarray:
         )
         time.sleep(delay)
 
-    if API_KEY.startswith('AIza'):
-        google_url = f'{GOOGLE_BASE_URL.rstrip("/")}/{MODEL}:embedContent?key={API_KEY}'
+    # Google native fallback：现有 special path，保留语义
+    if api_key.startswith('AIza'):
+        google_url = f'{GOOGLE_BASE_URL.rstrip("/")}/{model}:embedContent?key={api_key}'
         google_payload = {'content': {'parts': [{'text': text}]}}
         response = requests.post(google_url, json=google_payload, timeout=_EMBED_TIMEOUT)
         response.raise_for_status()
