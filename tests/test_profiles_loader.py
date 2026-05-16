@@ -47,7 +47,7 @@ def test_load_yaml_full_schema(tmp_path, monkeypatch):
     _clear_legacy_env(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
     monkeypatch.setenv("OPENAI_API_KEY", "oa-key")
-    monkeypatch.setenv("EXAMPLE_APP_API_KEY", "example-app-key")
+    monkeypatch.setenv("RERANKER_API_KEY", "selfhosted-gateway-key")
     yaml_path = _write_yaml(
         tmp_path,
         """
@@ -71,18 +71,18 @@ embeddings:
     api_key_env: OPENAI_API_KEY
     request_dim: 3072
 rerankers:
-  - name: example-app-bge
+  - name: selfhosted-bge
     provider: cohere_compatible
     model: text-reranker
     base_url: https://newapi.example/v1
-    api_key_env: EXAMPLE_APP_API_KEY
+    api_key_env: RERANKER_API_KEY
     timeout_s: 25
     min_score: 0.1
 routes:
   - match: {exact: host-z}
     embedding: gemini-3072
     embedding_fallbacks: [openai-3072]
-    reranker: example-app-bge
+    reranker: selfhosted-bge
     rerank: {enabled: true, chunk_top_k: 40, top_k: 10}
   - match: {default: true}
     embedding: gemini-3072
@@ -92,7 +92,7 @@ routes:
 
     assert isinstance(ps, ProfileSet)
     assert set(ps.embeddings) == {"gemini-3072", "openai-3072"}
-    assert set(ps.rerankers) == {"example-app-bge"}
+    assert set(ps.rerankers) == {"selfhosted-bge"}
     gem = ps.embeddings["gemini-3072"]
     assert isinstance(gem, EmbeddingProfile)
     assert gem.dim == 3072
@@ -105,7 +105,7 @@ routes:
     oa = ps.embeddings["openai-3072"]
     assert oa.request_dim == 3072
 
-    rr = ps.rerankers["example-app-bge"]
+    rr = ps.rerankers["selfhosted-bge"]
     assert isinstance(rr, RerankerProfile)
     assert rr.min_score == 0.1
     assert rr.timeout_s == 25
@@ -115,7 +115,7 @@ routes:
     assert matcher == {"exact": "host-z"}
     assert route.embedding == "gemini-3072"
     assert route.embedding_fallbacks == ("openai-3072",)
-    assert route.reranker == "example-app-bge"
+    assert route.reranker == "selfhosted-bge"
     assert route.rerank_enabled is True
     assert route.chunk_top_k == 40
     assert route.top_k == 10
