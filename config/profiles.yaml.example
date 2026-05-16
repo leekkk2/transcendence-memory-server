@@ -22,12 +22,12 @@ embeddings:
     timeout_s: 60
     max_retries: 3
 
-  # OpenAI text-embedding-3-small via egonex (newapi channel #44) — 1024 dim
+  # OpenAI text-embedding-3-small via selfhosted-gateway (newapi channel #44) — 1024 dim
   # Note: channel #44 reverse-mapping has been removed; this profile gets real OpenAI-compatible output.
   - name: openai-small-1024
     provider: openai_compatible
     model: text-embedding-3-small
-    dim: 1024                              # ⚠ egonex normalizes everything to 1024, not OpenAI's native 1536
+    dim: 1024                              # ⚠ selfhosted-gateway normalizes everything to 1024, not OpenAI's native 1536
     base_url: https://newapi.zweiteng.tk/v1
     api_key_env: NEWAPI_API_KEY            # same newapi key works for both channels
     max_token_size: 8192
@@ -46,8 +46,8 @@ embeddings:
     max_retries: 3
 
 rerankers:
-  # egonex Cohere-style reranker (newapi channel #44)
-  - name: egonex-bge
+  # selfhosted-gateway Cohere-style reranker (newapi channel #44)
+  - name: selfhosted-bge
     provider: cohere_compatible
     model: text-reranker
     base_url: https://newapi.zweiteng.tk/v1
@@ -69,7 +69,7 @@ routes:
   - match: {exact: imac}
     embedding: gemini-3072
     embedding_fallbacks: [openai-large-3072]     # ⚠ loader 强制 dim 必须相同
-    reranker: egonex-bge
+    reranker: selfhosted-bge
     rerank: {enabled: true, chunk_top_k: 30, top_k: 8}
 
   # 示例 2: glob 匹配某类 container
@@ -83,5 +83,5 @@ routes:
   # 兜底：所有未命中以上的 container 用 gemini-3072（必须恰好 1 个 default）
   - match: {default: true}
     embedding: gemini-3072
-    reranker: egonex-bge
+    reranker: selfhosted-bge
     rerank: {enabled: false}                   # default 不开 rerank，按需 per-call 启用
