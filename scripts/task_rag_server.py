@@ -1663,22 +1663,28 @@ async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
     _require_lightrag_ready()
     _admit_or_503(req.container, op='query')
-    # Phase 1：accept embedding_model / reranker_model / rerank 字段以兼容客户端 spec，
-    # 但 in-process LightRAG 暂不切换 instance；Phase 2 接到 LightRAG QueryParam。
-    if req.embedding_model or req.reranker_model or req.rerank is not None:
+    # Phase 2：rerank / chunk_top_k 字段透传到 LightRAG QueryParam。
+    # embedding_model / reranker_model 仍只记录日志（per-call profile 切换需要
+    # 重建 LightRAG instance，Phase 3 才实现 — 当前 instance 由 route 静态决定）。
+    if req.embedding_model or req.reranker_model:
         logger.info(
-            'query received model overrides (embedding=%r reranker=%r rerank=%r) — '
-            'Phase 1 accepts but does not switch instance; effective in Phase 2.',
-            req.embedding_model, req.reranker_model, req.rerank,
+            'query received profile overrides (embedding=%r reranker=%r) — '
+            'Phase 2 accepts but does not switch instance; effective in Phase 3.',
+            req.embedding_model, req.reranker_model,
         )
     from lightrag import QueryParam
     # Cap concurrent queries — each runs LLM + embedding fan-out.
     async with _RAG_QUERY_SEM:
         lightrag = await get_lightrag(req.container)
-        answer = await lightrag.aquery(
-            req.query,
-            param=QueryParam(mode=req.mode, top_k=req.top_k),
-        )
+        # QueryParam 字段按 LightRAG 默认值兜底；只在 req 显式给出时覆盖。
+        # rerank=None 表示走 route 默认（由 LightRAG instance 的 enable_rerank=True
+        # 默认 + rerank_model_func 是否为 None 共同决定）。
+        qp_kwargs: dict[str, Any] = {'mode': req.mode, 'top_k': req.top_k}
+        if req.rerank is not None:
+            qp_kwargs['enable_rerank'] = bool(req.rerank)
+        if req.chunk_top_k is not None:
+            qp_kwargs['chunk_top_k'] = int(req.chunk_top_k)
+        answer = await lightrag.aquery(req.query, param=QueryParam(**qp_kwargs))
     return QueryResponse(
         status='ok',
         query=req.query,
