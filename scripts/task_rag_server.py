@@ -338,12 +338,20 @@ async def _enforce_upload_limit(request, call_next):
     return await call_next(request)
 
 
-def child_env(embedding_override: str | None = None) -> dict[str, str]:
+def child_env(
+    embedding_override: str | None = None,
+    container: str = '',
+) -> dict[str, str]:
     """子进程 env 构造。
 
     embedding_override：来自 request 的 `embedding_model`。worker (task_rag_runtime)
     resolve 时若读到 `TM_EMBEDDING_PROFILE_OVERRIDE`，优先用它取代 route 默认 profile。
     Phase 1 的最小注入面：env var，不动 worker CLI 签名。
+
+    container：当前请求作用的 container 名。注入 `CONTAINER` env 让 subprocess
+    (task_rag_search.py 等) 的 task_rag_runtime._resolve_profile_for_worker 走
+    "CONTAINER env → registry.resolve(container)" 路径，而不是退化到 default route。
+    v0.10.1 修了 JobWorker 路径同名 bug；v0.10.2 这里补全同步 subprocess 路径。
     """
     env = os.environ.copy()
     if env.get('EMBEDDING_BASE_URL') and not env.get('EMBEDDINGS_BASE_URL'):
@@ -353,10 +361,18 @@ def child_env(embedding_override: str | None = None) -> dict[str, str]:
     env.setdefault('PYTHONIOENCODING', 'utf-8')
     if embedding_override:
         env['TM_EMBEDDING_PROFILE_OVERRIDE'] = embedding_override
+    if container:
+        env['CONTAINER'] = container
     return env
 
 
-def run(cmd: list[str], timeout_s: int, *, embedding_override: str | None = None) -> CommandResponse:
+def run(
+    cmd: list[str],
+    timeout_s: int,
+    *,
+    embedding_override: str | None = None,
+    container: str = '',
+) -> CommandResponse:
     script = Path(cmd[0])
     if not script.exists():
         return CommandResponse(command=cmd, code=127, stderr=f'script not found: {script}')
@@ -369,7 +385,7 @@ def run(cmd: list[str], timeout_s: int, *, embedding_override: str | None = None
             encoding='utf-8',
             errors='replace',
             timeout=timeout_s,
-            env=child_env(embedding_override),
+            env=child_env(embedding_override, container=container),
         )
         return CommandResponse(command=real_cmd, code=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
     except subprocess.TimeoutExpired as exc:
@@ -412,7 +428,7 @@ def run_or_start(
             )
         process = subprocess.Popen(
             real_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=child_env(embedding_override),
+            env=child_env(embedding_override, container=container),
         )
         BG_TRACKER.register(process.pid, container=container or 'unknown', label=Path(cmd[0]).name)
         return CommandResponse(
@@ -424,7 +440,7 @@ def run_or_start(
             status='started',
             note='Background ingest started.',
         )
-    result = run(cmd, timeout_s=timeout_s, embedding_override=embedding_override)
+    result = run(cmd, timeout_s=timeout_s, embedding_override=embedding_override, container=container)
     result.background = False
     result.wait = True
     return result
@@ -687,6 +703,7 @@ def _run_single_search(
         [str(script_path('task_rag_search.py')), '--query', query, '--topk', str(topk), '--container', container],
         timeout_s,
         embedding_override=embedding_override,
+        container=container,
     )
     try:
         payload = json.loads(result.stdout) if result.stdout.strip() else {}
@@ -924,7 +941,7 @@ def _enqueue_or_run(
         raise HTTPException(status_code=400, detail=str(exc))
     try:
         with GATE.acquire(container):
-            return run(cmd, timeout_s=timeout_s, embedding_override=embedding_override)
+            return run(cmd, timeout_s=timeout_s, embedding_override=embedding_override, container=container)
     except IngestBusyError as e:
         raise HTTPException(
             status_code=503,
