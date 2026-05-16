@@ -380,6 +380,98 @@ def test_admin_probe_embedding_requires_auth(tmp_path, monkeypatch):
     assert resp.status_code in (401, 403, 422), f'unexpected status: {resp.status_code}'
 
 
+def test_admin_probe_embedding_resets_breaker_on_success(tmp_path, monkeypatch):
+    """v0.9.0：探活成功 → 显式重置该 profile 的 circuit breaker，
+    response 含 breaker_reset 字段。
+
+    先人为把 breaker 推到 open 状态，再 probe 成功 → 应 reset。
+    """
+    import numpy as np
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+
+    # 同时打两份模块（与 _install_fake_registry 一样的双 import 处理）—
+    # pyproject pythonpath = ['src', 'scripts'] 让顶层 / scripts.* 是两个独立模块
+    from scripts import embedding_registry as er
+    import embedding_registry as er_top
+
+    # 让 _http_embed 不发真 HTTP：返回固定 dim=3072 的数组
+    async def fake_embed(profile, texts):
+        return np.zeros((len(texts), 3072), dtype="float32")
+
+    monkeypatch.setattr(er, "_http_embed", fake_embed)
+    monkeypatch.setattr(er_top, "_http_embed", fake_embed)
+
+    # 人为构造一个 open 状态（直接写 breaker dict，等价于实际跑过 5 次失败）
+    # 注意：scripts.embedding_registry 和顶层 embedding_registry 是两个独立
+    # 模块对象（pyproject pythonpath = ['src', 'scripts'] 双注册），各自
+    # 持有独立的 _breakers dict。Server 端点先 try 顶层，所以 breaker 写
+    # 的也是顶层那份；两边都要 setup 才能保证测试不依赖 import 顺序。
+    er._clear_all_breakers()
+    er_top._clear_all_breakers()
+    for mod in (er, er_top):
+        state = mod._get_breaker("gemini-3072")
+        state.consecutive_fails = 5
+        state.cooling_until_ts = 999999999.0
+        state.last_fail_ts = 1.0
+
+    client = TestClient(server.app)
+    resp = client.post('/admin/probe-embedding?profile=gemini-3072', headers=auth_headers())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data['ok'] is True
+    assert data['profile'] == 'gemini-3072'
+    assert data['dim'] == 3072
+    assert data['breaker_reset'] is True, f"expected breaker_reset=True, got {data}"
+
+    # 端点实际走的那份模块的 state 已清空（用 server 端点同款 import 顺序定位）
+    actual_mod = er_top  # endpoint 先 try 顶层 import
+    state_after = actual_mod._breakers.get('gemini-3072')
+    assert state_after is not None
+    assert state_after.consecutive_fails == 0
+    assert state_after.cooling_until_ts == 0.0
+
+
+def test_admin_probe_embedding_failure_marks_breaker_no_reset(tmp_path, monkeypatch):
+    """v0.9.0：探活失败（fallback-eligible 错误）→ breaker_reset=False，
+    且 breaker 计数加 1（不重置）。"""
+    import httpx
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    _install_fake_registry(server, monkeypatch)
+
+    from scripts import embedding_registry as er
+    import embedding_registry as er_top
+
+    # 模拟 503 错误（fallback-eligible）
+    async def fail_embed(profile, texts):
+        request = httpx.Request("POST", f"{profile.base_url}/embeddings")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError("upstream 503", request=request, response=response)
+
+    monkeypatch.setattr(er, "_http_embed", fail_embed)
+    monkeypatch.setattr(er_top, "_http_embed", fail_embed)
+
+    er._clear_all_breakers()
+    er_top._clear_all_breakers()
+
+    client = TestClient(server.app)
+    resp = client.post('/admin/probe-embedding?profile=gemini-3072', headers=auth_headers())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data['ok'] is False
+    assert data['breaker_reset'] is False
+    assert 'error' in data
+
+    # breaker 计数 +1（503 是 fallback-eligible 错误）
+    # endpoint 先 try 顶层 embedding_registry → 失败计数写到 er_top._breakers
+    actual_mod = er_top
+    state = actual_mod._breakers.get('gemini-3072')
+    assert state is not None, "probe failure 应触发 breaker mark"
+    assert state.consecutive_fails == 1
+
+
 def test_admin_system_health_includes_profile_summary(tmp_path, monkeypatch):
     """/admin/system-health 应包含 profiles.embeddings_count / rerankers_count。"""
     workspace = make_workspace(tmp_path)
