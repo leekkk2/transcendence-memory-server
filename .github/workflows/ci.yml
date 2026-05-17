@@ -63,6 +63,7 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.flavor }}-${{ matrix.platform }}
           build-args: |
             TM_VERSION=${{ github.sha }}
+            TM_SOURCE_REV=${{ github.sha }}
 
   build-release-assets:
     needs: test
@@ -174,6 +175,7 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             TM_VERSION=${{ github.ref_name }}
+            TM_SOURCE_REV=${{ github.sha }}
           # Read+write the GHA cache shared with docker-validate so this job
           # warm-starts off the validation build instead of from scratch.
           cache-from: |
