@@ -7,10 +7,14 @@ specific upstream provider, network RTT, and concurrent load.
 
 ## Test setup
 
-- Reranker provider: `text-embedding-3-small` model routed through `/v1/rerank`
-  on an OpenAI-compatible aggregator (cosine-similarity-based pseudo-rerank).
+- Reranker provider: an embedding model channel routed through `/v1/rerank`
+  on an OpenAI-compatible aggregator gateway, behaving as cosine-similarity-
+  based pseudo-rerank. Substitute "embedding model" with whatever your
+  gateway exposes; numbers below were collected against a small-dim (1024)
+  embedding model.
 - LightRAG `hybrid` mode with default `chunk_top_k=30`, `top_k=8`.
-- LLM: `gpt-5.4-mini` for entity/relation extraction + answer composition.
+- LLM: a mid-tier chat completion model used for entity/relation extraction
+  and final answer composition (any modern instruction-tuned model works).
 
 ## 1. Direct `/v1/rerank` latency (sequential)
 
