@@ -251,12 +251,12 @@ def _install_fake_registry(server, monkeypatch):
         base_url='https://api.cohere.com/v1', api_key='RRK-SECRET',
         timeout_s=30.0, min_score=0.2,
     )
-    route_devbox = Route(embedding='gemini-3072', embedding_fallbacks=('openai-3072',))
+    route_default = Route(embedding='gemini-3072', embedding_fallbacks=('openai-3072',))
     default_route = Route(embedding='gemini-3072')
     ps = ProfileSet(
         embeddings={'gemini-3072': emb_primary, 'openai-3072': emb_fb},
         rerankers={'cohere-rerank': rrk},
-        routes=[({'exact': 'host-z'}, route_devbox)],
+        routes=[({'exact': 'default'}, route_default)],
         default_route=default_route,
     )
     fake = er.EmbeddingRegistry(ps)
@@ -294,7 +294,7 @@ def test_admin_profiles_returns_full_detail(tmp_path, monkeypatch):
     assert 'cohere-rerank' in rrk_names
     # routes 至少 1 条、含 match dict
     assert len(data['routes']) == 1
-    assert data['routes'][0]['match'] == {'exact': 'host-z'}
+    assert data['routes'][0]['match'] == {'exact': 'default'}
     assert data['routes'][0]['embedding'] == 'gemini-3072'
     assert data['routes'][0]['embedding_fallbacks'] == ['openai-3072']
     # default_route 含 embedding 字段

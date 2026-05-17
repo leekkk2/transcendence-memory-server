@@ -76,7 +76,7 @@ def main():
 
     # export-token
     p_token = sub.add_parser('export-token', help='Export connection token')
-    p_token.add_argument('--container', default='host-z')
+    p_token.add_argument('--container', default='default')
     p_token.add_argument('--token-only', action='store_true')
     p_token.add_argument('--host', default='127.0.0.1')
     p_token.add_argument('--port', type=int, default=8711)

@@ -234,6 +234,50 @@ For OpenAI text-embedding-3-large (native 3072), set `request_dim: 1536` or `768
 
 ---
 
+## How the reranker actually fires (and when it does not)
+
+Reranker is **silent by default**. Three independent preconditions must all be true for any rerank call to happen:
+
+| Layer | Required state | Verification |
+|---|---|---|
+| **Config** | Route resolved for the request has `reranker: <name>` set AND `rerank.enabled: true`, OR the per-call request body sets `"rerank": true` | `curl $SRV/admin/profiles` shows the route's `reranker` and `rerank.enabled` |
+| **Data path** | Content was ingested through `POST /documents/text` or `POST /documents/upload` (the RAG-Anything knowledge-graph pipeline) | `ls /data/tasks/rag/containers/<C>/kv_store_*.json` exists |
+| **Query path** | Client called `POST /query` (not `POST /search`) | server access log shows `/query`, not `/search` |
+
+If **any** of these is missing, reranker silently does nothing:
+
+- `POST /search` is a direct LanceDB cosine + topk path. It never invokes a reranker, regardless of config.
+- A container ingested only via `POST /ingest-memory/objects` has no knowledge graph; `/query` against it returns `(no answer generated)` even with a configured reranker.
+- A route with `rerank.enabled: false` (the default) only fires the reranker when the request body includes `"rerank": true`.
+
+### Per-request field name (Pydantic strict)
+
+The request body field is `rerank: bool` (not `enable_rerank`). Sending an unknown key like `enable_rerank: true` is silently ignored by Pydantic — the reranker stays off, no warning emitted.
+
+```bash
+# Correct — overrides route default
+curl -X POST $SRV/query -H 'Content-Type: application/json' \
+  -d '{"container":"my-container","query":"...","rerank":true}'
+
+# Wrong — silently ignored
+curl -X POST $SRV/query -H 'Content-Type: application/json' \
+  -d '{"container":"my-container","query":"...","enable_rerank":true}'
+```
+
+### Three ways to turn reranker on
+
+| Mode | Change | When to use |
+|---|---|---|
+| Per-request | Add `"rerank": true` to `/query` body | You already use `/query` and want it for one call |
+| Default-on for a route | Set `rerank.enabled: true` in the route's `rerank:` block in `profiles.yaml` | All `/query` traffic on that route should rerank (note: adds ~200-500 ms per call) |
+| Single-container test | Add a glob route like `{glob: "*_rerank"}` with `rerank.enabled: true`; ingest a test container ending in `_rerank` and compare | A/B testing reranker impact |
+
+### Prerequisite: dual-write to make the reranker meaningful
+
+Reranker only sees what `/query` retrieves, and `/query` only sees content in the knowledge graph. If your container is LanceDB-only (typical for `/tm remember` workflows), you must **also** write through `POST /documents/text` to populate the knowledge graph before `/query` returns anything for reranker to score.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -244,11 +288,14 @@ For OpenAI text-embedding-3-large (native 3072), set `request_dim: 1536` or `768
 | Worker subprocess fails with `embedding profile 'X' not found` | YAML doesn't define profile X | check `/admin/profiles` for actual names |
 | Sudden dim mismatch on write | Per-request override targeted wrong-dim profile | only override matching-dim profiles for existing containers |
 | Backwards-incompat after upgrade | Edge case in legacy synthesis | report with `EMBEDDING_*` env dump (redact key) |
+| `/query` returns `(no answer generated)` | Container is LanceDB-only, no knowledge graph | dual-write through `POST /documents/text` |
+| Reranker configured but never fires | Traffic is on `/search` (LanceDB only) | switch to `/query` for the requests you want reranked |
+| `enable_rerank` field has no effect | Wrong field name; Pydantic silently drops unknown keys | use `rerank: true` (not `enable_rerank: true`) |
 
 ---
 
 ## See also
 
 - [`config/profiles.yaml.example`](../config/profiles.yaml.example) — full reference
-- [Multi-Embedding Architecture (design)](https://github.com/leekkk2/transcendence-memory-workspace/blob/main/docs/architecture/2026-05-16-multi-embedding-design.md) — workspace
-- [Quota Incident Postmortem](https://github.com/leekkk2/transcendence-memory-workspace/blob/main/docs/research/2026-05-16-quota-incident-postmortem.md) — why this framework exists
+- [`MIGRATION_EMBEDDINGS.md`](MIGRATION_EMBEDDINGS.md) — switch a container's embedding profile in-place
+- [`operations/troubleshooting.md`](operations/troubleshooting.md) — runtime symptom catalog
