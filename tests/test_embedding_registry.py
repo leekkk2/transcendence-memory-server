@@ -67,7 +67,7 @@ embeddings:
     base_url: https://b/v1
     api_key_env: K2
 routes:
-  - match: {exact: imac}
+  - match: {exact: default}
     embedding: p1
   - match: {glob: "test-*"}
     embedding: p2
@@ -85,7 +85,7 @@ routes:
 def test_resolve_exact_match(monkeypatch, tmp_path):
     ps = _make_ps_with_routes(monkeypatch, tmp_path)
     reg = EmbeddingRegistry(ps)
-    route = reg.resolve("imac")
+    route = reg.resolve("default")
     assert route.embedding == "p1"
 
 
@@ -163,7 +163,7 @@ def test_build_embedding_func_returns_lightrag_embeddingfunc(monkeypatch, tmp_pa
     """EmbeddingFunc 实例可用，dim 属性 = primary.dim。"""
     ps = _make_ps_with_routes(monkeypatch, tmp_path)
     reg = EmbeddingRegistry(ps)
-    route = reg.resolve("imac")
+    route = reg.resolve("default")
     func, sig = reg.build_embedding_func(route)
     assert isinstance(func, EmbeddingFunc)
     assert func.embedding_dim == 3072
@@ -218,7 +218,7 @@ def test_embedding_func_invokes_http_with_correct_payload(monkeypatch, tmp_path)
 
     ps = _make_ps_with_routes(monkeypatch, tmp_path)
     reg = EmbeddingRegistry(ps)
-    route = reg.resolve("imac")  # p1, dim=3072
+    route = reg.resolve("default")  # p1, dim=3072
 
     captured: list[tuple[str, list[str]]] = []
 
@@ -242,7 +242,7 @@ def test_embedding_func_dim_validation_kicks_in(monkeypatch, tmp_path):
 
     ps = _make_ps_with_routes(monkeypatch, tmp_path)
     reg = EmbeddingRegistry(ps)
-    route = reg.resolve("imac")  # dim=3072
+    route = reg.resolve("default")  # dim=3072
 
     async def bad_http_embed(profile, texts):
         return np.zeros((len(texts), 100), dtype="float32")  # wrong dim

@@ -20,19 +20,19 @@ def test_export_token_returns_valid_base64(tmp_path: Path, monkeypatch):
     body = resp.json()
 
     assert body["endpoint"] == "https://example.com:8711"
-    assert body["container"] == "imac"  # 默认 container
+    assert body["container"] == "default"  # 默认 container
 
     # token 是有效的 base64
     decoded = json.loads(base64.b64decode(body["token"]).decode("utf-8"))
     assert decoded["endpoint"] == "https://example.com:8711"
     assert decoded["api_key"] == API_KEY
-    assert decoded["container"] == "imac"
+    assert decoded["container"] == "default"
 
     pairing_auth = body["pairing_auth"]
     assert pairing_auth["mode"] == "api_key"
     assert pairing_auth["endpoint"] == "https://example.com:8711"
     assert pairing_auth["api_key"] == API_KEY
-    assert pairing_auth["container"] == "imac"
+    assert pairing_auth["container"] == "default"
     assert "X-API-KEY" in pairing_auth["accepted_headers"]
 
     onboarding = body["agent_onboarding"]

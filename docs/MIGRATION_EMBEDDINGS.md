@@ -76,7 +76,7 @@ the renamed `chunks_old_*` directory inside the same LanceDB folder — a
 
 ```bash
 python scripts/migrate_embeddings.py \
-    --container imac \
+    --container default \
     --from gemini-3072 \
     --to   openai-small-1024
 ```
@@ -111,7 +111,7 @@ current network / upstream conditions.
 
 ```bash
 python scripts/migrate_embeddings.py \
-    --container imac \
+    --container default \
     --from gemini-3072 \
     --to   openai-small-1024 \
     --commit
@@ -127,7 +127,7 @@ batch 58/58 embedded 51 rows in 3120 ms (cumulative 5751/5751)
 
 # Migration commit summary
 
-- **container**: `imac`
+- **container**: `default`
 - **from profile**: `gemini-3072`
 - **to profile**: `openai-small-1024`
 
@@ -139,11 +139,11 @@ batch 58/58 embedded 51 rows in 3120 ms (cumulative 5751/5751)
 | new model | `text-embedding-3-small` |
 | elapsed | 6.2m |
 | batches | 58 (size 100) |
-| old table backup | `tasks/rag/containers/imac/lancedb/chunks_old_20260516_153012.lance` |
-| new active table | `tasks/rag/containers/imac/lancedb/chunks.lance` |
+| old table backup | `tasks/rag/containers/default/lancedb/chunks_old_20260516_153012.lance` |
+| new active table | `tasks/rag/containers/default/lancedb/chunks.lance` |
 
 Old table preserved — verify search results, then remove manually:
-`rm -rf tasks/rag/containers/imac/lancedb/chunks_old_20260516_153012.lance`
+`rm -rf tasks/rag/containers/default/lancedb/chunks_old_20260516_153012.lance`
 ```
 
 ### Step 3 — Update routing
@@ -152,7 +152,7 @@ Edit `config/profiles.yaml` so the container routes to the new profile:
 
 ```yaml
 routes:
-  - match: {exact: imac}
+  - match: {exact: default}
     embedding: openai-small-1024     # was gemini-3072
 ```
 
@@ -172,7 +172,7 @@ script). Confirm:
 Only after confirming results:
 
 ```bash
-rm -rf tasks/rag/containers/imac/lancedb/chunks_old_20260516_153012.lance
+rm -rf tasks/rag/containers/default/lancedb/chunks_old_20260516_153012.lance
 ```
 
 There is no `--cleanup` flag on the tool, deliberately — manual deletion
@@ -185,7 +185,7 @@ keeps you from accidentally losing the rollback option.
 If smoke tests look wrong:
 
 ```bash
-cd tasks/rag/containers/imac/lancedb
+cd tasks/rag/containers/default/lancedb
 mv chunks.lance chunks_failed_$(date +%Y%m%d_%H%M%S).lance
 mv chunks_old_20260516_153012.lance chunks.lance
 ```
@@ -200,7 +200,7 @@ fully usable.
 The tool intentionally accepts one container at a time. For batches:
 
 ```bash
-for c in imac yzjx test-alpha; do
+for c in default my-container test-alpha; do
     python scripts/migrate_embeddings.py \
         --container "$c" \
         --from gemini-3072 \

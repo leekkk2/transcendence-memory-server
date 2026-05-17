@@ -378,7 +378,7 @@ def _try_optimize(table) -> None:
     """合并 fragments + 清理旧版本，避免 LanceDB MVCC 累积膨胀盘占。
 
     历史教训（2026-04-29）：v0.5.2 之前 ingest 用 mode='overwrite' 创建新 dataset
-    version 但保留旧 fragments，多次 ingest 后 yzjx 容器从 ~100 MB 实际数据
+    version 但保留旧 fragments，多次 ingest 后 my-container 容器从 ~100 MB 实际数据
     膨胀到 2.0 GB 盘占。
     """
     try:
@@ -410,7 +410,7 @@ def rebuild_rows(
       in-place upsert，失败时旧索引保留，下次 ingest 继续修复。
     - **upsert via merge_insert + 末尾删孤儿**（v0.5.8 起）：旧版本"先 delete
       REBUILD_DOC_TYPES → 再 add"，若 embed 全部失败（限速 / 5xx 风暴）旧数据
-      就被永久丢失（2026-04-30 yzjx rows 从 5751 归 0 的根因）。改为：
+      就被永久丢失（2026-04-30 my-container rows 从 5751 归 0 的根因）。改为：
         1) 全程不主动 delete 旧行
         2) 用 merge_insert(chunkId).when_matched_update_all() 写入，幂等
         3) 所有写入完成后才 delete 孤儿（docType IN REBUILD AND chunkId NOT IN ingested）
@@ -618,14 +618,14 @@ def rebuild_rows(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--container', default='imac')
+    parser.add_argument('--container', default='default')
     parser.add_argument('--memory-dir', default='')
     parser.add_argument('--archive-dir', default='')
     args = parser.parse_args()
 
-    if args.container == 'imac':
-        default_memory = WS / 'memory-imac'
-        default_archive = WS / 'memory-archive-imac'
+    if args.container == 'default':
+        default_memory = WS / 'memory-default'
+        default_archive = WS / 'memory-archive-default'
     else:
         default_memory = WS / 'memory'
         default_archive = WS / 'memory-archive'

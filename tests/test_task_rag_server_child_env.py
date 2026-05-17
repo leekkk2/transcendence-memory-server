@@ -36,17 +36,28 @@ def test_child_env_injects_container(server_module):
     assert env.get("CONTAINER") == "myapp_openai"
 
 
-def test_child_env_omits_container_when_empty(server_module):
+def test_child_env_omits_container_when_empty(server_module, monkeypatch):
     """container 缺省（空字符串）时不写 CONTAINER env，让 subprocess 走 default route。
 
-    兼容 legacy env-only 部署：旧调用方未传 container，行为应与改造前一致。"""
-    env = server_module.child_env(container="")
-    assert "CONTAINER" not in env or env["CONTAINER"] == env.get("CONTAINER", "")
-    # 更严格：默认参数不写 CONTAINER
+    兼容 legacy env-only 部署：旧调用方未传 container，行为应与改造前一致。
+
+    通过 monkeypatch 清掉 os.environ 的 CONTAINER（如 docker-compose 设了），
+    严格断言 child_env() / child_env(container='') 不会"自己"引入 CONTAINER key。
+    """
+    monkeypatch.delenv("CONTAINER", raising=False)
+
+    # 空字符串显式传入
+    env_empty = server_module.child_env(container="")
+    assert "CONTAINER" not in env_empty, (
+        "child_env(container='') 不应注入空字符串 CONTAINER；"
+        "下游 _resolve_profile_for_worker 用 os.environ.get('CONTAINER') 拿到 None 才能 fallback 到 default route"
+    )
+
+    # 完全省略参数
     env_default = server_module.child_env()
-    # 注意：os.environ 里可能 inherit CONTAINER（如 docker-compose 设了），不强求
-    # 不存在；但调用 child_env() 不应自己引入空 CONTAINER。
-    assert env_default.get("CONTAINER", "") == env_default.get("CONTAINER", "")
+    assert "CONTAINER" not in env_default, (
+        "child_env() 默认调用不应自己引入 CONTAINER key"
+    )
 
 
 def test_child_env_container_coexists_with_embedding_override(server_module):
@@ -54,10 +65,10 @@ def test_child_env_container_coexists_with_embedding_override(server_module):
     runtime 内 override 优先级更高（_resolve_profile_for_worker 先看 override）。"""
     env = server_module.child_env(
         embedding_override="openai-small-1024",
-        container="yzjx_openai",
+        container="my-container_openai",
     )
     assert env["TM_EMBEDDING_PROFILE_OVERRIDE"] == "openai-small-1024"
-    assert env["CONTAINER"] == "yzjx_openai"
+    assert env["CONTAINER"] == "my-container_openai"
 
 
 def test_run_passes_container_to_child_env(server_module, monkeypatch):

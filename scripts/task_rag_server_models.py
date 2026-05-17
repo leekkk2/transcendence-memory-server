@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-DEFAULT_CONTAINER = 'imac'
+DEFAULT_CONTAINER = 'default'
 
 
 PatternMode = Literal['substring', 'prefix', 'glob']

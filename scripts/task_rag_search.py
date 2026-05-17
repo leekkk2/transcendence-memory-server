@@ -79,7 +79,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--query', required=True)
     parser.add_argument('--topk', type=int, default=5)
-    parser.add_argument('--container', default='imac')
+    parser.add_argument('--container', default='default')
     args = parser.parse_args()
 
     print(json.dumps(search_lancedb(args.query, args.topk, args.container), ensure_ascii=False, indent=2))

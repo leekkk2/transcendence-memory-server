@@ -508,7 +508,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Re-embed a container's LanceDB chunks table from one embedding profile to another.",
     )
-    parser.add_argument("--container", required=True, help="Container name (e.g. imac, yzjx)")
+    parser.add_argument("--container", required=True, help="Container name (e.g. default, my-container)")
     parser.add_argument(
         "--from",
         dest="from_profile",
