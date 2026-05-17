@@ -79,7 +79,7 @@ rerankers:
     timeout_s: 25
     min_score: 0.1
 routes:
-  - match: {exact: host-z}
+  - match: {exact: default}
     embedding: gemini-3072
     embedding_fallbacks: [openai-3072]
     reranker: selfhosted-bge
@@ -112,7 +112,7 @@ routes:
 
     assert len(ps.routes) == 1
     matcher, route = ps.routes[0]
-    assert matcher == {"exact": "host-z"}
+    assert matcher == {"exact": "default"}
     assert route.embedding == "gemini-3072"
     assert route.embedding_fallbacks == ("openai-3072",)
     assert route.reranker == "selfhosted-bge"
@@ -281,7 +281,7 @@ embeddings:
     base_url: https://x/v1
     api_key_env: K
 routes:
-  - match: {exact: host-z}
+  - match: {exact: default}
     embedding: p1
 """,
     )
