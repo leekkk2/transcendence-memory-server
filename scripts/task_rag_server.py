@@ -758,7 +758,7 @@ def _run_single_search(
     return result, payload
 
 
-_DEFAULT_PER_CONTAINER_TIMEOUT_S = 3.0
+_DEFAULT_PER_CONTAINER_TIMEOUT_S = 12.0  # subprocess cold-start (py + lancedb + lightrag import) 实测 5-10s 不稳；v0.12 in-process 化后可降回 3s
 
 
 @app.post('/search', response_model=SearchResponse, dependencies=[Depends(verify_auth)])

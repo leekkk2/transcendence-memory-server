@@ -69,7 +69,7 @@ class SearchReq(_WithModelOverride):
         le=30.0,
         description=(
             '单容器子查询超时上限（秒）。超时容器在 per_container_status 标记 timeout，'
-            '不影响其余容器返回。None=默认 3.0s。'
+            '不影响其余容器返回。None=默认 12.0s（容忍 subprocess cold-start；v0.12 in-process 化后可降回 3s）。'
         ),
     )
 
