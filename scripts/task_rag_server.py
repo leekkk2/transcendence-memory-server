@@ -758,12 +758,82 @@ def _run_single_search(
     return result, payload
 
 
+def _resolve_search_rerank(req: SearchReq, targets: list[str]) -> tuple[bool, Any, str | None, int]:
+    """Resolve the lightweight /search reranker policy.
+
+    `/search` does not use LightRAG, so it must apply reranking explicitly after
+    LanceDB returns candidate chunks. The route config is still the source of
+    truth: `rerank.enabled` decides the default, while `req.rerank` can override
+    it per request. `req.reranker_model` can override the route profile.
+    """
+    if not targets:
+        return False, None, None, 0
+
+    try:
+        from embedding_registry import get_registry
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.embedding_registry import get_registry
+    try:
+        from reranker_registry import get_reranker_registry
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.reranker_registry import get_reranker_registry
+
+    route = get_registry().resolve(targets[0])
+    enabled = route.rerank_enabled if req.rerank is None else bool(req.rerank)
+    profile_name = req.reranker_model or route.reranker
+    candidate_topk = max(route.chunk_top_k, req.topk)
+    if not enabled or not profile_name:
+        return False, None, profile_name, candidate_topk
+
+    rrk_registry = get_reranker_registry()
+    profile = rrk_registry.get_profile(profile_name)
+    rerank_func, _sig = rrk_registry.build_rerank_func(profile)
+    return True, rerank_func, profile.name, candidate_topk
+
+
+def _apply_search_rerank(
+    query: str,
+    hits: list[SearchHit],
+    rerank_func: Any,
+    topk: int,
+) -> list[SearchHit]:
+    """Rerank SearchHit objects with the existing Cohere-style reranker adapter.
+
+    Reranker scores are relevance scores where larger is better. We keep
+    `score` unchanged for backward compatibility with existing clients that
+    treat it as LanceDB distance, and expose the reranker score separately.
+    """
+    if not hits:
+        return []
+    docs = [hit.text or hit.title or hit.source or '' for hit in hits]
+    reranked = _asyncio.run(rerank_func(query, docs, top_n=topk))
+    ranked: list[SearchHit] = []
+    used: set[int] = set()
+    for item in reranked:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item['index'])
+            score = float(item['relevance_score'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(hits) or idx in used:
+            continue
+        hit = hits[idx]
+        hit.vectorScore = hit.score
+        hit.rerankScore = score
+        ranked.append(hit)
+        used.add(idx)
+    return ranked
+
+
 _DEFAULT_PER_CONTAINER_TIMEOUT_S = 12.0  # subprocess cold-start (py + lancedb + lightrag import) 实测 5-10s 不稳；v0.12 in-process 化后可降回 3s
 
 
 @app.post('/search', response_model=SearchResponse, dependencies=[Depends(verify_auth)])
 def search(req: SearchReq) -> SearchResponse:
     targets, union_applied = _resolve_search_targets(req)
+    rerank_enabled, rerank_func, reranker_name, candidate_topk = _resolve_search_rerank(req, targets)
 
     # 命中 0 个容器：返回空结果，但不算错误
     if not targets:
@@ -783,10 +853,14 @@ def search(req: SearchReq) -> SearchResponse:
             stderr='',
             degraded=False,
             union_applied=False,
+            rerank_applied=False,
+            reranker=None,
         )
 
     # 跨容器召回时拉宽每容器 topk，避免被某个容器全占
     per_container_topk = req.topk if len(targets) == 1 else min(req.topk * len(targets), 100)
+    if rerank_enabled:
+        per_container_topk = min(max(per_container_topk, candidate_topk), 100)
 
     # v0.11.0：per-container timeout 上限仅在多容器（union）场景启用，避免破坏单容器
     # 长查询的向后兼容（旧默认 req.timeout_s=600s）。
@@ -877,6 +951,7 @@ def search(req: SearchReq) -> SearchResponse:
     seen_keys: set[tuple[str, str]] = set()
     deduped: list[SearchHit] = []
     for hit in all_hits:
+        hit.vectorScore = hit.score
         key = (hit.taskId or '', hit.chunkId or '')
         if key == ('', ''):
             # 缺标识符 → 不参与 dedup（保留，防止吞掉合法结果）
@@ -886,7 +961,22 @@ def search(req: SearchReq) -> SearchResponse:
             continue
         seen_keys.add(key)
         deduped.append(hit)
-    merged = deduped[: req.topk]
+
+    rerank_applied = False
+    rerank_warning: str | None = None
+    if rerank_enabled and rerank_func is not None and deduped:
+        try:
+            merged = _apply_search_rerank(req.query, deduped, rerank_func, req.topk)
+            rerank_applied = True
+        except Exception as exc:  # pragma: no cover - upstream/network dependent
+            logger.warning(
+                "/search rerank failed for profile=%s; returning vector results: %s",
+                reranker_name, exc,
+            )
+            rerank_warning = f"rerank failed: {type(exc).__name__}"
+            merged = deduped[: req.topk]
+    else:
+        merged = deduped[: req.topk]
 
     has_any_ok = any(s == 'ok' for s in per_status.values())
     primary_container = targets[0] if len(targets) == 1 else (req.container if req.container in targets else targets[0])
@@ -899,6 +989,8 @@ def search(req: SearchReq) -> SearchResponse:
     message = None
     if not has_any_ok and per_status:
         message = '; '.join(f'{name}: {status}' for name, status in per_status.items())
+    elif rerank_warning:
+        message = rerank_warning
 
     return SearchResponse(
         status='ok' if has_any_ok else 'error',
@@ -914,8 +1006,10 @@ def search(req: SearchReq) -> SearchResponse:
         results=merged,
         stdout=last_stdout,
         stderr=last_stderr,
-        degraded=degraded,
+        degraded=degraded or rerank_warning is not None,
         union_applied=union_applied,
+        rerank_applied=rerank_applied,
+        reranker=reranker_name if rerank_applied else None,
     )
 
 
