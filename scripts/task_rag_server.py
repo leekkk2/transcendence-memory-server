@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
 
 from contextlib import asynccontextmanager
@@ -665,33 +665,75 @@ async def health(container: str | None = None) -> HealthResponse:
     )
 
 
-def _resolve_search_targets(req: SearchReq) -> list[str]:
+def _get_union_search_default() -> bool:
+    """从 ProfileSet 拿 union_search_default 顶层开关。
+
+    v0.11.0：单 container 查询时根据该开关决定是否自动 union sibling _openai 镜像。
+    任何加载异常都视为 false，保证旧部署 / 缺 YAML 场景不被破坏。
+    """
+    try:
+        try:
+            from embedding_registry import get_registry as _get_registry
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.embedding_registry import get_registry as _get_registry
+        return bool(_get_registry().profiles.union_search_default)
+    except Exception:
+        return False
+
+
+_OPENAI_MIRROR_SUFFIX = '_openai'
+
+
+def _resolve_search_targets(req: SearchReq) -> tuple[list[str], bool]:
     """根据 SearchReq 解析最终要查询的容器列表。
 
-    优先级：containers > container_pattern > container。
+    优先级：containers > container_pattern > container（含 v0.11.0 union 扩展）。
+    返回 (targets, union_applied)：union_applied=True 表示触发了 sibling _openai 自动追加。
     """
     if req.containers:
+        # 显式 containers list → 用户已掌控全部目标，不再触发 union 扩展
         for name in req.containers:
             validate_container_name(name)
-        # 去重保序
         seen: set[str] = set()
         ordered: list[str] = []
         for name in req.containers:
             if name not in seen:
                 ordered.append(name)
                 seen.add(name)
-        return ordered
+        return ordered, False
 
     if req.container_pattern is not None:
+        # 显式 pattern → 同上，用户已掌控
         _validate_pattern(req.container_pattern)
         names = [
             p.name for p in _list_container_dirs()
             if _match_container(p.name, req.container_pattern, req.pattern_mode)
         ]
-        return names
+        return names, False
 
     validate_container_name(req.container)
-    return [req.container]
+    main = req.container
+    targets = [main]
+
+    # v0.11.0 union 扩展：解析 union flag —— 显式优先；None 时走 ProfileSet 全局默认
+    if req.union is False:
+        return targets, False
+    union_enabled = req.union is True or (req.union is None and _get_union_search_default())
+    if not union_enabled:
+        return targets, False
+
+    # 主容器本身就是 _openai 镜像 → 不再追加（避免镜像找镜像的环）
+    if main.endswith(_OPENAI_MIRROR_SUFFIX):
+        return targets, False
+
+    # sibling 不存在 → 不追加（不查不存在的容器，避免徒增 not_initialized 噪音）
+    sibling = f'{main}{_OPENAI_MIRROR_SUFFIX}'
+    existing_names = {p.name for p in _list_container_dirs()}
+    if sibling not in existing_names:
+        return targets, False
+
+    targets.append(sibling)
+    return targets, True
 
 
 def _run_single_search(
@@ -716,9 +758,12 @@ def _run_single_search(
     return result, payload
 
 
+_DEFAULT_PER_CONTAINER_TIMEOUT_S = 3.0
+
+
 @app.post('/search', response_model=SearchResponse, dependencies=[Depends(verify_auth)])
 def search(req: SearchReq) -> SearchResponse:
-    targets = _resolve_search_targets(req)
+    targets, union_applied = _resolve_search_targets(req)
 
     # 命中 0 个容器：返回空结果，但不算错误
     if not targets:
@@ -736,10 +781,21 @@ def search(req: SearchReq) -> SearchResponse:
             results=[],
             stdout='',
             stderr='',
+            degraded=False,
+            union_applied=False,
         )
 
     # 跨容器召回时拉宽每容器 topk，避免被某个容器全占
     per_container_topk = req.topk if len(targets) == 1 else min(req.topk * len(targets), 100)
+
+    # v0.11.0：per-container timeout 上限仅在多容器（union）场景启用，避免破坏单容器
+    # 长查询的向后兼容（旧默认 req.timeout_s=600s）。
+    # 默认 3.0s 是 reranker 端到端 P50 290-330ms × 多倍 buffer 的安全上限。
+    per_container_timeout = req.per_container_timeout_s or _DEFAULT_PER_CONTAINER_TIMEOUT_S
+    if len(targets) > 1:
+        subproc_timeout = max(1, int(min(per_container_timeout, req.timeout_s)))
+    else:
+        subproc_timeout = req.timeout_s
 
     per_status: dict[str, str] = {}
     all_hits: list[SearchHit] = []
@@ -750,22 +806,41 @@ def search(req: SearchReq) -> SearchResponse:
 
     def _do(name: str) -> tuple[str, CommandResponse, dict]:
         cmd_result, payload = _run_single_search(
-            req.query, per_container_topk, name, req.timeout_s,
+            req.query, per_container_topk, name, subproc_timeout,
             embedding_override=req.embedding_model,
         )
         return name, cmd_result, payload
 
+    # 多容器走线程池 + future.result(timeout) 形成第二层 wall-clock 防线：
+    # 即使 subprocess.run 内部 timeout 卡死（罕见但发生过），主进程也能继续。
     if len(targets) == 1:
-        results_iter = [_do(targets[0])]
+        results_iter: list[tuple[str, CommandResponse, dict]] = [_do(targets[0])]
+        timed_out_names: set[str] = set()
     else:
+        results_iter = []
+        timed_out_names = set()
         with ThreadPoolExecutor(max_workers=min(len(targets), 4)) as pool:
-            futures = [pool.submit(_do, name) for name in targets]
-            results_iter = [f.result() for f in as_completed(futures)]
+            future_to_name = {pool.submit(_do, name): name for name in targets}
+            for fut in as_completed(future_to_name, timeout=None):
+                name = future_to_name[fut]
+                try:
+                    # wall-clock 略宽于 subproc，给序列化/IPC 留一点
+                    results_iter.append(fut.result(timeout=per_container_timeout + 1.0))
+                except FuturesTimeoutError:
+                    timed_out_names.add(name)
+                    fut.cancel()
+                except Exception as e:  # pragma: no cover - 防御性
+                    timed_out_names.add(name)
+                    per_status[name] = f'error: {type(e).__name__}'
 
     for name, cmd_result, payload in results_iter:
         last_command = cmd_result.command
         last_stdout = cmd_result.stdout
         last_stderr = cmd_result.stderr
+        # subprocess timeout 也算 timeout（code=124），单独标记以便客户端区分
+        if cmd_result.code == 124:
+            per_status[name] = 'timeout'
+            continue
         if cmd_result.code != 0:
             per_status[name] = f'error: exit {cmd_result.code}'
             continue
@@ -790,12 +865,36 @@ def search(req: SearchReq) -> SearchResponse:
             except Exception:  # pragma: no cover - defensive
                 continue
 
+    # 线程池 wall-clock timeout 命中但 subprocess 未返回 → 兜底标记
+    for name in timed_out_names:
+        per_status.setdefault(name, 'timeout')
+
     # LanceDB 距离越小越相关；None 视为最差
     all_hits.sort(key=lambda hit: (hit.score is None, hit.score if hit.score is not None else 0.0))
-    merged = all_hits[: req.topk]
+
+    # v0.11.0 dedup：union 同 (taskId, chunkId) 可能在两条镜像各召回一次，
+    # 保留 score 更优（更小）的那条。dedup key 不含 vector / score，避免误杀。
+    seen_keys: set[tuple[str, str]] = set()
+    deduped: list[SearchHit] = []
+    for hit in all_hits:
+        key = (hit.taskId or '', hit.chunkId or '')
+        if key == ('', ''):
+            # 缺标识符 → 不参与 dedup（保留，防止吞掉合法结果）
+            deduped.append(hit)
+            continue
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(hit)
+    merged = deduped[: req.topk]
 
     has_any_ok = any(s == 'ok' for s in per_status.values())
     primary_container = targets[0] if len(targets) == 1 else (req.container if req.container in targets else targets[0])
+
+    # v0.11.0 degraded：任一容器超时 / 失败 / 未初始化都算降级（结果不完整）
+    degraded = any(
+        status != 'ok' for status in per_status.values()
+    )
 
     message = None
     if not has_any_ok and per_status:
@@ -815,6 +914,8 @@ def search(req: SearchReq) -> SearchResponse:
         results=merged,
         stdout=last_stdout,
         stderr=last_stderr,
+        degraded=degraded,
+        union_applied=union_applied,
     )
 
 
