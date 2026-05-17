@@ -241,12 +241,12 @@ Reranker is **silent by default**. Two independent preconditions must be true:
 | Layer | Required state | Verification |
 |---|---|---|
 | **Config** | Route resolved for the request has `reranker: <name>` set AND `rerank.enabled: true`, OR the per-call request body sets `"rerank": true` | `curl $SRV/admin/profiles` shows the route's `reranker` and `rerank.enabled` |
-| **Query path** | Client called `POST /query` (not `POST /search`) | server access log shows `/query`, not `/search` |
+| **Query path** | Client called `POST /query` or `POST /search` on a release that includes `/search` rerank support | `/query` logs `Successfully reranked: ...`; `/search` response has `rerank_applied: true` |
 
 If **either** is missing, reranker silently does nothing:
 
-- `POST /search` is a direct LanceDB cosine + topk path. It never invokes a reranker, regardless of config.
 - A route with `rerank.enabled: false` (the default) only fires the reranker when the request body includes `"rerank": true`.
+- On `POST /search`, rerank happens after LanceDB recall and dedup. The response keeps the original vector distance in `vectorScore` and exposes the reranker relevance in `rerankScore`.
 
 ### Data path is not a precondition
 
@@ -262,8 +262,12 @@ Either way, the retrieved chunks are then handed to the reranker before LLM synt
 The request body field is `rerank: bool` (not `enable_rerank`). Sending an unknown key like `enable_rerank: true` is silently ignored by Pydantic — the reranker stays off, no warning emitted.
 
 ```bash
-# Correct — overrides route default
+# Correct — overrides route default for /query
 curl -X POST $SRV/query -H 'Content-Type: application/json' \
+  -d '{"container":"my-container","query":"...","rerank":true}'
+
+# Also correct for /search
+curl -X POST $SRV/search -H 'Content-Type: application/json' \
   -d '{"container":"my-container","query":"...","rerank":true}'
 
 # Wrong — silently ignored
@@ -275,8 +279,8 @@ curl -X POST $SRV/query -H 'Content-Type: application/json' \
 
 | Mode | Change | When to use |
 |---|---|---|
-| Per-request | Add `"rerank": true` to `/query` body | You already use `/query` and want it for one call |
-| Default-on for a route | Set `rerank.enabled: true` in the route's `rerank:` block in `profiles.yaml` | All `/query` traffic on that route should rerank (note: adds ~200-500 ms per call) |
+| Per-request | Add `"rerank": true` to `/query` or `/search` body | You want rerank for one call |
+| Default-on for a route | Set `rerank.enabled: true` in the route's `rerank:` block in `profiles.yaml` | All `/query` and `/search` traffic on that route should rerank (note: adds latency per call) |
 | Single-container test | Add a glob route like `{glob: "*_rerank"}` with `rerank.enabled: true`; ingest a test container ending in `_rerank` and compare | A/B testing reranker impact |
 
 ### Optional: dual-write for richer `/query` answers
@@ -296,7 +300,7 @@ curl -X POST $SRV/query -H 'Content-Type: application/json' \
 | Sudden dim mismatch on write | Per-request override targeted wrong-dim profile | only override matching-dim profiles for existing containers |
 | Backwards-incompat after upgrade | Edge case in legacy synthesis | report with `EMBEDDING_*` env dump (redact key) |
 | `/query` returns `(no answer generated)` | Either container is empty, or retrieval matched 0 chunks | check `curl /admin/system-health` for container size; widen query |
-| Reranker configured but never fires | Traffic is on `/search` (LanceDB only) | switch to `/query` for the requests you want reranked |
+| Reranker configured but never fires | Route default is off, request omitted `rerank: true`, or the deployed image predates `/search` rerank support | send `rerank: true`, enable the route default, and verify `/search` returns `rerank_applied: true` |
 | Reranker upstream returns 400 on `/v1/rerank` (`model_price_error` / `model_not_found`) | OpenAI-compat aggregator gateways only honor model ids actually registered as channels. A fabricated rerank id (an invented "reranker" name, a profile's own `name` reused as `model`, etc.) is rejected even though the gateway exposes a `/v1/rerank` endpoint. | (a) If your gateway HAS a dedicated reranker channel registered: set `rerankers[].model` to that channel's registered model id. (b) If your gateway has ONLY embedding channels: set `model` to any embedding model id you already have on the gateway — the aggregator routes `/v1/rerank` through that channel as embedding-cosine pseudo-rerank, returning valid Cohere-v2 schema. Verify before changing config: `curl POST /v1/rerank -d '{"model":"<your-embedding-model-id>","query":"x","documents":["a","b"],"top_n":2}'`. Quality bounds and when pseudo-rerank is acceptable: see `docs/operations/rerank-perf-baseline.md`. |
 | `enable_rerank` field has no effect | Wrong field name; Pydantic silently drops unknown keys | use `rerank: true` (not `enable_rerank: true`) |
 
