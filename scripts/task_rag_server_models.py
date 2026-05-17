@@ -55,6 +55,23 @@ class SearchReq(_WithModelOverride):
         description='container_pattern 的匹配模式：substring（子串）/ prefix（前缀）/ glob（fnmatch）。',
     )
     timeout_s: int = Field(default=600, ge=1, le=1800)
+    union: bool | None = Field(
+        default=None,
+        description=(
+            '单 container 入参时是否自动 union 到 sibling 镜像（X + X_openai）。'
+            'None=按 profiles.yaml 的 union_search_default 决定；True/False 显式覆盖。'
+            '当指定 containers 或 container_pattern 时本字段被忽略（用户已显式控制）。'
+        ),
+    )
+    per_container_timeout_s: float | None = Field(
+        default=None,
+        ge=0.5,
+        le=30.0,
+        description=(
+            '单容器子查询超时上限（秒）。超时容器在 per_container_status 标记 timeout，'
+            '不影响其余容器返回。None=默认 3.0s。'
+        ),
+    )
 
 
 class ContainerReq(_WithModelOverride):
@@ -138,6 +155,14 @@ class SearchResponse(BaseModel):
     results: list[SearchHit]
     stdout: str
     stderr: str
+    degraded: bool = Field(
+        default=False,
+        description='True 表示至少一个目标容器超时或失败，结果不完整但已尽力合并。',
+    )
+    union_applied: bool = Field(
+        default=False,
+        description='True 表示本次查询触发了 sibling _openai 镜像自动 union（双轨召回）。',
+    )
 
 
 class ModuleStatusResponse(BaseModel):
