@@ -121,6 +121,14 @@ class CommandResponse(BaseModel):
 
 class SearchHit(BaseModel):
     score: float | None = None
+    vectorScore: float | None = Field(
+        default=None,
+        description='Original LanceDB vector distance before rerank. Smaller is better.',
+    )
+    rerankScore: float | None = Field(
+        default=None,
+        description='Reranker relevance score when /search rerank is applied. Larger is better.',
+    )
     container: str | None = None
     taskId: str | None = None
     chunkId: str | None = None
@@ -162,6 +170,14 @@ class SearchResponse(BaseModel):
     union_applied: bool = Field(
         default=False,
         description='True 表示本次查询触发了 sibling _openai 镜像自动 union（双轨召回）。',
+    )
+    rerank_applied: bool = Field(
+        default=False,
+        description='True 表示本次 /search 结果已经经过 reranker 重排。',
+    )
+    reranker: str | None = Field(
+        default=None,
+        description='实际用于 /search 重排的 reranker profile 名称。',
     )
 
 
