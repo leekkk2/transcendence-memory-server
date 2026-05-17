@@ -10,26 +10,28 @@ version: 1
 embeddings:
   # === 用户实际场景：双 model 并存 ===
 
-  # Gemini via gemini-balance gateway (newapi) — 3072 dim, free-tier quota constrained
+  # Gemini behind an OpenAI-compatible aggregator gateway — 3072 dim
   - name: gemini-3072
     provider: openai_compatible
     model: gemini-embedding-001
     dim: 3072
-    base_url: https://newapi.zweiteng.tk/v1
-    api_key_env: GEMINI_API_KEY            # env value: sk-... (newapi key with gemini channel access)
+    base_url: https://<your-aggregator-host>/v1
+    api_key_env: GEMINI_API_KEY            # aggregator key with gemini channel access
     max_token_size: 8192
     request_dim: null                       # native 3072
     timeout_s: 60
     max_retries: 3
 
-  # OpenAI text-embedding-3-small via selfhosted-gateway (newapi channel #44) — 1024 dim
-  # Note: channel #44 reverse-mapping has been removed; this profile gets real OpenAI-compatible output.
+  # OpenAI text-embedding-3-small behind an aggregator — dim depends on gateway:
+  #   - native OpenAI returns 1536; some aggregators normalize to 1024 — verify with
+  #     `curl POST /v1/embeddings -d '{"model":"text-embedding-3-small","input":"x"}'`
+  #     then `len(response.data[0].embedding)`.
   - name: openai-small-1024
     provider: openai_compatible
     model: text-embedding-3-small
-    dim: 1024                              # ⚠ selfhosted-gateway normalizes everything to 1024, not OpenAI's native 1536
-    base_url: https://newapi.zweiteng.tk/v1
-    api_key_env: NEWAPI_API_KEY            # same newapi key works for both channels
+    dim: 1024                              # ⚠ adjust to 1536 if your aggregator returns native OpenAI dim
+    base_url: https://<your-aggregator-host>/v1
+    api_key_env: AGGREGATOR_API_KEY
     max_token_size: 8192
     timeout_s: 60
     max_retries: 3
@@ -46,12 +48,29 @@ embeddings:
     max_retries: 3
 
 rerankers:
-  # selfhosted-gateway Cohere-style reranker (newapi channel #44)
-  - name: selfhosted-bge
+  # Cohere-style reranker behind an OpenAI-compatible aggregator gateway
+  # (newapi / one-api / litellm-proxy / similar). Two scenarios:
+  #
+  #   1. Gateway HAS a real reranker channel registered (Cohere / BGE / Jina):
+  #      set `model:` to that channel's model id, e.g. `rerank-v3.5`
+  #      (Cohere), `bge-reranker-v2-m3` (BGE), `jina-reranker-v2-base`.
+  #
+  #   2. Gateway has ONLY embedding channels registered (most common with
+  #      basic aggregator setups): set `model:` to an embedding model id
+  #      such as `text-embedding-3-small`. The gateway will route
+  #      /v1/rerank to cosine-similarity-based pseudo-rerank, returning a
+  #      valid Cohere-v2 response. Works out-of-the-box without registering
+  #      a separate reranker channel. Limitation: pseudo-rerank reliably
+  #      separates "most relevant vs noise" but does not produce a true
+  #      continuous ranking like a cross-encoder (BGE / Cohere) would.
+  #
+  # Using a fabricated rerank model id like `text-reranker` will return
+  # 400 model_price_error / model_not_found on most aggregator gateways.
+  - name: aggregator-rerank
     provider: cohere_compatible
-    model: text-reranker
-    base_url: https://newapi.zweiteng.tk/v1
-    api_key_env: NEWAPI_API_KEY
+    model: text-embedding-3-small        # pseudo-rerank fallback; swap to real rerank id when available
+    base_url: https://<your-aggregator-host>/v1
+    api_key_env: AGGREGATOR_API_KEY
     timeout_s: 30
     min_score: 0.0
 
@@ -65,23 +84,33 @@ rerankers:
     min_score: 0.0
 
 routes:
-  # 示例 1: 重要 container 用 Gemini，需要时降级到 OpenAI（Phase 3 实际生效）
-  - match: {exact: imac}
+  # 示例 1: exact match + embedding fallback (same dim required by loader)
+  - match: {exact: critical-container-name}
     embedding: gemini-3072
-    embedding_fallbacks: [openai-large-3072]     # ⚠ loader 强制 dim 必须相同
-    reranker: selfhosted-bge
+    embedding_fallbacks: [openai-large-3072]     # ⚠ loader enforces dim must match
+    reranker: aggregator-rerank
     rerank: {enabled: true, chunk_top_k: 30, top_k: 8}
 
-  # 示例 2: glob 匹配某类 container
-  - match: {glob: "test-*"}
+  # 示例 2: glob 匹配某类 container（如所有 OpenAI 1024 维镜像）
+  - match: {glob: "*_openai"}
     embedding: openai-small-1024
+    reranker: aggregator-rerank                  # rerank 可用但默认关，per-request `rerank: true` 启用
+    rerank: {enabled: false}
 
-  # 示例 3: 正则
+  # 示例 3: A/B 测试 reranker 影响：以 _rerank 结尾的 container 默认开启
+  # 同 query 在 `foo` (default route, rerank off) 和 `foo_rerank` (rerank on)
+  # 对比 answer 质量 / latency 差异。
+  - match: {glob: "*_rerank"}
+    embedding: gemini-3072
+    reranker: aggregator-rerank
+    rerank: {enabled: true, chunk_top_k: 30, top_k: 8}
+
+  # 示例 4: 正则
   - match: {regex: "^v[0-9]+_.*$"}
     embedding: openai-large-3072
 
   # 兜底：所有未命中以上的 container 用 gemini-3072（必须恰好 1 个 default）
   - match: {default: true}
     embedding: gemini-3072
-    reranker: selfhosted-bge
-    rerank: {enabled: false}                   # default 不开 rerank，按需 per-call 启用
+    reranker: aggregator-rerank
+    rerank: {enabled: false}                     # default 不开 rerank，按需 per-call 启用
