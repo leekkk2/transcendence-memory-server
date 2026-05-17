@@ -410,3 +410,62 @@ routes:
     )
     with pytest.raises(ValueError, match=r"version"):
         load_profiles(str(yaml_path))
+
+
+# ---- v0.11.0：union_search_default 顶层字段 -----------------------------
+
+def test_union_search_default_absent_defaults_to_false(monkeypatch, tmp_path):
+    """YAML 不含 union_search_default 字段 → 默认 false（向后兼容）。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("K", "v")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 1
+embeddings:
+  - name: p1
+    model: m
+    dim: 8
+    base_url: https://x/v1
+    api_key_env: K
+routes:
+  - match: {default: true}
+    embedding: p1
+""",
+    )
+    ps = load_profiles(str(yaml_path))
+    assert ps.union_search_default is False
+
+
+def test_union_search_default_true_parsed(monkeypatch, tmp_path):
+    """YAML 显式 union_search_default: true → 解析为 True。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("K", "v")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 1
+union_search_default: true
+embeddings:
+  - name: p1
+    model: m
+    dim: 8
+    base_url: https://x/v1
+    api_key_env: K
+routes:
+  - match: {default: true}
+    embedding: p1
+""",
+    )
+    ps = load_profiles(str(yaml_path))
+    assert ps.union_search_default is True
+
+
+def test_union_search_default_legacy_env_is_false(monkeypatch):
+    """无 YAML（legacy env-only）→ union_search_default 必须 false（不破坏旧部署）。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("EMBEDDING_MODEL", "m")
+    monkeypatch.setenv("EMBEDDING_DIM", "8")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+    ps = load_profiles()
+    assert ps.union_search_default is False
