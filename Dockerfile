@@ -20,6 +20,7 @@
 ARG PYTHON_VERSION=3.13
 ARG PYTHON_IMAGE=python:${PYTHON_VERSION}-slim-bookworm
 ARG TM_VERSION=dev
+ARG TM_SOURCE_REV=dev
 
 # -----------------------------------------------------------------------------
 # Stage: deps  — resolve and install runtime Python deps. Cached aggressively
@@ -71,9 +72,11 @@ RUN mkdir -p /root/.cache/mineru \
 FROM ${PYTHON_IMAGE} AS runtime-base
 ARG PYTHON_VERSION
 ARG TM_VERSION
+ARG TM_SOURCE_REV
 
 LABEL org.opencontainers.image.title="transcendence-memory-server" \
       org.opencontainers.image.version="${TM_VERSION}" \
+      org.opencontainers.image.revision="${TM_SOURCE_REV}" \
       org.opencontainers.image.source="https://github.com/leekkk2/transcendence-memory-server" \
       org.opencontainers.image.licenses="MIT"
 
@@ -132,17 +135,26 @@ ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 # -----------------------------------------------------------------------------
 FROM runtime-base AS lite
 ARG PYTHON_VERSION
+ARG TM_SOURCE_REV
 ENV TM_BUILD_FLAVOR=lite
 COPY --from=deps /usr/local/lib/python${PYTHON_VERSION}/site-packages \
                  /usr/local/lib/python${PYTHON_VERSION}/site-packages
 # Selective bin copy — only entry points we actually invoke from runtime.
 COPY --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+# Copy runtime code in the final stage as well. The source revision file makes
+# this layer depend on the commit SHA, preventing remote build caches from
+# serving an older /app/scripts tree after a release tag only bumps metadata.
+RUN printf '%s\n' "$TM_SOURCE_REV" > /app/.tm-source-rev
+COPY --chown=tm:tm scripts/ ./scripts/
+COPY --chown=tm:tm src/ ./src/
+RUN chmod 755 /app/scripts/*.sh /app/scripts/*.py
 
 # -----------------------------------------------------------------------------
 # Stage: full — final image with multimodal site-packages + mineru cache.
 # -----------------------------------------------------------------------------
 FROM runtime-base AS full
 ARG PYTHON_VERSION
+ARG TM_SOURCE_REV
 ENV TM_BUILD_FLAVOR=full
 COPY --from=deps-full /usr/local/lib/python${PYTHON_VERSION}/site-packages \
                       /usr/local/lib/python${PYTHON_VERSION}/site-packages
@@ -150,3 +162,7 @@ COPY --from=deps-full /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 # mineru pre-warm cache (root-owned in builder; copy --chown to tm so the
 # unprivileged runtime user can actually read it).
 COPY --from=deps-full --chown=tm:tm /root/.cache/mineru /home/tm/.cache/mineru
+RUN printf '%s\n' "$TM_SOURCE_REV" > /app/.tm-source-rev
+COPY --chown=tm:tm scripts/ ./scripts/
+COPY --chown=tm:tm src/ ./src/
+RUN chmod 755 /app/scripts/*.sh /app/scripts/*.py
