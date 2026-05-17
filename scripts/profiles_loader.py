@@ -95,12 +95,15 @@ class ProfileSet:
 
     `routes` 是按文件顺序的 (matcher_dict, Route) 列表，resolve 时按顺序匹配。
     `default_route` 单独拎出来，避免每次 resolve 都遍历找 default。
+    `union_search_default` 是 v0.11.0 引入的顶层开关：true 时 /search 单 container
+    入参会自动追加 sibling _openai 镜像做 union（双轨召回）；缺省 false 保持旧行为。
     """
 
     embeddings: dict[str, EmbeddingProfile]
     rerankers: dict[str, RerankerProfile]
     routes: list[tuple[dict[str, Any], Route]] = field(default_factory=list)
     default_route: Route | None = None
+    union_search_default: bool = False
 
 
 def _resolve_yaml_path(yaml_path: str | None) -> Path | None:
@@ -250,11 +253,15 @@ def _load_yaml(path: Path) -> ProfileSet:
     if default_route is None:
         raise ValueError("profiles.yaml must define exactly one route with {default: true}")
 
+    # v0.11.0：顶层 union_search_default 字段，缺省 false 保持向后兼容
+    union_default = bool(doc.get("union_search_default", False))
+
     ps = ProfileSet(
         embeddings=embeddings,
         rerankers=rerankers,
         routes=routes,
         default_route=default_route,
+        union_search_default=union_default,
     )
     _validate(ps)
     return ps

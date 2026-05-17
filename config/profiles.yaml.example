@@ -7,6 +7,12 @@
 
 version: 1
 
+# v0.11.0：当客户端只指定 container=X 时，自动 union 到 sibling X_openai 镜像
+# （双轨召回，gemini + openai 同时查）。默认 false 保持向后兼容；启用前请确保
+# 已通过 clone_container_reembed.py 或 v0.12+ /admin/mirror 创建 sibling。
+# 每条请求可用 SearchReq.union: bool 显式覆盖此默认。
+union_search_default: false
+
 embeddings:
   # === Common shape: dual-profile so per-container you can pick a fast/cheap
   # embedding for high-volume containers and a higher-quality one for
