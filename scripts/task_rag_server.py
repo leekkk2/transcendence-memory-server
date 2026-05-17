@@ -408,6 +408,8 @@ def run_or_start(
     container: str = '',
     embedding_override: str | None = None,
 ) -> CommandResponse:
+    """**DEPRECATED 自 v0.10.2** — 全仓 grep 无内部调用方（合并入 _enqueue_or_run 后留下）。
+    保留签名以防外部第三方代码引用；计划 v0.11.0 删除。新代码不要使用此函数。"""
     if not Path(cmd[0]).exists():
         return CommandResponse(command=cmd, code=127, stderr=f'script not found: {cmd[0]}')
     real_cmd = [sys.executable, *cmd] if cmd[0].endswith('.py') else cmd

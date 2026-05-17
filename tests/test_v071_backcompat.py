@@ -67,7 +67,7 @@ def test_legacy_resolve_any_container_returns_default(monkeypatch):
     monkeypatch.setenv("EMBEDDING_API_KEY", "sk-x")
 
     reg = EmbeddingRegistry(load_profiles())
-    for container in ("host-z", "team", "test-foo", "v1_prod", "anything-else"):
+    for container in ("default", "my-container", "test-foo", "v1_prod", "anything-else"):
         route = reg.resolve(container)
         assert route.embedding == "legacy"
         assert route.embedding_fallbacks == ()
