@@ -342,8 +342,13 @@ async def _enforce_upload_limit(request, call_next):
 def child_env(
     embedding_override: str | None = None,
     container: str = '',
+    embed_mode: str | None = None,
 ) -> dict[str, str]:
     """子进程 env 构造。
+
+    embed_mode：P0 asymmetric retrieval —— `/search` 子进程注入
+    `TM_EMBED_MODE=query`，让 task_rag_runtime.embed_text 对 gemini-embedding-2
+    查询走 query 前缀；摄取子进程不注入 → embed_text 默认 document。
 
     embedding_override：来自 request 的 `embedding_model`。worker (task_rag_runtime)
     resolve 时若读到 `TM_EMBEDDING_PROFILE_OVERRIDE`，优先用它取代 route 默认 profile。
@@ -364,6 +369,8 @@ def child_env(
         env['TM_EMBEDDING_PROFILE_OVERRIDE'] = embedding_override
     if container:
         env['CONTAINER'] = container
+    if embed_mode:
+        env['TM_EMBED_MODE'] = embed_mode
     return env
 
 
@@ -373,6 +380,7 @@ def run(
     *,
     embedding_override: str | None = None,
     container: str = '',
+    embed_mode: str | None = None,
 ) -> CommandResponse:
     script = Path(cmd[0])
     if not script.exists():
@@ -386,7 +394,7 @@ def run(
             encoding='utf-8',
             errors='replace',
             timeout=timeout_s,
-            env=child_env(embedding_override, container=container),
+            env=child_env(embedding_override, container=container, embed_mode=embed_mode),
         )
         return CommandResponse(command=real_cmd, code=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
     except subprocess.TimeoutExpired as exc:
@@ -749,6 +757,8 @@ def _run_single_search(
         timeout_s,
         embedding_override=embedding_override,
         container=container,
+        # P0：查询侧 embedding 走 asymmetric query 前缀。
+        embed_mode='query',
     )
     try:
         payload = json.loads(result.stdout) if result.stdout.strip() else {}
@@ -826,6 +836,42 @@ def _apply_search_rerank(
         ranked.append(hit)
         used.add(idx)
     return ranked
+
+
+def _collapse_media_caption_hits(hits: list[SearchHit]) -> list[SearchHit]:
+    """P1：把 `media_caption` 兄弟行折叠回其父媒体行。
+
+    /embed-multimodal 一个媒体项落两行 —— 媒体原生向量行 + caption 文本向量行。
+    文本 query 可能两行都命中。规则：
+    - 父媒体行也在结果里 → 丢弃 caption 行，媒体行取两者较优（distance 更小）
+      的分数；caption 命中信息记入媒体行 metadata。
+    - 父媒体行未命中 → 保留 caption 行（它仍代表该媒体，metadata 带父引用）。
+
+    依赖 caption 行 metadata 的 `parent_chunk_id`（由 /embed-multimodal 写入）。
+    """
+    media_by_chunk: dict[str, SearchHit] = {}
+    for hit in hits:
+        if hit.docType != 'media_caption' and hit.chunkId:
+            media_by_chunk[hit.chunkId] = hit
+
+    out: list[SearchHit] = []
+    for hit in hits:
+        if hit.docType == 'media_caption':
+            parent_id = (hit.metadata or {}).get('parent_chunk_id')
+            parent = media_by_chunk.get(parent_id) if isinstance(parent_id, str) else None
+            if parent is not None:
+                # 媒体行取较优分数（distance 越小越相关）。
+                if hit.score is not None and (
+                    parent.score is None or hit.score < parent.score
+                ):
+                    parent.score = hit.score
+                if isinstance(parent.metadata, dict):
+                    parent.metadata['caption_hit'] = True
+                    if hit.score is not None:
+                        parent.metadata['caption_score'] = hit.score
+                continue  # caption 行折叠掉，不单独出现
+        out.append(hit)
+    return out
 
 
 _DEFAULT_PER_CONTAINER_TIMEOUT_S = 12.0  # subprocess cold-start (py + lancedb + lightrag import) 实测 5-10s 不稳；v0.12 in-process 化后可降回 3s
@@ -945,6 +991,13 @@ def search(req: SearchReq) -> SearchResponse:
         per_status.setdefault(name, 'timeout')
 
     # LanceDB 距离越小越相关；None 视为最差
+    all_hits.sort(key=lambda hit: (hit.score is None, hit.score if hit.score is not None else 0.0))
+
+    # P1 caption 混合检索去重：媒体行与其 caption 兄弟行同时命中时折叠为一条。
+    # 保留媒体行为规范结果，并取较优（distance 更小）的分数；caption 行单独命中
+    # （父媒体行未进 topk）时原样保留 —— 它仍代表该媒体，且 metadata 带父引用。
+    all_hits = _collapse_media_caption_hits(all_hits)
+    # 折叠可能下调媒体行 distance → 重新按分数排序保证 topk 正确。
     all_hits.sort(key=lambda hit: (hit.score is None, hit.score if hit.score is not None else 0.0))
 
     # v0.11.0 dedup：union 同 (taskId, chunkId) 可能在两条镜像各召回一次，
@@ -1967,13 +2020,13 @@ async def embed_multimodal(
 
     try:
         from gemini_native_embed import (
-            SUPPORTED_MIMES, embed_parts_async, guess_mime, inline_part,
-            modality_of, text_part,
+            SUPPORTED_MIMES, embed_parts_async, generate_media_caption_async,
+            guess_mime, inline_part, modality_of, text_part,
         )
     except ModuleNotFoundError:  # pragma: no cover - package import path
         from scripts.gemini_native_embed import (
-            SUPPORTED_MIMES, embed_parts_async, guess_mime, inline_part,
-            modality_of, text_part,
+            SUPPORTED_MIMES, embed_parts_async, generate_media_caption_async,
+            guess_mime, inline_part, modality_of, text_part,
         )
     mime = guess_mime(filename, file.content_type)
     if mime not in SUPPORTED_MIMES:
@@ -1983,26 +2036,39 @@ async def embed_multimodal(
                     f'supported: {sorted(SUPPORTED_MIMES)}'),
         )
 
-    parts = [inline_part(mime, raw)]
-    if caption:
-        parts.append(text_part(caption))
+    # 媒体原生多模态向量 —— 媒体 part 直接 embed，不套任何文本前缀（P0）。
     try:
-        vector = await embed_parts_async(profile, parts)
+        vector = await embed_parts_async(profile, [inline_part(mime, raw)])
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(
             status_code=502, detail=f'gemini multimodal embed failed: {str(exc)[:300]}')
 
+    # P1 caption 混合检索：经 Gemini relay VLM 为媒体生成文字 caption。
+    # best-effort —— caption 链路失败不阻塞媒体行落库（媒体原生向量仍可检回）。
+    # 用户显式 caption 优先于自动生成（用户最了解语境）。
+    vlm_caption: str | None = None
+    if not caption:
+        try:
+            vlm_caption = await generate_media_caption_async(profile, mime, raw)
+        except Exception as exc:
+            logger.warning(
+                'embed-multimodal caption generation failed for %r: %s',
+                filename, str(exc)[:200])
+    effective_caption = caption or vlm_caption
+    caption_source = 'user' if caption else ('vlm' if vlm_caption else 'none')
+
     stable = doc_id or f'mm-{hashlib.sha1(f"{container}/{filename}".encode()).hexdigest()[:16]}'
     modality = modality_of(mime)
-    row = {
-        'chunkId': f'{stable}#multimodal',
+    media_chunk_id = f'{stable}#multimodal'
+    media_row = {
+        'chunkId': media_chunk_id,
         'taskId': stable,
         'docType': 'multimodal',
         'sourcePath': filename,
         'section': modality,
-        'text': caption or filename,
+        'text': effective_caption or filename,
         'title': filename,
         'source': 'embed-multimodal',
         'tags': [modality],
@@ -2011,24 +2077,69 @@ async def embed_multimodal(
             'mime_type': mime,
             'size_bytes': len(raw),
             'filename': filename,
-            'caption': caption or '',
+            'caption': effective_caption or '',
+            'caption_source': caption_source,
         },
         'embedding_model': profile.model,
         'embedding_dim': int(len(vector)),
         'embedding_profile': profile.name,
         'vector': vector.tolist(),
     }
+    rows = [media_row]
+
+    # caption 兄弟行：caption 经 document 侧文本 embedding 存为同容器另一行，
+    # 关联父媒体行 id。文本 query 既能命中媒体原生向量、又能命中 caption 文本
+    # 向量 —— 双表征闭合模态间隙。caption embedding 失败同样 best-effort。
+    caption_chunk_id: str | None = None
+    if effective_caption:
+        try:
+            cap_vec = await embed_parts_async(
+                profile, [text_part(effective_caption)],
+                mode='document', title=filename,
+            )
+            caption_chunk_id = f'{stable}#caption'
+            rows.append({
+                'chunkId': caption_chunk_id,
+                'taskId': stable,
+                'docType': 'media_caption',
+                'sourcePath': filename,
+                'section': modality,
+                'text': effective_caption,
+                'title': filename,
+                'source': 'embed-multimodal-caption',
+                'tags': [modality, 'caption'],
+                'metadata': {
+                    'modality': modality,
+                    'mime_type': mime,
+                    'caption_source': caption_source,
+                    # /search 去重靠这两个父引用把 caption 行折叠回媒体行。
+                    'parent_chunk_id': media_chunk_id,
+                    'parent_doc_id': stable,
+                },
+                'embedding_model': profile.model,
+                'embedding_dim': int(len(cap_vec)),
+                'embedding_profile': profile.name,
+                'vector': cap_vec.tolist(),
+            })
+        except Exception as exc:
+            logger.warning(
+                'embed-multimodal caption embedding failed for %r: %s',
+                filename, str(exc)[:200])
+
     try:
         from task_rag_lancedb_ingest import ingest_precomputed_rows
     except ModuleNotFoundError:  # pragma: no cover - package import path
         from scripts.task_rag_lancedb_ingest import ingest_precomputed_rows
-    summary = ingest_precomputed_rows(container, [row])
+    summary = ingest_precomputed_rows(container, rows)
 
     return {
         'status': 'ok',
         'container': container,
         'doc_id': stable,
-        'chunk_id': row['chunkId'],
+        'chunk_id': media_chunk_id,
+        'caption_chunk_id': caption_chunk_id,
+        'caption': effective_caption or '',
+        'caption_source': caption_source,
         'modality': modality,
         'mime_type': mime,
         'size_bytes': len(raw),

@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import logging
 import mimetypes
+import os
 import random
 import time
 from typing import Any
@@ -99,6 +100,50 @@ def inline_part(mime: str, raw: bytes) -> dict[str, Any]:
     }
 
 
+# ---- asymmetric retrieval prefix（P0）-----------------------------------
+# gemini-embedding-2 是指令微调模型，**不支持** `task_type` 参数 —— 必须用提示词
+# 前缀对齐查询/文档语义。缺前缀时检索精度（尤其「文本查媒体」）明显下降。
+# 来源：ai.google.dev/gemini-api/docs/embeddings。
+_QUERY_TASK = 'search result'
+
+
+def query_text(text: str) -> str:
+    """查询侧文本 —— 套 asymmetric query 前缀。"""
+    return f'task: {_QUERY_TASK} | query: {text}'
+
+
+def document_text(text: str, title: str | None = None) -> str:
+    """文档侧文本 —— 套 asymmetric document 前缀；title 缺省填 none。"""
+    return f"title: {title or 'none'} | text: {text}"
+
+
+def _apply_retrieval_mode(
+    parts: list[dict[str, Any]], mode: str | None, title: str | None,
+) -> list[dict[str, Any]]:
+    """按 mode 给 text part 套 asymmetric retrieval 前缀。
+
+    - mode='query'      → text part 包 query 前缀
+    - mode='document'   → text part 包 document 前缀
+    - mode=None/'media' → 原样返回（媒体直 embed，或调用方已自行格式化）
+
+    `inline_data` 媒体 part 在任何 mode 下都原样保留 —— 官方未定义媒体侧前缀，
+    闭合「文本查媒体」差距靠的是查询侧带前缀（见接入指南 §2.1）。
+    """
+    if mode in (None, 'media'):
+        return parts
+    if mode not in ('query', 'document'):
+        raise ValueError(f'unknown embedding mode {mode!r} (expect query|document)')
+    out: list[dict[str, Any]] = []
+    for part in parts:
+        if isinstance(part, dict) and 'text' in part and 'inline_data' not in part:
+            raw = part['text']
+            wrapped = query_text(raw) if mode == 'query' else document_text(raw, title)
+            out.append({'text': wrapped})
+        else:
+            out.append(part)
+    return out
+
+
 def _model_path(model: str) -> str:
     """Gemini API 要求 model 形如 `models/<id>`；已带前缀则原样返回。"""
     return model if model.startswith('models/') else f'models/{model}'
@@ -165,14 +210,19 @@ def _backoff(attempt: int) -> float:
     return max(0.5, base + base * random.uniform(-0.25, 0.25))
 
 
-def embed_parts_sync(profile: Any, parts: list[dict[str, Any]]) -> np.ndarray:
+def embed_parts_sync(
+    profile: Any, parts: list[dict[str, Any]],
+    mode: str | None = None, title: str | None = None,
+) -> np.ndarray:
     """单 content embedding —— worker subprocess 同步路径（requests）。
 
     parts 可含 text / inline_data，混合即多模态联合 embedding。
-    返回 1-D ndarray (dim,)。
+    mode（query|document）非空时给 text part 套 asymmetric 前缀（P0）；
+    inline_data 媒体 part 不受影响。返回 1-D ndarray (dim,)。
     """
     import requests
 
+    parts = _apply_retrieval_mode(parts, mode, title)
     url = _endpoint(profile.base_url, profile.model, 'embedContent')
     body = _single_body(profile, parts)
     headers = _headers(profile.api_key)
@@ -202,12 +252,20 @@ def embed_parts_sync(profile: Any, parts: list[dict[str, Any]]) -> np.ndarray:
     )
 
 
-async def embed_parts_async(profile: Any, parts: list[dict[str, Any]]) -> np.ndarray:
-    """单 content embedding —— server 端点 async 路径（httpx）。返回 1-D ndarray。"""
+async def embed_parts_async(
+    profile: Any, parts: list[dict[str, Any]],
+    mode: str | None = None, title: str | None = None,
+) -> np.ndarray:
+    """单 content embedding —— server 端点 async 路径（httpx）。
+
+    mode（query|document）非空时给 text part 套 asymmetric 前缀（P0）；
+    inline_data 媒体 part 不受影响。返回 1-D ndarray。
+    """
     import asyncio
 
     import httpx
 
+    parts = _apply_retrieval_mode(parts, mode, title)
     url = _endpoint(profile.base_url, profile.model, 'embedContent')
     body = _single_body(profile, parts)
     headers = _headers(profile.api_key)
@@ -234,10 +292,15 @@ async def embed_parts_async(profile: Any, parts: list[dict[str, Any]]) -> np.nda
     )
 
 
-async def embed_texts_async(profile: Any, texts: list[str]) -> np.ndarray:
+async def embed_texts_async(
+    profile: Any, texts: list[str],
+    mode: str | None = None, title: str | None = None,
+) -> np.ndarray:
     """批量纯文本 embedding —— registry fallback chain / probe 走这条。
 
-    用 batchEmbedContents 一次 HTTP 调用拿 n 条向量。返回 ndarray (n, dim)。
+    用 batchEmbedContents 一次 HTTP 调用拿 n 条向量。mode 非空时给每条文本套
+    asymmetric 前缀（P0）；registry/LightRAG 路径不传 mode，保持既有行为。
+    返回 ndarray (n, dim)。
     """
     import asyncio
 
@@ -246,7 +309,12 @@ async def embed_texts_async(profile: Any, texts: list[str]) -> np.ndarray:
     if not texts:
         return np.zeros((0, profile.dim), dtype='float32')
     url = _endpoint(profile.base_url, profile.model, 'batchEmbedContents')
-    body = {'requests': [_single_body(profile, [text_part(t)]) for t in texts]}
+    body = {
+        'requests': [
+            _single_body(profile, _apply_retrieval_mode([text_part(t)], mode, title))
+            for t in texts
+        ],
+    }
     headers = _headers(profile.api_key)
     last_err: Exception | None = None
     async with httpx.AsyncClient(timeout=profile.timeout_s) as client:
@@ -268,4 +336,89 @@ async def embed_texts_async(profile: Any, texts: list[str]) -> np.ndarray:
                 await asyncio.sleep(_backoff(attempt))
     raise RuntimeError(
         f'gemini batchEmbedContents failed after {profile.max_retries} retries: {last_err}'
+    )
+
+
+# ---- 媒体 caption 生成（P1 caption 混合检索）----------------------------
+# 经 Gemini relay（gemini-balance）调 vision-capable chat 模型为媒体生成文字
+# caption；caption 再走 document 文本 embedding 存为兄弟行，闭合「文本查媒体」
+# 的模态间隙。复用 embedding profile 的 base_url + api_key（同一 relay、同一
+# 鉴权 token），避开独立 VLM 网关的可用性风险。VLM 模型 id 可经 env 覆盖。
+_DEFAULT_CAPTION_MODEL = os.environ.get('GE2_CAPTION_VLM_MODEL', 'gemini-2.5-flash-lite')
+
+_CAPTION_PROMPT = (
+    'Describe this media concisely and factually for search retrieval. '
+    'Cover the key visible or audible content: objects, people, actions, '
+    'on-screen or spoken text, and setting. Output only the description '
+    'itself with no preamble. Keep it under 80 words.'
+)
+
+
+def _generate_content_endpoint(base_url: str, model: str) -> str:
+    """拼 Gemini 原生 generateContent 端点 URL。"""
+    return f"{base_url.rstrip('/')}/v1beta/{_model_path(model)}:generateContent"
+
+
+def _parse_caption(data: dict[str, Any]) -> str:
+    """解析 generateContent 响应 `{"candidates":[{"content":{"parts":[...]}}]}`。"""
+    try:
+        parts = data['candidates'][0]['content']['parts']
+    except (KeyError, IndexError, TypeError):
+        raise ValueError(
+            f'gemini generateContent response missing candidates: {str(data)[:200]}'
+        )
+    texts = [p.get('text', '') for p in parts if isinstance(p, dict) and p.get('text')]
+    caption = ' '.join(t.strip() for t in texts if t.strip()).strip()
+    if not caption:
+        raise ValueError('gemini generateContent returned empty caption')
+    return caption
+
+
+async def generate_media_caption_async(
+    profile: Any, mime: str, raw: bytes,
+    model: str | None = None, prompt: str | None = None,
+) -> str:
+    """经 Gemini relay 为媒体生成文字 caption（vision chat）。
+
+    复用 `profile.base_url`（relay 主机根）+ `profile.api_key`（relay token），
+    与 embedding 同一 relay、同一鉴权。返回 caption 文本；上游失败抛异常，
+    调用方按 best-effort 处理（caption 失败不应阻塞媒体行落库）。
+    """
+    import asyncio
+
+    import httpx
+
+    vlm_model = model or _DEFAULT_CAPTION_MODEL
+    url = _generate_content_endpoint(profile.base_url, vlm_model)
+    headers = _headers(profile.api_key)
+    body = {
+        'contents': [{
+            'parts': [
+                inline_part(mime, raw),
+                text_part(prompt or _CAPTION_PROMPT),
+            ],
+        }],
+        # 低温度求事实性、稳定的检索用描述；256 token 足够 80 词以内的 caption。
+        'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 256},
+    }
+    last_err: Exception | None = None
+    async with httpx.AsyncClient(timeout=profile.timeout_s) as client:
+        for attempt in range(profile.max_retries):
+            try:
+                resp = await client.post(url, json=body, headers=headers)
+                if _retryable(resp.status_code):
+                    last_err = RuntimeError(
+                        f'gemini caption upstream {resp.status_code}: {resp.text[:200]!r}')
+                elif resp.status_code >= 400:
+                    resp.raise_for_status()
+                else:
+                    return _parse_caption(resp.json())
+            except httpx.HTTPStatusError:
+                raise
+            except (httpx.TransportError, ValueError) as exc:
+                last_err = exc
+            if attempt < profile.max_retries - 1:
+                await asyncio.sleep(_backoff(attempt))
+    raise RuntimeError(
+        f'gemini generateContent failed after {profile.max_retries} retries: {last_err}'
     )

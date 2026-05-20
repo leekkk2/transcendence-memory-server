@@ -207,3 +207,101 @@ def test_embed_texts_async_batch(monkeypatch):
 def test_embed_texts_async_empty_shortcuts():
     out = asyncio.run(gne.embed_texts_async(_Profile(), []))
     assert out.shape == (0, 3072)
+
+
+# ---- P0：asymmetric retrieval prefix ------------------------------------
+
+def test_query_text_prefix():
+    assert gne.query_text("猫在哪") == "task: search result | query: 猫在哪"
+
+
+def test_document_text_prefix():
+    assert gne.document_text("body", "T") == "title: T | text: body"
+    assert gne.document_text("body") == "title: none | text: body"
+
+
+def test_apply_retrieval_mode_query_wraps_text_only():
+    parts = [gne.text_part("q"), gne.inline_part("image/png", b"x")]
+    out = gne._apply_retrieval_mode(parts, "query", None)
+    assert out[0] == {"text": "task: search result | query: q"}
+    # 媒体 part 任何 mode 都原样保留
+    assert out[1] == parts[1]
+
+
+def test_apply_retrieval_mode_document_uses_title():
+    out = gne._apply_retrieval_mode([gne.text_part("c")], "document", "doc.pdf")
+    assert out[0] == {"text": "title: doc.pdf | text: c"}
+
+
+def test_apply_retrieval_mode_none_and_media_passthrough():
+    parts = [gne.text_part("c")]
+    assert gne._apply_retrieval_mode(parts, None, None) == parts
+    assert gne._apply_retrieval_mode(parts, "media", None) == parts
+
+
+def test_apply_retrieval_mode_rejects_unknown():
+    with pytest.raises(ValueError):
+        gne._apply_retrieval_mode([gne.text_part("c")], "bogus", None)
+
+
+def test_embed_parts_sync_applies_query_prefix(monkeypatch):
+    import requests
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["body"] = json
+        return _Resp(200, {"embedding": {"values": [0.1] * 3072}})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    gne.embed_parts_sync(_Profile(), [gne.text_part("hello")], mode="query")
+    assert captured["body"]["content"]["parts"] == [
+        {"text": "task: search result | query: hello"}
+    ]
+
+
+def test_embed_texts_async_applies_document_prefix(monkeypatch):
+    import httpx
+    _FakeAsyncClient.responses = [
+        _Resp(200, {"embeddings": [{"values": [1.0]}]})
+    ]
+    _FakeAsyncClient.sent = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    asyncio.run(gne.embed_texts_async(_Profile(), ["body"], mode="document", title="T"))
+    req0 = _FakeAsyncClient.sent[0]["json"]["requests"][0]
+    assert req0["content"]["parts"] == [{"text": "title: T | text: body"}]
+
+
+# ---- P1：媒体 caption 生成 ----------------------------------------------
+
+def test_parse_caption_ok_and_errors():
+    data = {"candidates": [{"content": {"parts": [{"text": "a cat"}]}}]}
+    assert gne._parse_caption(data) == "a cat"
+    with pytest.raises(ValueError):
+        gne._parse_caption({"candidates": []})
+    with pytest.raises(ValueError):
+        gne._parse_caption({"candidates": [{"content": {"parts": [{"text": ""}]}}]})
+
+
+def test_generate_caption_endpoint():
+    url = gne._generate_content_endpoint("https://relay.test", "gemini-2.5-flash-lite")
+    assert url == (
+        "https://relay.test/v1beta/models/gemini-2.5-flash-lite:generateContent"
+    )
+
+
+def test_generate_media_caption_async_success(monkeypatch):
+    import httpx
+    _FakeAsyncClient.responses = [
+        _Resp(200, {"candidates": [{"content": {"parts": [{"text": "a red car"}]}}]})
+    ]
+    _FakeAsyncClient.sent = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    cap = asyncio.run(
+        gne.generate_media_caption_async(_Profile(), "image/jpeg", b"bytes")
+    )
+    assert cap == "a red car"
+    sent = _FakeAsyncClient.sent[0]
+    assert sent["url"].endswith(":generateContent")
+    # 媒体 part + prompt part
+    parts = sent["json"]["contents"][0]["parts"]
+    assert "inline_data" in parts[0] and "text" in parts[1]

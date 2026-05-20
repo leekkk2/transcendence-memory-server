@@ -515,7 +515,10 @@ def rebuild_rows(
     for row in fresh_rows:
         item = _normalize_row(row, container)
         try:
-            item['vector'] = embed_text(item['text']).tolist()
+            # P0：文本文档摄取走 document 侧 asymmetric 前缀（title 一并带入）。
+            item['vector'] = embed_text(
+                item['text'], mode='document', title=item.get('title'),
+            ).tolist()
             _annotate_embedding_meta(item, embedding_meta)
             pacer.on_success()
             consecutive_fails = 0
@@ -554,7 +557,10 @@ def rebuild_rows(
             row = entry['row']
             item = _normalize_row(row, container)
             try:
-                item['vector'] = embed_text(item['text']).tolist()
+                # P0：document 侧前缀（与 pass1 一致）。
+                item['vector'] = embed_text(
+                    item['text'], mode='document', title=item.get('title'),
+                ).tolist()
                 _annotate_embedding_meta(item, embedding_meta)
                 buf.append(item)
                 ingested += 1
