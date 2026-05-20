@@ -41,7 +41,7 @@ class EmbeddingProfile:
     """单个 embedding provider 配置。frozen 防止运行期被改。"""
 
     name: str
-    provider: str  # 当前仅 "openai_compatible"
+    provider: str  # "openai_compatible"（/v1/embeddings 纯文本）| "gemini_native"（:embedContent 原生多模态）
     model: str
     dim: int
     base_url: str

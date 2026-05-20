@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import hashlib
 import importlib.util
 import json
 import logging
@@ -1899,6 +1900,143 @@ async def ingest_document_file(
         answer=f'Document {filename} ({total} bytes) ingested into container {container}.',
         mode='insert',
     )
+
+
+_EMBED_MM_MAX_BYTES = int(os.environ.get('EMBED_MM_MAX_BYTES', str(20 * 1024 * 1024)))
+
+
+def _resolve_gemini_native_profile(container: str):
+    """解析 container 路由 → embedding profile，强制要求 gemini_native provider。
+
+    多模态 embedding 只能走 Gemini 原生 :embedContent 协议；命中非 gemini_native
+    的 profile（如 openai_compatible）直接 400，不静默降级。
+    """
+    try:
+        from embedding_registry import get_registry
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.embedding_registry import get_registry
+    try:
+        reg = get_registry()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'failed to load profiles: {exc}')
+    route = reg.resolve(container)
+    profile = reg.get_profile(route.embedding)
+    if profile.provider != 'gemini_native':
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f'container {container!r} routes to embedding profile '
+                f'{profile.name!r} (provider={profile.provider!r}); multimodal '
+                'ingest requires a gemini_native profile (e.g. gemini-embedding-2). '
+                'Add a profiles.yaml route for this container first.'
+            ),
+        )
+    return profile
+
+
+@app.post('/embed-multimodal', dependencies=[Depends(verify_auth)])
+async def embed_multimodal(
+    container: str = Form(...),
+    file: UploadFile = File(...),
+    caption: str | None = Form(default=None),
+    doc_id: str | None = Form(default=None),
+) -> dict:
+    """单个媒体文件 → gemini-embedding-2 原生多模态 embedding → 一条 LanceDB 向量行。
+
+    与 /documents/file 的区别：/documents/file 走 RAGAnything + mineru 解析 +
+    LightRAG 知识图谱（图片靠 VLM 转写，无音 / 视频路径）；本端点把媒体原始
+    字节直接经 Gemini 原生 :embedContent 算成统一向量空间的向量，一个媒体项
+    落一条 chunks 行，/search 即可向量检回 —— 路径最短，不与旧多模态管线纠缠。
+
+    要求目标 container 路由命中的 embedding profile 为 gemini_native provider。
+    caption 可选：给出时与媒体作为联合 part 一起送入 embedContent，并作为该行
+    可读文本；缺省时文本回退为文件名。
+    """
+    validate_container_name(container)
+    filename = _sanitize_upload_filename(file.filename)
+    profile = _resolve_gemini_native_profile(container)
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail='uploaded file is empty')
+    if len(raw) > _EMBED_MM_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f'media exceeds inline embed limit {_EMBED_MM_MAX_BYTES} bytes',
+        )
+
+    try:
+        from gemini_native_embed import (
+            SUPPORTED_MIMES, embed_parts_async, guess_mime, inline_part,
+            modality_of, text_part,
+        )
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.gemini_native_embed import (
+            SUPPORTED_MIMES, embed_parts_async, guess_mime, inline_part,
+            modality_of, text_part,
+        )
+    mime = guess_mime(filename, file.content_type)
+    if mime not in SUPPORTED_MIMES:
+        raise HTTPException(
+            status_code=415,
+            detail=(f'unsupported media type {mime!r} for {filename!r}; '
+                    f'supported: {sorted(SUPPORTED_MIMES)}'),
+        )
+
+    parts = [inline_part(mime, raw)]
+    if caption:
+        parts.append(text_part(caption))
+    try:
+        vector = await embed_parts_async(profile, parts)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail=f'gemini multimodal embed failed: {str(exc)[:300]}')
+
+    stable = doc_id or f'mm-{hashlib.sha1(f"{container}/{filename}".encode()).hexdigest()[:16]}'
+    modality = modality_of(mime)
+    row = {
+        'chunkId': f'{stable}#multimodal',
+        'taskId': stable,
+        'docType': 'multimodal',
+        'sourcePath': filename,
+        'section': modality,
+        'text': caption or filename,
+        'title': filename,
+        'source': 'embed-multimodal',
+        'tags': [modality],
+        'metadata': {
+            'modality': modality,
+            'mime_type': mime,
+            'size_bytes': len(raw),
+            'filename': filename,
+            'caption': caption or '',
+        },
+        'embedding_model': profile.model,
+        'embedding_dim': int(len(vector)),
+        'embedding_profile': profile.name,
+        'vector': vector.tolist(),
+    }
+    try:
+        from task_rag_lancedb_ingest import ingest_precomputed_rows
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.task_rag_lancedb_ingest import ingest_precomputed_rows
+    summary = ingest_precomputed_rows(container, [row])
+
+    return {
+        'status': 'ok',
+        'container': container,
+        'doc_id': stable,
+        'chunk_id': row['chunkId'],
+        'modality': modality,
+        'mime_type': mime,
+        'size_bytes': len(raw),
+        'embedding_profile': profile.name,
+        'embedding_model': profile.model,
+        'embedding_dim': int(len(vector)),
+        **summary,
+    }
 
 
 @app.post('/query', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
