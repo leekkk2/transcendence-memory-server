@@ -130,7 +130,9 @@ def _resolve_profile_for_worker():
     return registry.get_profile(registry._profiles.default_route.embedding)
 
 
-def embed_text(text: str) -> np.ndarray:
+def embed_text(
+    text: str, mode: str | None = None, title: str | None = None,
+) -> np.ndarray:
     """单条文本 embedding 调用，专供 worker 使用。
 
     路由：CONTAINER env -> registry.resolve -> profile -> /embeddings 调用。
@@ -140,8 +142,16 @@ def embed_text(text: str) -> np.ndarray:
     provider == 'gemini_native' 时改走 Gemini 原生 `:embedContent` 协议
     （单 text part）—— 与多模态摄取走同一向量空间，保证 /search 查询向量
     与已存媒体向量可比。
+
+    P0 asymmetric retrieval：`mode`（query|document）控制 gemini-embedding-2
+    的提示词前缀。优先级 = 显式参数 > `TM_EMBED_MODE` env > 'document'。
+    `/search` 子进程注入 `TM_EMBED_MODE=query`，摄取子进程不注入 → document。
+    openai_compatible provider 是对称模型，mode 对其为 no-op。
     """
     profile = _resolve_profile_for_worker()
+
+    # 显式参数最高优先；其次 env（server 端按调用语义注入）；兜底 document。
+    effective_mode = mode or os.environ.get('TM_EMBED_MODE') or 'document'
 
     if getattr(profile, 'provider', '') == 'gemini_native':
         try:
@@ -151,7 +161,9 @@ def embed_text(text: str) -> np.ndarray:
                 embed_parts_sync,
                 text_part,
             )
-        return embed_parts_sync(profile, [text_part(text)])
+        return embed_parts_sync(
+            profile, [text_part(text)], mode=effective_mode, title=title,
+        )
 
     api_key = profile.api_key
     if not api_key:

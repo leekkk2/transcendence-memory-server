@@ -330,3 +330,45 @@ def test_union_e2e_explicit_false_skips(tmp_path, monkeypatch):
         body = sr.json()
         assert body["union_applied"] is False, body
         assert body["containers"] == [CONTAINER_MAIN], body
+
+
+# =============================================================================
+# P1 — _collapse_media_caption_hits：媒体行 / caption 兄弟行折叠
+# =============================================================================
+
+def _mk_hit(server, chunk_id, *, doc_type=None, score=None, parent=None):
+    """SearchHit factory for caption-collapse unit tests."""
+    from scripts.task_rag_server_models import SearchHit
+    meta = {"parent_chunk_id": parent} if parent else {}
+    return SearchHit(chunkId=chunk_id, taskId="T", docType=doc_type,
+                     score=score, metadata=meta)
+
+
+def test_collapse_caption_folds_into_parent(server_module):
+    """媒体行 + caption 行同时命中 → caption 折叠，媒体行取较优分数。"""
+    media = _mk_hit(server_module, "T#multimodal", doc_type="multimodal", score=0.40)
+    cap = _mk_hit(server_module, "T#caption", doc_type="media_caption",
+                  score=0.18, parent="T#multimodal")
+    out = server_module._collapse_media_caption_hits([cap, media])
+    assert len(out) == 1
+    assert out[0].chunkId == "T#multimodal"
+    assert out[0].score == 0.18  # 取较优（更小 distance）
+    assert out[0].metadata.get("caption_hit") is True
+
+
+def test_collapse_caption_kept_when_parent_absent(server_module):
+    """父媒体行未命中 → caption 行原样保留。"""
+    cap = _mk_hit(server_module, "T#caption", doc_type="media_caption",
+                  score=0.2, parent="T#multimodal")
+    out = server_module._collapse_media_caption_hits([cap])
+    assert len(out) == 1
+    assert out[0].chunkId == "T#caption"
+
+
+def test_collapse_caption_keeps_better_media_score(server_module):
+    """媒体行分数已优于 caption → 不下调。"""
+    media = _mk_hit(server_module, "T#multimodal", doc_type="multimodal", score=0.10)
+    cap = _mk_hit(server_module, "T#caption", doc_type="media_caption",
+                  score=0.50, parent="T#multimodal")
+    out = server_module._collapse_media_caption_hits([media, cap])
+    assert len(out) == 1 and out[0].score == 0.10
