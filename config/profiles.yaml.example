@@ -58,6 +58,29 @@ embeddings:
     timeout_s: 60
     max_retries: 3
 
+  # Optional: gemini_native provider — Google Gemini 原生 :embedContent 协议。
+  # 用于原生多模态 embedding（文本 + 图片/PDF/视频/音频 → 统一向量空间），
+  # 这是 /embed-multimodal 端点的前置要求；openai_compatible 的 /v1/embeddings
+  # 只能处理纯文本，无法做多模态。
+  #
+  # 关键差异 vs openai_compatible：
+  #   - base_url 填 Gemini relay（gemini-balance 等）的「主机根」，
+  #     **不带** /v1beta、**不带** /v1。代码自动拼
+  #     {base_url}/v1beta/models/{model}:embedContent。
+  #   - 鉴权用 x-goog-api-key header（api_key_env 引用的 token）。
+  #   - request_dim 非空时透传 output_dimensionality（MRL 维度裁剪）；
+  #     缺省 null = 模型原生维度（gemini-embedding-2 为 3072）。
+  - name: gemini-embedding-2
+    provider: gemini_native
+    model: gemini-embedding-2               # body 内自动补成 models/gemini-embedding-2
+    dim: 3072                               # 原生多模态统一维度
+    base_url: https://<your-gemini-relay-host>   # 主机根，不带 /v1beta
+    api_key_env: GEMINI_RELAY_TOKEN         # gemini relay 的 ALLOWED_TOKENS 之一
+    max_token_size: 8192
+    request_dim: null                       # null = 原生 3072 维
+    timeout_s: 120                          # 多模态（视频/音频）单请求偏慢，留足
+    max_retries: 3
+
 rerankers:
   # Cohere-style reranker, served via an OpenAI-compatible aggregator gateway
   # (e.g. newapi / one-api / litellm-proxy). The reranker `model` field below
@@ -128,6 +151,15 @@ routes:
   # 示例 4: 正则
   - match: {regex: "^v[0-9]+_.*$"}
     embedding: direct-provider-fallback
+
+  # 示例 5: 原生多模态 embedding 容器 — 路由到 gemini_native profile。
+  # ⚠ 多模态向量空间与 openai_compatible 文本向量不兼容（即使同 3072 维），
+  #   且 LanceDB 表维度首次写入即锁定 —— 必须用**全新独立 container**承接，
+  #   不要把 gemini_native route 指到已有文本容器。该容器同时支持：
+  #     - POST /embed-multimodal  上传图片/PDF/视频/音频 → 一条向量行
+  #     - POST /search            文本 query 经同 profile 算向量后检回
+  - match: {exact: ge2-test}
+    embedding: gemini-embedding-2
 
   # 兜底：所有未命中以上的 container 用主 embedding 配置（必须恰好 1 个 default）
   - match: {default: true}

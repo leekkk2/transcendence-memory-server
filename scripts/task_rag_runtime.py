@@ -136,8 +136,22 @@ def embed_text(text: str) -> np.ndarray:
     路由：CONTAINER env -> registry.resolve -> profile -> /embeddings 调用。
     fallback：若 profile.api_key 以 'AIza' 开头（个人 Google API Key），
     在 OpenAI-style 调用全部失败后改走 Google native endpoint。
+
+    provider == 'gemini_native' 时改走 Gemini 原生 `:embedContent` 协议
+    （单 text part）—— 与多模态摄取走同一向量空间，保证 /search 查询向量
+    与已存媒体向量可比。
     """
     profile = _resolve_profile_for_worker()
+
+    if getattr(profile, 'provider', '') == 'gemini_native':
+        try:
+            from gemini_native_embed import embed_parts_sync, text_part  # type: ignore[import-not-found]
+        except ImportError:  # pragma: no cover - package import path
+            from scripts.gemini_native_embed import (  # type: ignore[import-not-found]
+                embed_parts_sync,
+                text_part,
+            )
+        return embed_parts_sync(profile, [text_part(text)])
 
     api_key = profile.api_key
     if not api_key:

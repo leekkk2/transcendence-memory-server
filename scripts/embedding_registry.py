@@ -266,7 +266,17 @@ async def _http_embed_single(
     与 v0.8.0 _http_embed 行为一致，仅改名 _http_embed_single 以便上层
     fallback chain 区分「profile 级 retry」与「cross-profile fallback」。
     request_dim 非 None 时透传 OpenAI `dimensions` 字段（Matryoshka）。
+
+    provider == "gemini_native" 时改走 Gemini 原生 `:embedContent` 协议
+    （batchEmbedContents 批量），其余保持 OpenAI-compatible `/v1/embeddings`。
     """
+    if profile.provider == 'gemini_native':
+        try:
+            from gemini_native_embed import embed_texts_async  # type: ignore[import-not-found]
+        except ImportError:  # pragma: no cover - package import path
+            from scripts.gemini_native_embed import embed_texts_async  # type: ignore[import-not-found]
+        return await embed_texts_async(profile, texts)
+
     url = f"{profile.base_url.rstrip('/')}/embeddings"
     headers = {"Authorization": f"Bearer {profile.api_key}"}
     payload: dict[str, Any] = {"model": profile.model, "input": texts}

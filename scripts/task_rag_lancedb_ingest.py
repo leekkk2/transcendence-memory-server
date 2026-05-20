@@ -616,6 +616,52 @@ def rebuild_rows(
     }
 
 
+def ingest_precomputed_rows(
+    container: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, int]:
+    """把已自带 `vector` 的 row 直接 upsert 进 LanceDB chunks 表。
+
+    与 `rebuild_rows` 的区别：`rebuild_rows` 会对每条 row 重新跑 `embed_text`；
+    本函数用于「向量已在上游算好」的场景（如多模态原生 embedding —— 媒体字节
+    经 gemini-embedding-2 `:embedContent` 算出 3072 维向量后直接落库）。一个
+    媒体项 = 一条 row。schema 经 `_normalize_row` 归一，与 `rebuild_rows` 完全
+    一致（metadata string 化），保证同容器混排 + `/search` 反序列化兼容。
+
+    幂等：按 chunkId 覆盖既有同 id 行。
+
+    实现采用「读旧行 → 剔除同 chunkId → 合并新行 → `create_table(overwrite)`」，
+    与 `task_rag_structured_ingest.upsert_records` 同一套久经验证的路径，**不用**
+    `merge_insert` —— 后者在既有表上对带 3072 维 vector 列做 join 时会触发
+    LanceDB DataFusion spill，在本服务环境实测抛 `Spill has sent an error`。
+    多模态容器行数小（媒体项级别），整表 overwrite 成本可忽略。
+    """
+    if not rows:
+        return {'ingested': 0, 'total': 0}
+    materialized: list[dict[str, Any]] = []
+    new_chunk_ids: set[str] = set()
+    for row in rows:
+        vector = row.get('vector')
+        if vector is None:
+            raise ValueError(f"row {row.get('chunkId')!r} missing precomputed vector")
+        item = _normalize_row(row, container)
+        item['vector'] = list(vector)
+        materialized.append(item)
+        new_chunk_ids.add(str(item.get('chunkId') or ''))
+
+    # 旧行剔除同 chunkId（幂等覆盖），其余原样保留；旧行已含 vector + 归一 schema
+    retained = [
+        row for row in load_existing_rows(container)
+        if str(row.get('chunkId') or '') not in new_chunk_ids
+    ]
+    merged = retained + materialized
+    db = lancedb.connect(str(lancedb_dir(container)))
+    table = db.create_table('chunks', data=merged, mode='overwrite')
+    # 末尾 optimize：overwrite 会累积 dead fragments，与 upsert_records 一致清理
+    _try_optimize(table)
+    return {'ingested': len(materialized), 'total': int(table.count_rows())}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--container', default='default')
