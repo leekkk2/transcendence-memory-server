@@ -96,10 +96,11 @@ def test_parse_batch_ok_and_count_mismatch():
 # ---- HTTP mock 基建 ------------------------------------------------------
 
 class _Resp:
-    def __init__(self, status, json_data=None, text=""):
+    def __init__(self, status, json_data=None, text="", headers=None):
         self.status_code = status
         self._json = json_data or {}
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._json
@@ -155,6 +156,82 @@ def test_embed_parts_sync_4xx_raises_without_retry(monkeypatch):
     with pytest.raises(requests.HTTPError):
         gne.embed_parts_sync(_Profile(max_retries=3), [gne.text_part("x")])
     assert calls["n"] == 1  # 4xx 不重试
+
+
+# ---- typed exception：重试耗尽后归类 -------------------------------------
+
+def test_embed_parts_sync_429_raises_quota_error(monkeypatch):
+    """429 重试耗尽 → EmbeddingQuotaError，error_class=='quota'、retry_after 透传。"""
+    import requests
+
+    from scripts import embedding_errors as ee
+
+    monkeypatch.setattr(gne.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        requests, "post",
+        lambda *a, **k: _Resp(429, text="rate limited", headers={"Retry-After": "12"}),
+    )
+    with pytest.raises(ee.EmbeddingQuotaError) as ei:
+        gne.embed_parts_sync(_Profile(max_retries=2), [gne.text_part("x")])
+    assert ei.value.error_class == "quota"
+    assert ei.value.status == 429
+    assert ei.value.retry_after == 12.0
+    # typed exception 仍是 RuntimeError 子类 —— 旧 except RuntimeError 不破
+    assert isinstance(ei.value, RuntimeError)
+
+
+def test_embed_parts_sync_5xx_raises_transient_error(monkeypatch):
+    """5xx 重试耗尽 → EmbeddingTransientError。"""
+    import requests
+
+    from scripts import embedding_errors as ee
+
+    monkeypatch.setattr(gne.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp(503, text="down"))
+    with pytest.raises(ee.EmbeddingTransientError) as ei:
+        gne.embed_parts_sync(_Profile(max_retries=2), [gne.text_part("x")])
+    assert ei.value.error_class == "transient"
+    assert ei.value.status == 503
+
+
+def test_embed_parts_sync_timeout_raises_timeout_error(monkeypatch):
+    """连接超时重试耗尽 → EmbeddingTimeoutError。"""
+    import requests
+
+    from scripts import embedding_errors as ee
+
+    monkeypatch.setattr(gne.time, "sleep", lambda *_: None)
+
+    def fake_post(*a, **k):
+        raise requests.Timeout("read timed out")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(ee.EmbeddingTimeoutError) as ei:
+        gne.embed_parts_sync(_Profile(max_retries=2), [gne.text_part("x")])
+    assert ei.value.error_class == "timeout"
+
+
+def test_embed_texts_async_429_raises_quota_error(monkeypatch):
+    """batchEmbedContents 429 重试耗尽 → EmbeddingQuotaError + retry_after 透传。"""
+    import httpx
+
+    from scripts import embedding_errors as ee
+
+    _FakeAsyncClient.responses = [
+        _Resp(429, text="rl", headers={"Retry-After": "7"}),
+        _Resp(429, text="rl", headers={"Retry-After": "7"}),
+    ]
+    _FakeAsyncClient.sent = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    async def _nosleep(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _nosleep)
+    with pytest.raises(ee.EmbeddingQuotaError) as ei:
+        asyncio.run(gne.embed_texts_async(_Profile(max_retries=2), ["a"]))
+    assert ei.value.error_class == "quota"
+    assert ei.value.retry_after == 7.0
 
 
 # ---- async 路径 ----------------------------------------------------------

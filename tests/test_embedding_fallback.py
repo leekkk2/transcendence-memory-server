@@ -483,3 +483,51 @@ def test_breakers_are_per_profile_independent(monkeypatch):
     assert out.shape == (1, 8)
     state_b = er_mod._breakers.get("beta")
     assert state_b is None or state_b.cooling_until_ts == 0.0
+
+
+# =========================================================================
+# 6. typed exception → _is_fallback_eligible 分类
+# =========================================================================
+
+
+def test_is_fallback_eligible_typed_exceptions():
+    """gemini_native / registry 重试耗尽后抛的 typed exception 按 error_class 判定：
+    quota / timeout / transient 可 fallback，permanent 不可。"""
+    from scripts import embedding_errors as ee
+    from scripts.embedding_registry import _is_fallback_eligible
+
+    # gemini_native 的 429 现在被包成 EmbeddingQuotaError → 应判 True
+    assert _is_fallback_eligible(ee.EmbeddingQuotaError("q", status=429)) is True
+    assert _is_fallback_eligible(ee.EmbeddingTimeoutError("t")) is True
+    assert _is_fallback_eligible(ee.EmbeddingTransientError("x", status=503)) is True
+    # 4xx 非 429 永久错 —— 换 profile 没用，不 fallback
+    assert _is_fallback_eligible(ee.EmbeddingPermanentError("p", status=400)) is False
+
+
+def test_typed_quota_error_triggers_fallback(monkeypatch):
+    """primary 抛 typed EmbeddingQuotaError（模拟 gemini_native 429 耗尽）→
+    fallback 链路 catch 后切下一条 profile 成功。"""
+    from scripts import embedding_errors as ee
+
+    primary = _make_profile("primary")
+    fb = _make_profile("fallback")
+    reg = _make_registry([primary, fb], fallbacks=("fallback",))
+    route = reg.resolve("any")
+    func, _ = reg.build_embedding_func(route)
+
+    calls: list[str] = []
+
+    async def fake_embed(profile, texts):
+        calls.append(profile.name)
+        if profile.name == "primary":
+            raise ee.EmbeddingQuotaError(
+                "gemini embedContent failed after 2 retries", status=429, retry_after=5.0,
+            )
+        return np.zeros((len(texts), profile.dim), dtype="float32")
+
+    monkeypatch.setattr(er_mod, "_http_embed", fake_embed)
+    out = asyncio.run(func(["hello"]))
+    assert out.shape == (1, 8)
+    assert calls == ["primary", "fallback"]
+    # primary 的 quota 失败计入 breaker
+    assert er_mod._breakers["primary"].consecutive_fails == 1
