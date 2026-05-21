@@ -295,6 +295,10 @@ class ContainerInfo(BaseModel):
     objects: int
     indexed: bool
     last_modified: str | None = None
+    index_state: str | None = Field(
+        default=None,
+        description='容器索引状态机：fresh / indexing / backlog / quota_blocked / error / stale / unknown。',
+    )
 
 
 class ContainerListDetailedResponse(BaseModel):
@@ -313,6 +317,78 @@ class JobStatusResponse(BaseModel):
     running: bool
     exit_code: int | None = None
     message: str
+
+
+# --- 容器索引状态机 / embedding backlog 响应模型 ---
+
+
+class IndexStatusResponse(BaseModel):
+    """单容器索引状态机视图。
+
+    ``state`` 由 ``index_state.compute_index_state`` 实时推导（fresh / indexing /
+    backlog / quota_blocked / error / stale / unknown），不读缓存字段，避免投影
+    与真实状态失同步。计数与时间戳来自 ``container_index_state`` + ``embed_backlog``。
+    """
+    container: str
+    state: str = Field(
+        ...,
+        description='fresh / indexing / backlog / quota_blocked / error / stale / unknown',
+    )
+    total_objects: int = 0
+    embedded_objects: int = 0
+    backlog_active: int = Field(
+        default=0,
+        description='backlog 中 waiting + retrying 的 chunk 数（待静默重试）。',
+    )
+    backlog_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description='backlog 各状态计数：waiting / retrying / resolved / dead。',
+    )
+    dead_count: int = Field(
+        default=0,
+        description='永久失败（dead-letter）的 chunk 数 —— 需人工介入。',
+    )
+    job_running: bool = Field(
+        default=False,
+        description='该容器当前是否有 embed 类 job 处于 pending / running。',
+    )
+    next_retry_at: int | None = Field(
+        default=None,
+        description='最近一个待重试 chunk 的下次重试时间（unix ts）。',
+    )
+    last_error_class: str | None = Field(
+        default=None,
+        description='最近一次失败的错误类别：quota / timeout / transient。',
+    )
+    last_embed_ok_at: int | None = None
+    last_embed_attempt_at: int | None = None
+
+
+class IndexStatusListResponse(BaseModel):
+    containers: list[IndexStatusResponse] = Field(default_factory=list)
+    count: int = 0
+
+
+class BacklogItemResponse(BaseModel):
+    """单条 embedding backlog 明细。``last_error`` 已截断防止响应体被长 traceback 撑大。"""
+    chunk_id: str
+    content_hash: str | None = None
+    error_class: str
+    attempts: int = 0
+    first_failed_at: int = 0
+    last_attempt_at: int = 0
+    next_retry_at: int = 0
+    last_error: str | None = None
+    status: str
+    resolved_at: int | None = None
+
+
+class BacklogListResponse(BaseModel):
+    container: str
+    count: int = 0
+    active: int = Field(default=0, description='waiting + retrying 的 chunk 数。')
+    dead: int = Field(default=0, description='永久失败的 chunk 数。')
+    items: list[BacklogItemResponse] = Field(default_factory=list)
 
 
 class DocumentTextReq(_WithModelOverride):
