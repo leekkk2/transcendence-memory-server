@@ -242,3 +242,74 @@ def test_default_env_resolver_handles_empty_container(queue_module, worker_modul
     )
     env = worker.env_resolver(job)
     assert env["CONTAINER"] == ""
+
+
+# ---------- embedding backlog drain ----------
+
+
+def _force_backlog_due(db_path: Path) -> None:
+    """把 backlog 所有行的 next_retry_at 压到过去，让 due_containers 立刻返回。"""
+    import sqlite3
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("UPDATE embed_backlog SET next_retry_at=0")
+        conn.commit()
+
+
+def test_maybe_drain_backlog_enqueues_due_containers(queue_module, worker_module, tmp_path):
+    """到期 backlog 行应被提升为 embed-backlog-retry job（per-container 去重）。"""
+    from scripts.embed_backlog import BacklogStore
+
+    db_path = tmp_path / "q.db"
+    queue = queue_module.JobQueue(db_path)
+    store = BacklogStore(db_path)
+    # 同容器两个 chunk + 另一个容器 —— 期望每容器只入一个 job（coalesce）。
+    store.record_failure("myapp", "chunk-1", "transient")
+    store.record_failure("myapp", "chunk-2", "quota")
+    store.record_failure("otherbox", "chunk-9", "timeout")
+    _force_backlog_due(db_path)
+
+    worker = worker_module.JobWorker(queue=queue, command_resolver=lambda _j: ["true"])
+    worker._maybe_drain_backlog()
+
+    retry_jobs = [j for j in queue.list_jobs(status="pending") if j.op == "embed-backlog-retry"]
+    assert len(retry_jobs) == 2
+    assert {j.container for j in retry_jobs} == {"myapp", "otherbox"}
+
+    # cadence：间隔内再次调用是 no-op，不会重复入队。
+    worker._maybe_drain_backlog()
+    retry_jobs2 = [j for j in queue.list_jobs(status="pending") if j.op == "embed-backlog-retry"]
+    assert len(retry_jobs2) == 2
+
+
+def test_maybe_drain_backlog_respects_disable_flag(queue_module, worker_module, tmp_path, monkeypatch):
+    """TM_BACKLOG_ENABLED=0 时 drain 完全关闭。"""
+    from scripts.embed_backlog import BacklogStore
+
+    monkeypatch.setenv("TM_BACKLOG_ENABLED", "0")
+    db_path = tmp_path / "q.db"
+    queue = queue_module.JobQueue(db_path)
+    store = BacklogStore(db_path)
+    store.record_failure("myapp", "chunk-1", "transient")
+    _force_backlog_due(db_path)
+
+    worker = worker_module.JobWorker(queue=queue, command_resolver=lambda _j: ["true"])
+    worker._maybe_drain_backlog()
+
+    assert not [j for j in queue.list_jobs(status="pending") if j.op == "embed-backlog-retry"]
+
+
+def test_default_command_resolver_maps_backlog_retry(queue_module, worker_module, tmp_path):
+    """embed-backlog-retry op → task_rag_lancedb_ingest.py --mode embed-backlog-retry。"""
+    resolver = worker_module.default_command_resolver(tmp_path / "scripts")
+    job = queue_module.Job(
+        id=1, op="embed-backlog-retry", container="myapp", payload={},
+        status="running", attempts=1, max_attempts=5,
+        enqueued_at=0, next_run_at=0,
+        started_at=None, finished_at=None, result_code=None,
+        last_error=None, pid=None, label="",
+    )
+    cmd = resolver(job)
+    assert "task_rag_lancedb_ingest.py" in cmd[0]
+    assert cmd[-2:] == ["--mode", "embed-backlog-retry"]
+    assert "--container" in cmd and "myapp" in cmd
