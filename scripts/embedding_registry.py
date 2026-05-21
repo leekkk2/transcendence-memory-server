@@ -22,6 +22,7 @@ import fnmatch
 import logging
 import random
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -49,6 +50,22 @@ except ImportError:  # pragma: no cover - package import path
         Route,
         load_profiles,
     )
+
+# 双重 import + 模块身份归一。worker subprocess（bare import）与 server/package
+# （scripts. 前缀）两种入口可能各加载一份 embedding_errors 副本 —— typed
+# exception 的 isinstance 跨副本会失效。这里复用任一已加载副本，并登记到两个
+# 模块名下，保证全进程只有一份类对象。
+embedding_errors = (
+    sys.modules.get('scripts.embedding_errors')
+    or sys.modules.get('embedding_errors')
+)
+if embedding_errors is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import embedding_errors  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import embedding_errors  # type: ignore[no-redef]
+sys.modules.setdefault('embedding_errors', embedding_errors)
+sys.modules.setdefault('scripts.embedding_errors', embedding_errors)
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +265,13 @@ def _is_fallback_eligible(exc: Exception) -> bool:
     - 401 Unauthorized（key 错 — 用户配置）
     - 403 Forbidden（无权限 — 用户配置）
     - 其他 4xx 非 429（404/405/422 等都是配置或代码问题）
+
+    typed embedding exception（embedding_errors.EmbeddingError）自带权威类别：
+    quota / timeout / transient 可 fallback，permanent 不可。其余 legacy
+    httpx / ValueError 分支保留 —— hotpatch 半应用期间仍能优雅降级。
     """
+    if isinstance(exc, embedding_errors.EmbeddingError):
+        return exc.error_class in embedding_errors.RETRYABLE_CLASSES
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         return code == 429 or code >= 500
@@ -284,6 +307,10 @@ async def _http_embed_single(
         payload["dimensions"] = profile.request_dim
 
     last_exc: Exception | None = None
+    # 重试耗尽后用这三项把失败归类成 typed exception（embedding_errors）。
+    last_status: int | None = None
+    last_retry_after: float | None = None
+    last_error_class: str | None = None
     async with httpx.AsyncClient(timeout=profile.timeout_s) as client:
         for attempt in range(profile.max_retries):
             retry_after: float | None = None
@@ -301,13 +328,25 @@ async def _http_embed_single(
                 sorted_data = sorted(data, key=lambda x: x["index"])
                 return np.array([d["embedding"] for d in sorted_data], dtype="float32")
             except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
-                # 4xx（非 429）配置/输入错误，profile 内不重试，直接抛
-                # — 由上层 fallback 决定是否跨 profile（事实上不会，
-                # _is_fallback_eligible 会判 False）
                 if isinstance(exc, httpx.HTTPStatusError):
                     code = exc.response.status_code
                     if not (code == 429 or code >= 500):
+                        # 4xx（非 429）配置/输入错误，profile 内不重试，原样抛
+                        # httpx.HTTPStatusError —— 上层 _is_fallback_eligible
+                        # 判 False，不跨 profile fallback。
                         raise
+                    last_status = code
+                    last_retry_after = retry_after
+                    last_error_class = None
+                elif isinstance(exc, httpx.TimeoutException):
+                    last_status = None
+                    last_retry_after = None
+                    last_error_class = embedding_errors.TIMEOUT
+                else:
+                    # httpx.TransportError（非超时）/ ValueError → transient
+                    last_status = None
+                    last_retry_after = None
+                    last_error_class = None
                 last_exc = exc
                 if attempt == profile.max_retries - 1:
                     break
@@ -318,7 +357,14 @@ async def _http_embed_single(
                 )
                 await asyncio.sleep(delay)
     assert last_exc is not None
-    raise last_exc
+    # 重试耗尽 —— 归一为 typed exception，让 backlog 调度按 error_class 决策。
+    raise embedding_errors.make_embedding_error(
+        f"embedding upstream failed after {profile.max_retries} retries "
+        f"(profile={profile.name}): {last_exc}",
+        status=last_status,
+        retry_after=last_retry_after,
+        error_class=last_error_class,
+    )
 
 
 # 反向兼容别名：v0.8.0 的 _http_embed 名称被 admin probe 端点直接 import；
