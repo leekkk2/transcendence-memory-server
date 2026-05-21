@@ -28,6 +28,22 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+# 双重 import + 模块身份归一。worker subprocess（bare import）与 server/package
+# （scripts. 前缀）两种入口可能各加载一份 embedding_errors 副本 —— typed
+# exception 的 isinstance 跨副本会失效。这里复用任一已加载副本，并登记到两个
+# 模块名下，保证全进程只有一份类对象。
+embedding_errors = (
+    sys.modules.get('scripts.embedding_errors')
+    or sys.modules.get('embedding_errors')
+)
+if embedding_errors is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import embedding_errors  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import embedding_errors  # type: ignore[no-redef]
+sys.modules.setdefault('embedding_errors', embedding_errors)
+sys.modules.setdefault('scripts.embedding_errors', embedding_errors)
+
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 TASKS = WS / 'tasks'
@@ -185,6 +201,10 @@ def embed_text(
         payload['dimensions'] = int(request_dim)
 
     last_err: Exception | None = None
+    # 重试耗尽后用这三项把失败归类成 typed exception（embedding_errors）。
+    last_status: int | None = None
+    last_retry_after: float | None = None
+    last_error_class: str | None = None
     for attempt in range(_EMBED_MAX_RETRIES):
         retry_after: float | None = None
         try:
@@ -195,6 +215,9 @@ def embed_text(
                 # 不读 body 拿到更多细节，但避免抛 raise_for_status 的细节膨胀
                 snippet = response.text[:200] if response.text else ''
                 last_err = RuntimeError(f'embedding upstream {status}: {snippet!r}')
+                last_status = status
+                last_retry_after = retry_after
+                last_error_class = None
             elif status >= 400:
                 # 4xx（鉴权 / 参数错误）不可重试，立即抛出
                 response.raise_for_status()
@@ -203,11 +226,21 @@ def embed_text(
                 return np.array(data['data'][0]['embedding'], dtype='float32')
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_err = exc
+            last_status = None
+            last_retry_after = None
+            # 超时单列 timeout 类别；连接抖动归默认 transient
+            last_error_class = (
+                embedding_errors.TIMEOUT
+                if isinstance(exc, requests.Timeout) else None
+            )
         except requests.HTTPError:
-            # 已被分类，直接抛
+            # 已被分类（4xx 非 429），直接抛
             raise
         except Exception as exc:  # JSON 解析失败、空 data 等也算可重试
             last_err = exc
+            last_status = None
+            last_retry_after = None
+            last_error_class = None
 
         if attempt == _EMBED_MAX_RETRIES - 1:
             break
@@ -220,11 +253,30 @@ def embed_text(
 
     # Google native fallback：现有 special path，保留语义
     if api_key.startswith('AIza'):
-        google_url = f'{GOOGLE_BASE_URL.rstrip("/")}/{model}:embedContent?key={api_key}'
-        google_payload = {'content': {'parts': [{'text': text}]}}
-        response = requests.post(google_url, json=google_payload, timeout=_EMBED_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        return np.array(data['embedding']['values'], dtype='float32')
+        try:
+            google_url = f'{GOOGLE_BASE_URL.rstrip("/")}/{model}:embedContent?key={api_key}'
+            google_payload = {'content': {'parts': [{'text': text}]}}
+            response = requests.post(google_url, json=google_payload, timeout=_EMBED_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            return np.array(data['embedding']['values'], dtype='float32')
+        except Exception as exc:
+            # Google fallback 也失败 —— 记录后与主链一起归一为 typed exception
+            last_err = exc
+            g_status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            if g_status is not None:
+                last_status = int(g_status)
+                last_retry_after = None
+                last_error_class = None
+            elif isinstance(exc, requests.Timeout):
+                last_status = None
+                last_retry_after = None
+                last_error_class = embedding_errors.TIMEOUT
 
-    raise RuntimeError(f'Embedding request failed after {_EMBED_MAX_RETRIES} retries: {last_err}')
+    # 重试耗尽 —— 归一为 typed exception，让上层 backlog 调度按 error_class 决策。
+    raise embedding_errors.make_embedding_error(
+        f'Embedding request failed after {_EMBED_MAX_RETRIES} retries: {last_err}',
+        status=last_status,
+        retry_after=last_retry_after,
+        error_class=last_error_class,
+    )

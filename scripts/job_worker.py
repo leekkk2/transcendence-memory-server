@@ -40,9 +40,19 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.job_queue import Job, JobQueue
 
 try:
-    from server_protection import BG_TRACKER, GATE, read_system_health
+    from server_protection import BG_TRACKER, GATE, RETRY_LIMITER, read_system_health
 except ModuleNotFoundError:  # pragma: no cover
-    from scripts.server_protection import BG_TRACKER, GATE, read_system_health
+    from scripts.server_protection import (
+        BG_TRACKER,
+        GATE,
+        RETRY_LIMITER,
+        read_system_health,
+    )
+
+try:
+    from embed_backlog import BacklogStore
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.embed_backlog import BacklogStore
 
 logger = logging.getLogger("transcendence-memory-server.worker")
 
@@ -92,6 +102,19 @@ class JobWorker:
         self.purge_interval_sec = _env_int("TM_QUEUE_PURGE_INTERVAL_SEC", 3600)
         self.purge_retention_sec = _env_int("TM_QUEUE_PURGE_RETENTION_SEC", 7 * 86400)
         self._last_purge_ts = 0.0
+        # Embedding backlog drain: on a fixed cadence (mirrors _maybe_purge),
+        # promote due backlog rows into 'embed-backlog-retry' jobs so the
+        # single worker executes them on the same queue path as everything
+        # else. Gated by TM_BACKLOG_ENABLED so a deployment can switch the
+        # whole subsystem off without code changes.
+        self.backlog_enabled = os.environ.get(
+            "TM_BACKLOG_ENABLED", "1"
+        ) in ("1", "true", "True")
+        self.backlog_drain_interval_sec = _env_int(
+            "TM_BACKLOG_RETRY_INTERVAL_SEC", 300
+        )
+        self._last_backlog_drain_ts = 0.0
+        self._backlog_store: BacklogStore | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -136,6 +159,9 @@ class JobWorker:
     def _tick(self) -> None:
         # Periodic queue compaction (no-op when called within retention window).
         self._maybe_purge()
+        # Promote due embedding-backlog rows into retry jobs (no-op within the
+        # cadence window, or when TM_BACKLOG_ENABLED is off).
+        self._maybe_drain_backlog()
 
         # Pre-flight: refuse to claim a job if the host is under pressure.
         # The job stays in the queue; we'll check again next tick.
@@ -173,6 +199,58 @@ class JobWorker:
                 logger.info("queue purge removed %d old rows", removed)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("queue purge failed: %s", exc)
+
+    def _get_backlog_store(self) -> BacklogStore:
+        # 惰性构建：backlog 与 JobQueue 共用同一个 queue.db（backlog 是 job
+        # 队列的卫星表），所以直接复用 queue 的 db_path，不另开数据源。
+        if self._backlog_store is None:
+            self._backlog_store = BacklogStore(self.queue.db_path)
+        return self._backlog_store
+
+    def _maybe_drain_backlog(self) -> None:
+        """把到期的 embedding backlog 行提升为 ``embed-backlog-retry`` job。
+
+        只负责「调度」——不在 worker 线程里直接做 embedding，保持所有子进程
+        执行都走同一条 ``JobQueue -> _execute`` 路径。per-container 去抖交给
+        ``RETRY_LIMITER``（本功能是这个目前空转的限速器的首个消费者）；
+        ``enqueue(coalesce=True)`` 进一步保证同容器不堆叠重复 job。
+
+        cadence 与 ``_maybe_purge`` 同款：间隔内多次调用是 no-op。
+        """
+        if not self.backlog_enabled or self.backlog_drain_interval_sec <= 0:
+            return
+        now = time.time()
+        if (now - self._last_backlog_drain_ts) < self.backlog_drain_interval_sec:
+            return
+        self._last_backlog_drain_ts = now
+        try:
+            due = self._get_backlog_store().due_containers()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("backlog drain query failed: %s", exc)
+            return
+        for container in due:
+            if not container:
+                continue
+            # per-container 冷却去抖：避免每个 tick 都为同一容器重排 job。
+            if not RETRY_LIMITER.can_retry(container):
+                continue
+            try:
+                self.queue.enqueue(
+                    op="embed-backlog-retry",
+                    container=container,
+                    label="embed-backlog-retry",
+                    coalesce=True,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "backlog drain enqueue failed for %s: %s", container, exc
+                )
+                continue
+            RETRY_LIMITER.mark_retry(container)
+            logger.info(
+                "backlog drain queued embed-backlog-retry for container=%s",
+                container,
+            )
 
     def _execute(self, job: Job) -> None:
         try:
@@ -241,8 +319,9 @@ class JobWorker:
 def default_command_resolver(scripts_dir: Path) -> Callable[[Job], list[str]]:
     """Build the default mapping from job.op to subprocess command.
 
-    Knows about the three op types currently produced by the API:
+    Knows about the op types currently produced by the API and the worker:
     - 'embed' / 'ingest-memory' → task_rag_lancedb_ingest.py
+    - 'embed-backlog-retry' → task_rag_lancedb_ingest.py --mode embed-backlog-retry
     - 'ingest-structured' → task_rag_structured_ingest.py
     """
     scripts_dir = Path(scripts_dir)
@@ -260,6 +339,14 @@ def default_command_resolver(scripts_dir: Path) -> Callable[[Job], list[str]]:
             if archive_dir:
                 cmd += ["--archive-dir", str(archive_dir)]
             return cmd
+        if job.op == "embed-backlog-retry":
+            # backlog 静默重试：走 task_rag_lancedb_ingest 的 embed-backlog-retry
+            # 模式，只重嵌该容器 backlog 里 waiting 的 chunk（断点续传式重试）。
+            return [
+                str(scripts_dir / "task_rag_lancedb_ingest.py"),
+                "--container", job.container,
+                "--mode", "embed-backlog-retry",
+            ]
         if job.op == "ingest-structured":
             cmd = [
                 str(scripts_dir / "task_rag_structured_ingest.py"),

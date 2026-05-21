@@ -40,6 +40,10 @@ try:
         DocumentTextReq,
         HealthResponse,
         IngestMemoryReq,
+        BacklogItemResponse,
+        BacklogListResponse,
+        IndexStatusListResponse,
+        IndexStatusResponse,
         JobStatusResponse,
         MemoryDeleteResponse,
         MemoryUpdateResponse,
@@ -69,6 +73,10 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         DocumentTextReq,
         HealthResponse,
         IngestMemoryReq,
+        BacklogItemResponse,
+        BacklogListResponse,
+        IndexStatusListResponse,
+        IndexStatusResponse,
         JobStatusResponse,
         MemoryDeleteResponse,
         MemoryUpdateResponse,
@@ -125,6 +133,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.job_queue import JobQueue, Job, QueueFullError
     from scripts.job_worker import JobWorker, default_command_resolver
+
+try:
+    from embed_backlog import BacklogItem, BacklogStore
+    from index_state import IndexStateStore, compute_index_state
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.embed_backlog import BacklogItem, BacklogStore
+    from scripts.index_state import IndexStateStore, compute_index_state
 
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
@@ -293,6 +308,34 @@ def get_job_queue() -> JobQueue:
     if JOB_QUEUE is None:
         JOB_QUEUE = JobQueue(_queue_db_path())
     return JOB_QUEUE
+
+
+# embedding backlog 与 container_index_state 都复用 JobQueue 的 queue.db
+# （单一 WAL / 崩溃恢复 / purge 域）。惰性单例，按 WORKSPACE 实例化。
+BACKLOG_STORE: BacklogStore | None = None
+INDEX_STATE_STORE: IndexStateStore | None = None
+
+
+def get_backlog_store() -> BacklogStore:
+    global BACKLOG_STORE
+    if BACKLOG_STORE is None:
+        BACKLOG_STORE = BacklogStore(_queue_db_path())
+    return BACKLOG_STORE
+
+
+def get_index_state_store() -> IndexStateStore:
+    global INDEX_STATE_STORE
+    if INDEX_STATE_STORE is None:
+        INDEX_STATE_STORE = IndexStateStore(_queue_db_path())
+    return INDEX_STATE_STORE
+
+
+# /embed 与 /ingest-memory/objects 响应里附带的说明：embedding 失败不丢对象。
+_BACKLOG_NOTE = (
+    'Objects whose embedding fails upstream (e.g. quota exhaustion or timeout) '
+    'are recorded in a retry backlog and retried silently in the background — '
+    'they are not lost. See GET /containers/{name}/index-status for state.'
+)
 
 
 @asynccontextmanager
@@ -592,6 +635,31 @@ async def _collect_health_state(container: str | None) -> dict:
     if not worker_running and not DISABLE_WORKER:
         public_warnings.append('background ingest worker not running')
         sensitive_warnings.append('background ingest worker is not running')
+
+    # embedding backlog 概览 —— 仅 sensitive 轨：容器名不进公开视图（避免给
+    # 匿名访问者积累指纹）；公开 /health 只能从 system_status 看压力标签。
+    try:
+        bstore = get_backlog_store()
+        backlog_n = quota_n = dead_n = 0
+        for c in bstore.all_active_containers():
+            csum = bstore.summary(c)
+            if csum['active'] > 0:
+                backlog_n += 1
+                if csum['last_error_class'] == 'quota':
+                    quota_n += 1
+            if csum['dead'] > 0:
+                dead_n += 1
+        backlog_parts: list[str] = []
+        if backlog_n:
+            backlog_parts.append(f'{backlog_n} container(s) with embedding backlog')
+        if quota_n:
+            backlog_parts.append(f'{quota_n} quota-blocked')
+        if dead_n:
+            backlog_parts.append(f'{dead_n} with permanent embedding failures')
+        if backlog_parts:
+            sensitive_warnings.append('; '.join(backlog_parts) + '.')
+    except Exception as exc:  # pragma: no cover - defensive
+        sensitive_warnings.append(f'embedding backlog status unavailable: {exc}')
 
     runtime_ready = {
         'search': scripts_present['search'] and embedding_configured and lancedb_available,
@@ -1080,6 +1148,13 @@ def _build_ingest_cmd(op: str, container: str, payload: dict) -> list[str]:
         if archive_dir:
             cmd += ['--archive-dir', str(archive_dir)]
         return cmd
+    if op == 'embed-backlog-retry':
+        # backlog 静默重试：只重嵌该容器 backlog 里 waiting 的 chunk（断点续传）。
+        return [
+            str(script_path('task_rag_lancedb_ingest.py')),
+            '--container', container,
+            '--mode', 'embed-backlog-retry',
+        ]
     if op == 'ingest-structured':
         cmd = [
             str(script_path('task_rag_structured_ingest.py')),
@@ -1237,7 +1312,7 @@ def _job_to_command_response(job: Job, timed_out_wait: bool = False) -> CommandR
 
 @app.post('/embed', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def embed(req: ContainerReq) -> CommandResponse:
-    return _enqueue_or_run(
+    resp = _enqueue_or_run(
         op='embed',
         container=req.container,
         payload={},
@@ -1246,6 +1321,9 @@ def embed(req: ContainerReq) -> CommandResponse:
         label='embed',
         embedding_override=req.embedding_model,
     )
+    # 说明静默重试 backlog：embedding 失败的对象不会丢，会进 backlog 后台重试。
+    resp.note = f'{resp.note} {_BACKLOG_NOTE}'.strip() if resp.note else _BACKLOG_NOTE
+    return resp
 
 
 @app.post('/build-manifest', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
@@ -1331,6 +1409,8 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
             index_hint = 'Embed job queued; the background worker will index this container shortly.'
     else:
         index_hint = 'Run /embed for this container to refresh LanceDB after storing new objects.'
+    # 说明静默重试 backlog：后续 embedding 若失败，对象进 backlog 后台重试不丢失。
+    index_hint = f'{index_hint} {_BACKLOG_NOTE}'
     return ClientIngestResponse(
         container=req.container,
         accepted=len(lines),
@@ -1511,13 +1591,193 @@ def list_containers(pattern: str | None = None, mode: str = 'substring'):
         # 检查索引
         lancedb_dir = p / 'lancedb'
         indexed = lancedb_dir.exists() and any(lancedb_dir.iterdir()) if lancedb_dir.exists() else False
+        # 索引状态机：fresh / indexing / backlog / quota_blocked / error / stale / unknown
+        status = _compute_container_index_status(p.name)
         result.append({
             'name': p.name,
             'objects': obj_count,
             'indexed': indexed,
             'last_modified': last_mod,
+            'index_state': status['state'] if status else 'unknown',
         })
     return {'containers': result, 'count': len(result)}
+
+
+# --- 容器索引状态机 / embedding backlog 端点 ---
+
+_EMBED_OPS_FOR_STATE = ('embed', 'ingest-memory', 'embed-backlog-retry')
+_BACKLOG_LAST_ERROR_MAXLEN = 240
+
+
+def _container_dir(name: str) -> Path:
+    """容器目录路径（**不创建**，与 container_root() 不同 —— 状态查询不应产生副作用）。"""
+    return WS / 'tasks' / 'rag' / 'containers' / name
+
+
+def _container_object_count(name: str) -> int:
+    """统计容器 memory_objects.jsonl 的对象数（无 index_state 记录时的回退来源）。"""
+    jsonl = _container_dir(name) / 'memory_objects.jsonl'
+    if not jsonl.exists():
+        return 0
+    try:
+        return sum(
+            1 for line in jsonl.read_text(encoding='utf-8').splitlines() if line.strip()
+        )
+    except OSError:  # pragma: no cover - defensive
+        return 0
+
+
+def _container_has_active_embed_job(name: str) -> bool:
+    """该容器是否有 embed 类 job 处于 pending / running —— 推导 indexing 态。"""
+    try:
+        jobs = get_job_queue().list_jobs(container=name, limit=200)
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return any(
+        j.op in _EMBED_OPS_FOR_STATE and j.status in ('pending', 'running')
+        for j in jobs
+    )
+
+
+def _compute_container_index_status(name: str) -> dict | None:
+    """组装单容器索引状态机视图。
+
+    完全无记录（无 index_state 行、无 backlog、容器目录不存在）时返回 None —— 由
+    调用方决定是否 404。state 由 compute_index_state 实时推导，不读缓存字段。
+    """
+    record = get_index_state_store().get(name)
+    summary = get_backlog_store().summary(name)
+    job_running = _container_has_active_embed_job(name)
+    dir_exists = _container_dir(name).exists()
+
+    backlog_active = summary['active']
+    dead_count = summary['dead']
+
+    if record is None and not dir_exists and backlog_active == 0 and dead_count == 0:
+        return None
+
+    if record is not None:
+        # 子进程登记的权威计数（与 embedded_objects 同口径，避免与 jsonl 行数错配）。
+        total_objects = record.total_objects
+        embedded_objects = record.embedded_objects
+        ever_embedded = record.last_embed_ok_at is not None
+        last_embed_ok_at = record.last_embed_ok_at
+        last_embed_attempt_at = record.last_embed_attempt_at
+    else:
+        # 从未 embed 过：对象数回退到 jsonl 行数，embedded=0 → 落 stale / unknown。
+        total_objects = _container_object_count(name)
+        embedded_objects = 0
+        ever_embedded = False
+        last_embed_ok_at = None
+        last_embed_attempt_at = None
+
+    state = compute_index_state(
+        total_objects=total_objects,
+        embedded_objects=embedded_objects,
+        backlog_active=backlog_active,
+        dead_count=dead_count,
+        job_running=job_running,
+        last_error_class=summary['last_error_class'],
+        ever_embedded=ever_embedded,
+    )
+    return {
+        'container': name,
+        'state': state,
+        'total_objects': total_objects,
+        'embedded_objects': embedded_objects,
+        'backlog_active': backlog_active,
+        'backlog_counts': summary['counts'],
+        'dead_count': dead_count,
+        'job_running': job_running,
+        'next_retry_at': summary['next_retry_at'],
+        'last_error_class': summary['last_error_class'],
+        'last_embed_ok_at': last_embed_ok_at,
+        'last_embed_attempt_at': last_embed_attempt_at,
+    }
+
+
+def _backlog_item_to_response(item: BacklogItem) -> BacklogItemResponse:
+    last_error = item.last_error
+    if last_error is not None and len(last_error) > _BACKLOG_LAST_ERROR_MAXLEN:
+        last_error = last_error[:_BACKLOG_LAST_ERROR_MAXLEN] + '…'
+    return BacklogItemResponse(
+        chunk_id=item.chunk_id,
+        content_hash=item.content_hash,
+        error_class=item.error_class,
+        attempts=item.attempts,
+        first_failed_at=item.first_failed_at,
+        last_attempt_at=item.last_attempt_at,
+        next_retry_at=item.next_retry_at,
+        last_error=last_error,
+        status=item.status,
+        resolved_at=item.resolved_at,
+    )
+
+
+@app.get('/index-status', response_model=IndexStatusListResponse, dependencies=[Depends(verify_auth)])
+def all_index_status() -> IndexStatusListResponse:
+    """全容器索引状态机批量视图。
+
+    容器并集来源：曾 embed 过的容器（container_index_state）∪ 有 backlog 的容器
+    ∪ 当前 containers 目录。
+    """
+    names: set[str] = set()
+    names.update(r.container for r in get_index_state_store().all())
+    names.update(get_backlog_store().all_active_containers())
+    names.update(p.name for p in _list_container_dirs())
+    items: list[IndexStatusResponse] = []
+    for name in sorted(names):
+        status = _compute_container_index_status(name)
+        if status is not None:
+            items.append(IndexStatusResponse(**status))
+    return IndexStatusListResponse(containers=items, count=len(items))
+
+
+@app.get(
+    '/containers/{name}/index-status',
+    response_model=IndexStatusResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def container_index_status(name: str) -> IndexStatusResponse:
+    """单容器索引状态机：state + 对象计数 + backlog 摘要 + next_retry_at。"""
+    validate_container_name(name)
+    status = _compute_container_index_status(name)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f'container not found: {name}')
+    return IndexStatusResponse(**status)
+
+
+@app.get(
+    '/containers/{name}/backlog',
+    response_model=BacklogListResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def container_backlog(
+    name: str,
+    status: str | None = None,
+    limit: int = 100,
+) -> BacklogListResponse:
+    """容器 embedding backlog 明细（含 dead 项）。
+
+    - status：可选过滤 waiting / retrying / resolved / dead；非法值 → 400。
+    - limit：1..500。
+    - 每项 last_error 截断，避免响应体被长 traceback 撑大。
+    """
+    validate_container_name(name)
+    limit = max(1, min(500, int(limit)))
+    store = get_backlog_store()
+    try:
+        items = store.list_items(name, status=status, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    summary = store.summary(name)
+    return BacklogListResponse(
+        container=name,
+        count=len(items),
+        active=summary['active'],
+        dead=summary['dead'],
+        items=[_backlog_item_to_response(it) for it in items],
+    )
 
 
 @app.delete('/containers/{name}', response_model=ContainerDeleteResponse, dependencies=[Depends(verify_auth)])

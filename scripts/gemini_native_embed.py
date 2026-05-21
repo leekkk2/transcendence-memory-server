@@ -29,11 +29,29 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# 双重 import + 模块身份归一。worker subprocess（sys.path[0]=scripts，bare
+# import）与 server/package（scripts. 前缀）两种入口可能各加载一份
+# embedding_errors 副本 —— typed exception 的 isinstance 跨副本会失效。这里
+# 复用任一已加载副本，并登记到两个模块名下，保证全进程只有一份类对象。
+import sys as _sys
+
+embedding_errors = (
+    _sys.modules.get('scripts.embedding_errors')
+    or _sys.modules.get('embedding_errors')
+)
+if embedding_errors is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import embedding_errors  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import embedding_errors  # type: ignore[no-redef]
+_sys.modules.setdefault('embedding_errors', embedding_errors)
+_sys.modules.setdefault('scripts.embedding_errors', embedding_errors)
+
 # 退避参数 —— 与 embedding_registry 保持同量级，gemini relay 限速时指数退避。
 _RETRY_BASE_DELAY_S = 1.5
 _RETRY_MAX_DELAY_S = 30.0
 
-# Gemini 原生多模态支持的 MIME（见 lane 间共享契约 §固定参数）。
+# Gemini 原生多模态支持的 MIME。
 _EXT_MIME: dict[str, str] = {
     '.png': 'image/png',
     '.jpg': 'image/jpeg',
@@ -227,10 +245,19 @@ def embed_parts_sync(
     body = _single_body(profile, parts)
     headers = _headers(profile.api_key)
     last_err: Exception | None = None
+    # 记录最后一次失败的状态码 / Retry-After / 类别 —— 重试耗尽后归类成 typed
+    # exception，让 backlog 调度无需再字符串匹配。
+    last_status: int | None = None
+    last_retry_after: float | None = None
+    last_error_class: str | None = None
     for attempt in range(profile.max_retries):
         try:
             resp = requests.post(url, json=body, headers=headers, timeout=profile.timeout_s)
             if _retryable(resp.status_code):
+                last_status = resp.status_code
+                last_retry_after = embedding_errors.parse_retry_after(
+                    (getattr(resp, 'headers', None) or {}).get('Retry-After'))
+                last_error_class = None
                 last_err = RuntimeError(f'gemini upstream {resp.status_code}: {resp.text[:200]!r}')
             elif resp.status_code >= 400:
                 resp.raise_for_status()
@@ -238,17 +265,28 @@ def embed_parts_sync(
                 return np.array(_parse_single(resp.json()), dtype='float32')
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_err = exc
+            last_status = None
+            last_retry_after = None
+            # 超时单列 timeout 类别；连接抖动归默认 transient
+            last_error_class = (
+                embedding_errors.TIMEOUT
+                if isinstance(exc, requests.Timeout) else None
+            )
         except requests.HTTPError:
             raise
         except Exception as exc:  # JSON 解析失败 / 空 values 等也算可重试
             last_err = exc
+            last_status = None
+            last_retry_after = None
+            last_error_class = None
         if attempt < profile.max_retries - 1:
             delay = _backoff(attempt)
             logger.warning('gemini embed sync attempt %d failed: %s; retry in %.1fs',
                             attempt + 1, last_err, delay)
             time.sleep(delay)
-    raise RuntimeError(
-        f'gemini embedContent failed after {profile.max_retries} retries: {last_err}'
+    raise embedding_errors.make_embedding_error(
+        f'gemini embedContent failed after {profile.max_retries} retries: {last_err}',
+        status=last_status, retry_after=last_retry_after, error_class=last_error_class,
     )
 
 
@@ -270,11 +308,18 @@ async def embed_parts_async(
     body = _single_body(profile, parts)
     headers = _headers(profile.api_key)
     last_err: Exception | None = None
+    last_status: int | None = None
+    last_retry_after: float | None = None
+    last_error_class: str | None = None
     async with httpx.AsyncClient(timeout=profile.timeout_s) as client:
         for attempt in range(profile.max_retries):
             try:
                 resp = await client.post(url, json=body, headers=headers)
                 if _retryable(resp.status_code):
+                    last_status = resp.status_code
+                    last_retry_after = embedding_errors.parse_retry_after(
+                        (getattr(resp, 'headers', None) or {}).get('Retry-After'))
+                    last_error_class = None
                     last_err = RuntimeError(
                         f'gemini upstream {resp.status_code}: {resp.text[:200]!r}')
                 elif resp.status_code >= 400:
@@ -285,10 +330,18 @@ async def embed_parts_async(
                 raise
             except (httpx.TransportError, ValueError) as exc:
                 last_err = exc
+                last_status = None
+                last_retry_after = None
+                # httpx.TimeoutException 是 TransportError 子类 —— 超时单列
+                last_error_class = (
+                    embedding_errors.TIMEOUT
+                    if isinstance(exc, httpx.TimeoutException) else None
+                )
             if attempt < profile.max_retries - 1:
                 await asyncio.sleep(_backoff(attempt))
-    raise RuntimeError(
-        f'gemini embedContent failed after {profile.max_retries} retries: {last_err}'
+    raise embedding_errors.make_embedding_error(
+        f'gemini embedContent failed after {profile.max_retries} retries: {last_err}',
+        status=last_status, retry_after=last_retry_after, error_class=last_error_class,
     )
 
 
@@ -317,11 +370,18 @@ async def embed_texts_async(
     }
     headers = _headers(profile.api_key)
     last_err: Exception | None = None
+    last_status: int | None = None
+    last_retry_after: float | None = None
+    last_error_class: str | None = None
     async with httpx.AsyncClient(timeout=profile.timeout_s) as client:
         for attempt in range(profile.max_retries):
             try:
                 resp = await client.post(url, json=body, headers=headers)
                 if _retryable(resp.status_code):
+                    last_status = resp.status_code
+                    last_retry_after = embedding_errors.parse_retry_after(
+                        (getattr(resp, 'headers', None) or {}).get('Retry-After'))
+                    last_error_class = None
                     last_err = RuntimeError(
                         f'gemini upstream {resp.status_code}: {resp.text[:200]!r}')
                 elif resp.status_code >= 400:
@@ -332,10 +392,17 @@ async def embed_texts_async(
                 raise
             except (httpx.TransportError, ValueError) as exc:
                 last_err = exc
+                last_status = None
+                last_retry_after = None
+                last_error_class = (
+                    embedding_errors.TIMEOUT
+                    if isinstance(exc, httpx.TimeoutException) else None
+                )
             if attempt < profile.max_retries - 1:
                 await asyncio.sleep(_backoff(attempt))
-    raise RuntimeError(
-        f'gemini batchEmbedContents failed after {profile.max_retries} retries: {last_err}'
+    raise embedding_errors.make_embedding_error(
+        f'gemini batchEmbedContents failed after {profile.max_retries} retries: {last_err}',
+        status=last_status, retry_after=last_retry_after, error_class=last_error_class,
     )
 
 
@@ -402,11 +469,18 @@ async def generate_media_caption_async(
         'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 256},
     }
     last_err: Exception | None = None
+    last_status: int | None = None
+    last_retry_after: float | None = None
+    last_error_class: str | None = None
     async with httpx.AsyncClient(timeout=profile.timeout_s) as client:
         for attempt in range(profile.max_retries):
             try:
                 resp = await client.post(url, json=body, headers=headers)
                 if _retryable(resp.status_code):
+                    last_status = resp.status_code
+                    last_retry_after = embedding_errors.parse_retry_after(
+                        (getattr(resp, 'headers', None) or {}).get('Retry-After'))
+                    last_error_class = None
                     last_err = RuntimeError(
                         f'gemini caption upstream {resp.status_code}: {resp.text[:200]!r}')
                 elif resp.status_code >= 400:
@@ -417,8 +491,15 @@ async def generate_media_caption_async(
                 raise
             except (httpx.TransportError, ValueError) as exc:
                 last_err = exc
+                last_status = None
+                last_retry_after = None
+                last_error_class = (
+                    embedding_errors.TIMEOUT
+                    if isinstance(exc, httpx.TimeoutException) else None
+                )
             if attempt < profile.max_retries - 1:
                 await asyncio.sleep(_backoff(attempt))
-    raise RuntimeError(
-        f'gemini generateContent failed after {profile.max_retries} retries: {last_err}'
+    raise embedding_errors.make_embedding_error(
+        f'gemini generateContent failed after {profile.max_retries} retries: {last_err}',
+        status=last_status, retry_after=last_retry_after, error_class=last_error_class,
     )
