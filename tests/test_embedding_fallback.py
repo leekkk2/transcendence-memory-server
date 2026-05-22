@@ -324,8 +324,8 @@ def test_all_profiles_fail_raises_no_upstream_available(monkeypatch):
     assert "fallback" in str(ei.value)
 
     # 两条 profile 各 +1 失败计数
-    assert er_mod._breakers["primary"].consecutive_fails == 1
-    assert er_mod._breakers["fallback"].consecutive_fails == 1
+    assert er_mod._breakers["embed:primary"].consecutive_fails == 1
+    assert er_mod._breakers["embed:fallback"].consecutive_fails == 1
 
 
 # =========================================================================
@@ -363,7 +363,7 @@ def test_4xx_non_429_does_not_fallback(monkeypatch, status_code):
     assert len(fallback_calls) == 0, "非 429 错误不应 fallback"
 
     # breaker 不计入失败（rerun 必须仍然能访问 primary，不会被 cooling 挡住）
-    state = er_mod._breakers.get("primary")
+    state = er_mod._breakers.get("embed:primary")
     assert state is None or state.consecutive_fails == 0, (
         f"401/400/403 不应触发 breaker，但 state={state}"
     )
@@ -386,7 +386,7 @@ def test_401_does_not_trigger_breaker_even_after_many_calls(monkeypatch):
         with pytest.raises(httpx.HTTPStatusError):
             asyncio.run(func(["x"]))
 
-    state = er_mod._breakers.get("primary")
+    state = er_mod._breakers.get("embed:primary")
     assert state is None or state.consecutive_fails == 0
 
 
@@ -435,7 +435,7 @@ def test_half_open_after_cooling_expires(monkeypatch):
     assert out.shape == (1, 8)
 
     # 探活成功 → state 完全重置
-    state = er_mod._breakers["primary"]
+    state = er_mod._breakers["embed:primary"]
     assert state.consecutive_fails == 0
     assert state.cooling_until_ts == 0.0
     assert state.half_open is False
@@ -449,8 +449,9 @@ def test_half_open_after_cooling_expires(monkeypatch):
 def test_reset_breaker_on_unknown_profile_is_noop():
     """reset_breaker 对从未见过的 profile 名 → 返回 False，不抛。"""
     assert reset_breaker("never-seen-profile") is False
-    # breaker 字典里仍然没有这条记录（reset 不应隐式创建）
-    assert "never-seen-profile" not in er_mod._breakers
+    # breaker 字典里仍然没有这条记录（reset 不应隐式创建）；key 为复合
+    # {category}:{profile}，embedding 链路前缀 embed:。
+    assert "embed:never-seen-profile" not in er_mod._breakers
 
 
 def test_breakers_are_per_profile_independent(monkeypatch):
@@ -478,10 +479,10 @@ def test_breakers_are_per_profile_independent(monkeypatch):
             asyncio.run(func_a(["x"]))
 
     # alpha cooling — beta 应该完全不受影响
-    assert er_mod._breakers["alpha"].cooling_until_ts > 0
+    assert er_mod._breakers["embed:alpha"].cooling_until_ts > 0
     out = asyncio.run(func_b(["x"]))
     assert out.shape == (1, 8)
-    state_b = er_mod._breakers.get("beta")
+    state_b = er_mod._breakers.get("embed:beta")
     assert state_b is None or state_b.cooling_until_ts == 0.0
 
 
@@ -530,4 +531,4 @@ def test_typed_quota_error_triggers_fallback(monkeypatch):
     assert out.shape == (1, 8)
     assert calls == ["primary", "fallback"]
     # primary 的 quota 失败计入 breaker
-    assert er_mod._breakers["primary"].consecutive_fails == 1
+    assert er_mod._breakers["embed:primary"].consecutive_fails == 1
