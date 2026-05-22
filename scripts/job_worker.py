@@ -84,7 +84,7 @@ class JobWorker:
         self.queue = queue
         self.command_resolver = command_resolver
         # v0.10.1 fix：worker subprocess 必须拿到 job.container，下游
-        # task_rag_runtime._resolve_profile_for_worker() 和 task_rag_lancedb_ingest
+        # task_rag_runtime._resolve_chain_for_worker() 和 task_rag_lancedb_ingest
         # 才能按 container 走对应 embedding profile。v0.7.0~v0.10.0 此处默认
         # env_resolver 漏注入 CONTAINER，导致所有 worker 退化到 default route，
         # 多 profile 路由（含 per-request override 之外的 glob/regex/exact）全部失效。

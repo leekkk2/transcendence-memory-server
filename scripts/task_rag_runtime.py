@@ -44,15 +44,24 @@ if embedding_errors is None:  # pragma: no cover - 取决于运行入口
 sys.modules.setdefault('embedding_errors', embedding_errors)
 sys.modules.setdefault('scripts.embedding_errors', embedding_errors)
 
+# 通用 fallback 核心 —— worker subprocess 同步链路用 run_with_fallback_sync。
+# 同款双重 import + 模块身份归一：worker（bare import）与 server（package
+# import）必须共用同一份 breaker dict，否则跨副本计数失效。
+model_fallback = (
+    sys.modules.get('scripts.model_fallback')
+    or sys.modules.get('model_fallback')
+)
+if model_fallback is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import model_fallback  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import model_fallback  # type: ignore[no-redef]
+sys.modules.setdefault('model_fallback', model_fallback)
+sys.modules.setdefault('scripts.model_fallback', model_fallback)
+
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 TASKS = WS / 'tasks'
-
-# Google native endpoint 模板（fallback path 用，本身不依赖 profile）。
-GOOGLE_BASE_URL = os.getenv(
-    'GOOGLE_EMBEDDING_BASE_URL',
-    'https://generativelanguage.googleapis.com/v1beta/models',
-)
 
 # 重试配置：上游限速时（429/5xx）走指数退避 + 抖动。
 # 单条 chunk 最坏耗时 = MAX_RETRIES * (TIMEOUT + 平均退避)，控制在 ~3 分钟内，
@@ -113,15 +122,16 @@ def _backoff_delay(attempt: int, retry_after: float | None) -> float:
     return delay
 
 
-def _resolve_profile_for_worker():
-    """根据 CONTAINER / TM_EMBEDDING_PROFILE_OVERRIDE env 拿 registry profile。
+def _resolve_chain_for_worker() -> list:
+    """根据 CONTAINER / TM_EMBEDDING_PROFILE_OVERRIDE env 解析 embedding profile 链。
 
-    优先级（高 → 低）：
-      1. TM_EMBEDDING_PROFILE_OVERRIDE — γ 的 server 端点 per-request override 注入
-      2. CONTAINER env → registry.resolve(container).embedding
-      3. TM_WORKER_CONTAINER env（旧别名）
-      4. 缺失时走 registry.default_route — 向后兼容 legacy env-only 部署
-         （这条 fallback 保证旧测试 / 旧 docker-compose 不指定 CONTAINER 时仍能工作）
+    返回 ``[primary, *fallbacks]``，供 run_with_fallback_sync 按序尝试：
+      1. TM_EMBEDDING_PROFILE_OVERRIDE — 显式单 profile override。override 是
+         「就用这一条」语义，不展开 route 的 fallback，链仅一元素。
+      2. CONTAINER / TM_WORKER_CONTAINER env → registry.resolve(container) 拿
+         Route，展开 ``[embedding, *embedding_fallbacks]``。
+      3. 缺失 → default route 展开（向后兼容 legacy env-only 部署 / 旧测试 /
+         不指定 CONTAINER 的旧 docker-compose）。
     """
     try:
         from embedding_registry import get_registry  # type: ignore
@@ -135,40 +145,31 @@ def _resolve_profile_for_worker():
 
     override = os.environ.get('TM_EMBEDDING_PROFILE_OVERRIDE', '').strip()
     if override:
-        return registry.get_profile(override)
+        return [registry.get_profile(override)]
 
     container = os.environ.get('CONTAINER') or os.environ.get('TM_WORKER_CONTAINER')
-    if container:
-        route = registry.resolve(container)
-        return registry.get_profile(route.embedding)
+    route = (
+        registry.resolve(container) if container
+        else registry._profiles.default_route
+    )
+    return [
+        registry.get_profile(route.embedding),
+        *(registry.get_profile(fb) for fb in route.embedding_fallbacks),
+    ]
 
-    # 缺失 → 用 default route（registry 总有一个 default，legacy env 路径会合成 'legacy' profile）
-    return registry.get_profile(registry._profiles.default_route.embedding)
 
-
-def embed_text(
-    text: str, mode: str | None = None, title: str | None = None,
+def _embed_text_single(
+    profile, text: str, mode: str, title: str | None,
 ) -> np.ndarray:
-    """单条文本 embedding 调用，专供 worker 使用。
+    """单 profile 的同步 embedding 执行器 —— run_with_fallback_sync 的 per-profile 回调。
 
-    路由：CONTAINER env -> registry.resolve -> profile -> /embeddings 调用。
-    fallback：若 profile.api_key 以 'AIza' 开头（个人 Google API Key），
-    在 OpenAI-style 调用全部失败后改走 Google native endpoint。
+    profile 内部 429/5xx 走指数退避重试；4xx 非 429 立即抛 requests.HTTPError
+    （上层判 non-fallback、直接上抛）；重试耗尽归一为 typed embedding_errors，
+    让 fallback runner 按 error_class 决定是否切下一条 profile。
 
-    provider == 'gemini_native' 时改走 Gemini 原生 `:embedContent` 协议
-    （单 text part）—— 与多模态摄取走同一向量空间，保证 /search 查询向量
-    与已存媒体向量可比。
-
-    P0 asymmetric retrieval：`mode`（query|document）控制 gemini-embedding-2
-    的提示词前缀。优先级 = 显式参数 > `TM_EMBED_MODE` env > 'document'。
-    `/search` 子进程注入 `TM_EMBED_MODE=query`，摄取子进程不注入 → document。
-    openai_compatible provider 是对称模型，mode 对其为 no-op。
+    provider == 'gemini_native' 时单 profile 走 Gemini 原生 `:embedContent`
+    协议（单 text part），与多模态摄取同一向量空间。
     """
-    profile = _resolve_profile_for_worker()
-
-    # 显式参数最高优先；其次 env（server 端按调用语义注入）；兜底 document。
-    effective_mode = mode or os.environ.get('TM_EMBED_MODE') or 'document'
-
     if getattr(profile, 'provider', '') == 'gemini_native':
         try:
             from gemini_native_embed import embed_parts_sync, text_part  # type: ignore[import-not-found]
@@ -177,9 +178,7 @@ def embed_text(
                 embed_parts_sync,
                 text_part,
             )
-        return embed_parts_sync(
-            profile, [text_part(text)], mode=effective_mode, title=title,
-        )
+        return embed_parts_sync(profile, [text_part(text)], mode=mode, title=title)
 
     api_key = profile.api_key
     if not api_key:
@@ -187,14 +186,12 @@ def embed_text(
             f"profile {profile.name!r} has no api_key (check api_key_env)"
         )
 
-    base_url = profile.base_url
-    model = profile.model
-    url = f'{base_url.rstrip("/")}/embeddings'
+    url = f'{profile.base_url.rstrip("/")}/embeddings'
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
     }
-    payload: dict = {'model': model, 'input': text}
+    payload: dict = {'model': profile.model, 'input': text}
     # Matryoshka：profile.request_dim 指定时传 OpenAI `dimensions=N`
     request_dim = getattr(profile, 'request_dim', None)
     if request_dim:
@@ -251,32 +248,46 @@ def embed_text(
         )
         time.sleep(delay)
 
-    # Google native fallback：现有 special path，保留语义
-    if api_key.startswith('AIza'):
-        try:
-            google_url = f'{GOOGLE_BASE_URL.rstrip("/")}/{model}:embedContent?key={api_key}'
-            google_payload = {'content': {'parts': [{'text': text}]}}
-            response = requests.post(google_url, json=google_payload, timeout=_EMBED_TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
-            return np.array(data['embedding']['values'], dtype='float32')
-        except Exception as exc:
-            # Google fallback 也失败 —— 记录后与主链一起归一为 typed exception
-            last_err = exc
-            g_status = getattr(getattr(exc, 'response', None), 'status_code', None)
-            if g_status is not None:
-                last_status = int(g_status)
-                last_retry_after = None
-                last_error_class = None
-            elif isinstance(exc, requests.Timeout):
-                last_status = None
-                last_retry_after = None
-                last_error_class = embedding_errors.TIMEOUT
-
-    # 重试耗尽 —— 归一为 typed exception，让上层 backlog 调度按 error_class 决策。
+    # 重试耗尽 —— 归一为 typed exception，让上层 fallback / backlog 调度按
+    # error_class 决策（quota/timeout/transient 可切下一条 profile）。
     raise embedding_errors.make_embedding_error(
         f'Embedding request failed after {_EMBED_MAX_RETRIES} retries: {last_err}',
         status=last_status,
         retry_after=last_retry_after,
         error_class=last_error_class,
+    )
+
+
+def embed_text(
+    text: str, mode: str | None = None, title: str | None = None,
+) -> np.ndarray:
+    """单条文本 embedding 调用，专供 worker 使用。
+
+    路由：CONTAINER env → registry.resolve → ``[primary, *fallbacks]`` 链。
+    主 profile 不可用（429/5xx/超时/typed quota 等）时由 run_with_fallback_sync
+    按序切下一条备用 profile，并与 server 端共用同一份 circuit breaker
+    （category=embed）；4xx 非 429 / permanent 错误不前进、原样上抛。
+
+    历史的「`AIza` 开头 key → Google native endpoint」单点 fallback 已被数组级
+    fallback + `gemini_native` provider 正式取代 —— 备用 Google endpoint 现应
+    作为一条独立 `gemini_native` profile 配进 route.embedding_fallbacks。
+
+    provider == 'gemini_native' 时单 profile 走 Gemini 原生 `:embedContent`
+    协议 —— 与多模态摄取走同一向量空间，保证 /search 查询向量与已存媒体
+    向量可比。
+
+    P0 asymmetric retrieval：`mode`（query|document）控制 gemini-embedding-2
+    的提示词前缀。优先级 = 显式参数 > `TM_EMBED_MODE` env > 'document'。
+    `/search` 子进程注入 `TM_EMBED_MODE=query`，摄取子进程不注入 → document。
+    openai_compatible provider 是对称模型，mode 对其为 no-op。
+    """
+    chain = _resolve_chain_for_worker()
+    # 显式参数最高优先；其次 env（server 端按调用语义注入）；兜底 document。
+    effective_mode = mode or os.environ.get('TM_EMBED_MODE') or 'document'
+
+    def _executor(profile) -> np.ndarray:
+        return _embed_text_single(profile, text, effective_mode, title)
+
+    return model_fallback.run_with_fallback_sync(
+        model_fallback.CATEGORY_EMBED, chain, _executor,
     )
