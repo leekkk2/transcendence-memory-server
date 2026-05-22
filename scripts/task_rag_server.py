@@ -15,12 +15,12 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-import tempfile
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -157,13 +157,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Async semaphores for unbounded-cost RAG paths (lightrag write/query, mineru
-# upload). One semaphore per category so they don't starve each other.
+# Async semaphore for the unbounded-cost RAG query path. Document ingestion
+# (text/file) no longer runs in-process — it is deferred to the background job
+# worker via the persistent queue — so its write/upload semaphores are gone.
 import asyncio as _asyncio
 
-_RAG_WRITE_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_RAG_WRITES', 1))
 _RAG_QUERY_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_RAG_QUERIES', 2))
-_DOC_FILE_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_DOC_FILES', 1))
 SERVER_SCRIPTS = Path(__file__).resolve().parent
 WORKSPACE_SCRIPTS = WS / 'scripts'
 RAG_API_KEY = os.environ.get('RAG_API_KEY', '')
@@ -1173,6 +1172,19 @@ def _build_ingest_cmd(op: str, container: str, payload: dict) -> list[str]:
         if payload.get('doc_id'):
             cmd += ['--doc-id', str(payload['doc_id'])]
         return cmd
+    if op in ('ingest-document-text', 'ingest-document-file'):
+        mode = 'text' if op == 'ingest-document-text' else 'file'
+        cmd = [
+            str(script_path('task_rag_graph_ingest.py')),
+            '--container', container,
+            '--mode', mode,
+            '--input', str(payload.get('input_path', '')),
+        ]
+        if payload.get('description'):
+            cmd += ['--description', str(payload['description'])]
+        if payload.get('parse_method'):
+            cmd += ['--parse-method', str(payload['parse_method'])]
+        return cmd
     raise ValueError(f'unknown op: {op}')
 
 
@@ -1184,12 +1196,15 @@ def _enqueue_or_run(
     wait: bool,
     label: str = '',
     embedding_override: str | None = None,
+    coalesce: bool = True,
 ) -> CommandResponse:
     """Dispatch one of the three ingest ops, choosing between three modes:
 
     1. wait=False (default): enqueue into persistent SQLite queue, return job_id.
        The single background worker drains the queue at a steady, host-friendly
-       pace. Coalescing prevents duplicate enqueues for (op, container).
+       pace. Coalescing prevents duplicate enqueues for (op, container) — pass
+       coalesce=False for ops whose payload carries a distinct per-call input
+       (e.g. document ingestion) so concurrent posts are not collapsed/lost.
 
     2. wait=True with worker running: enqueue + poll queue until done/timeout.
        Lets a synchronous client share the same coalescing/backoff machinery
@@ -1223,6 +1238,7 @@ def _enqueue_or_run(
             job_id = queue.enqueue(
                 op=op, container=container, payload=payload,
                 label=label or op, max_pending=max_pending,
+                coalesce=coalesce,
             )
         except QueueFullError as exc:
             raise HTTPException(
@@ -1246,6 +1262,7 @@ def _enqueue_or_run(
             job_id = queue.enqueue(
                 op=op, container=container, payload=payload,
                 label=label or op, max_pending=max_pending,
+                coalesce=coalesce,
             )
         except QueueFullError as exc:
             raise HTTPException(
@@ -2095,31 +2112,54 @@ def _require_lightrag_ready() -> None:
     raise HTTPException(status_code=503, detail=f'LightRAG not available.{pkg}{missing}')
 
 
-@app.post('/documents/text', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
-async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
+def _inbox_dir(container: str) -> Path:
+    """container 的异步入库暂存目录，建图 CLI 子进程从这里读输入并在成功后清理。"""
+    d = WS / 'tasks' / 'rag' / 'containers' / container / '_inbox'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _stage_inbox_text(container: str, text: str) -> Path:
+    """把 /documents/text 的正文落到 container 的 _inbox，返回绝对路径。
+
+    用 uuid 命名（不依赖 job_id —— job_id 要 enqueue 后才有，会形成先有鸡先有
+    蛋的依赖）。"""
+    path = _inbox_dir(container) / f'text-{uuid.uuid4().hex}.txt'
+    path.write_text(text, encoding='utf-8')
+    return path.resolve()
+
+
+@app.post('/documents/text', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
+def ingest_document_text(req: DocumentTextReq) -> CommandResponse:
+    """把纯文本异步入库到 container 知识图谱。
+
+    建图（LightRAG ainsert）会跑数十秒到数分钟 —— 同步等待会撞边缘代理的
+    100s 超时。这里把正文落到 _inbox 后立即入队并返回 job 标识；后台 worker
+    驱动 task_rag_graph_ingest.py 子进程完成建图。轮询 GET /jobs/{pid} 查进度。
+    """
     validate_container_name(req.container)
     _require_lightrag_ready()
-    _admit_or_503(req.container, op='documents/text')
-    # embedding_model override 在 in-process LightRAG 路径暂不生效（Phase 1+：
-    # 需要 β 的 registry-based cache key 才能切换 instance）。当前接受字段以保持
-    # API 兼容，但若客户端真的指定了 override，记一行 warning 提示无效。
+    # embedding_model override 在建图路径暂不生效（需 registry-based cache key
+    # 才能切换 instance）。接受字段以保持 API 兼容，指定时记一行 warning。
     if req.embedding_model:
         logger.warning(
-            'documents/text received embedding_model=%r but in-process LightRAG path '
-            'does not honor per-request override in Phase 1; using route default.',
+            'documents/text received embedding_model=%r but the graph-ingest path '
+            'does not honor per-request override yet; using route default.',
             req.embedding_model,
         )
-    # Cap concurrent lightrag writes — each call drives many embedding+LLM
-    # invocations and holds the container's KV graph lock.
-    async with _RAG_WRITE_SEM:
-        lightrag = await get_lightrag(req.container)
-        await lightrag.ainsert(req.text)
-    return QueryResponse(
-        status='ok',
-        query='',
+    input_path = _stage_inbox_text(req.container, req.text)
+    payload: dict[str, Any] = {'input_path': str(input_path)}
+    if req.description:
+        payload['description'] = req.description
+    return _enqueue_or_run(
+        op='ingest-document-text',
         container=req.container,
-        answer=f'Text ingested into container {req.container} knowledge graph.',
-        mode='insert',
+        payload=payload,
+        timeout_s=300,
+        wait=False,
+        label='ingest-document-text',
+        embedding_override=req.embedding_model,
+        coalesce=False,
     )
 
 
@@ -2136,91 +2176,99 @@ def _sanitize_upload_filename(raw: str | None) -> str:
     return name
 
 
-@app.post('/documents/file', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
-async def ingest_document_file(
-    container: str = Form(...),
-    file: UploadFile = File(...),
-    parse_method: str | None = Form(default=None),
-    embedding_model: str | None = Form(default=None),
-) -> QueryResponse:
-    """多模态文档入库：PDF / Office / 图片 / HTML / Markdown 等。
+async def _stage_inbox_upload(container: str, filename: str, file: UploadFile) -> Path:
+    """把上传文件流式落到 container 的 _inbox，做大小上限校验，返回绝对路径。
 
-    底层走 RAGAnything.process_document_complete → mineru parser → LightRAG。
-    与 /documents/text 共享同一个 container working_dir，写入同一知识图谱。
+    流式写盘（1 MB 分块）避免把大文件整体读进内存；超过 MAX_UPLOAD_BYTES 即
+    413 并清理半成品。"""
+    inbox = _inbox_dir(container)
+    saved = inbox / f'file-{uuid.uuid4().hex}-{filename}'
+    # 防御性：验证 resolve 后仍在 inbox 内
+    if not str(saved.resolve()).startswith(str(inbox.resolve()) + os.sep):
+        raise HTTPException(status_code=400, detail='invalid filename: path traversal')
+    total = 0
+    try:
+        with saved.open('wb') as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f'file exceeds max upload size {_MAX_UPLOAD_BYTES} bytes',
+                    )
+                f.write(chunk)
+    except Exception:
+        saved.unlink(missing_ok=True)
+        raise
+    return saved.resolve()
 
-    Mineru parsing routinely uses 1-2 GB RAM; we admit-gate + serialize via
-    _DOC_FILE_SEM (default concurrency=1) so two simultaneous uploads can't
-    OOM a 1.5 GB container.
+
+async def _ingest_uploaded_document(
+    container: str,
+    file: UploadFile,
+    parse_method: str | None,
+    embedding_model: str | None,
+) -> CommandResponse:
+    """/documents/file 与 /documents/upload 的共享异步入库逻辑。
+
+    把上传文件落到 _inbox 后立即入队（op=ingest-document-file）并返回 job 标识；
+    后台 worker 驱动 task_rag_graph_ingest.py 子进程跑 RAG-Anything 解析 + 建图，
+    避免同步等待数十秒到数分钟撞边缘代理 100s 超时。
     """
     validate_container_name(container)
     _require_lightrag_ready()
     if get_raganything is None:
         raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
-
     filename = _sanitize_upload_filename(file.filename)
-    _admit_or_503(container, op='documents/file')
     if embedding_model:
-        # 与 /documents/text 同样的 Phase 1 限制：in-process RAGAnything 还未接到 registry 切换
         logger.warning(
-            'documents/file received embedding_model=%r but in-process RAGAnything path '
-            'does not honor per-request override in Phase 1; using route default.',
+            'documents/file received embedding_model=%r but the graph-ingest path '
+            'does not honor per-request override yet; using route default.',
             embedding_model,
         )
-
-    # Stage uploads under /data/scratch (persistent volume, ~no size cap)
-    # rather than /tmp tmpfs (128 MB), since MAX_UPLOAD_BYTES defaults to
-    # 200 MB and mineru's intermediate parse output can be hundreds of MB more.
-    scratch_root = WS / 'scratch' / 'uploads'
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path(tempfile.mkdtemp(prefix='tm-upload-', dir=str(scratch_root)))
-    saved = tmp_dir / filename
-    # 防御性：验证 resolve 后仍在 tmp_dir 内
-    if not str(saved.resolve()).startswith(str(tmp_dir.resolve()) + os.sep):
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail='invalid filename: path traversal')
-
-    total = 0
-    try:
-        async with _DOC_FILE_SEM:
-            with saved.open('wb') as f:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > _MAX_UPLOAD_BYTES:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=f'file exceeds max upload size {_MAX_UPLOAD_BYTES} bytes',
-                        )
-                    f.write(chunk)
-
-            rag = await get_raganything(container)
-            parse_output = tmp_dir / 'parsed'
-            parse_output.mkdir(exist_ok=True)
-            parser_kwargs: dict[str, Any] = {}
-            backend = os.environ.get('RAG_PARSER_BACKEND')
-            if backend:
-                parser_kwargs['backend'] = backend
-            lang = os.environ.get('RAG_PARSER_LANG')
-            if lang:
-                parser_kwargs['lang'] = lang
-            await rag.process_document_complete(
-                file_path=str(saved),
-                output_dir=str(parse_output),
-                parse_method=parse_method or os.environ.get('RAG_PARSE_METHOD', 'auto'),
-                **parser_kwargs,
-            )
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    return QueryResponse(
-        status='ok',
-        query='',
+    saved = await _stage_inbox_upload(container, filename, file)
+    payload: dict[str, Any] = {'input_path': str(saved)}
+    if parse_method:
+        payload['parse_method'] = parse_method
+    return _enqueue_or_run(
+        op='ingest-document-file',
         container=container,
-        answer=f'Document {filename} ({total} bytes) ingested into container {container}.',
-        mode='insert',
+        payload=payload,
+        timeout_s=600,
+        wait=False,
+        label='ingest-document-file',
+        embedding_override=embedding_model,
+        coalesce=False,
     )
+
+
+@app.post('/documents/file', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
+async def ingest_document_file(
+    container: str = Form(...),
+    file: UploadFile = File(...),
+    parse_method: str | None = Form(default=None),
+    embedding_model: str | None = Form(default=None),
+) -> CommandResponse:
+    """多模态文档异步入库：PDF / Office / 图片 / HTML / Markdown 等。
+
+    底层走 RAGAnything.process_document_complete → mineru parser → LightRAG，
+    与 /documents/text 写入同一容器知识图谱。轮询 GET /jobs/{pid} 查进度。
+    """
+    return await _ingest_uploaded_document(container, file, parse_method, embedding_model)
+
+
+@app.post('/documents/upload', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
+async def upload_document(
+    container: str = Form(...),
+    file: UploadFile = File(...),
+    parse_method: str | None = Form(default=None),
+    embedding_model: str | None = Form(default=None),
+) -> CommandResponse:
+    """/documents/file 的别名路由，行为完全一致（异步入队多模态文档）。"""
+    return await _ingest_uploaded_document(container, file, parse_method, embedding_model)
 
 
 _EMBED_MM_MAX_BYTES = int(os.environ.get('EMBED_MM_MAX_BYTES', str(20 * 1024 * 1024)))

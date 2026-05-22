@@ -323,6 +323,7 @@ def default_command_resolver(scripts_dir: Path) -> Callable[[Job], list[str]]:
     - 'embed' / 'ingest-memory' → task_rag_lancedb_ingest.py
     - 'embed-backlog-retry' → task_rag_lancedb_ingest.py --mode embed-backlog-retry
     - 'ingest-structured' → task_rag_structured_ingest.py
+    - 'ingest-document-text' / 'ingest-document-file' → task_rag_graph_ingest.py
     """
     scripts_dir = Path(scripts_dir)
 
@@ -360,6 +361,23 @@ def default_command_resolver(scripts_dir: Path) -> Callable[[Job], list[str]]:
             cmd += ["--doc-type", doc_type]
             if doc_id:
                 cmd += ["--doc-id", doc_id]
+            return cmd
+        if job.op in ("ingest-document-text", "ingest-document-file"):
+            # 知识图谱建图（LightRAG / RAG-Anything）异步化：HTTP handler 把正文/
+            # 上传文件落到 _inbox，这里把 job 解析到建图 CLI 子进程。
+            mode = "text" if job.op == "ingest-document-text" else "file"
+            cmd = [
+                str(scripts_dir / "task_rag_graph_ingest.py"),
+                "--container", job.container,
+                "--mode", mode,
+                "--input", str(job.payload.get("input_path", "")),
+            ]
+            description = job.payload.get("description")
+            if description:
+                cmd += ["--description", str(description)]
+            parse_method = job.payload.get("parse_method")
+            if parse_method:
+                cmd += ["--parse-method", str(parse_method)]
             return cmd
         raise ValueError(f"unknown op: {job.op}")
 
