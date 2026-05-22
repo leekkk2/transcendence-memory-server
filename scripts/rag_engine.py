@@ -311,8 +311,15 @@ async def get_lightrag(container: str) -> Any:
 
         # 只在 route 实际配置 reranker 时才传 rerank_model_func / min_rerank_score；
         # 否则保持 v0.7.0 行为完全等价 — 不动 LightRAG 默认值。
+        # workspace 必须显式传 "" —— LightRAG 的 workspace 字段默认从 WORKSPACE
+        # 环境变量取值，而本服务用 WORKSPACE 定位数据根目录（部署时常设为绝对
+        # 路径）。不显式覆盖会让 LightRAG 内部 os.path.join(working_dir, workspace)
+        # 因右侧是绝对路径而坍缩，所有容器的 KG 存储挤进同一目录、per-container
+        # 隔离失效（且换 embedding 维度后旧 KG 触发 nano-vdb dim mismatch）。
+        # 传 "" 让 workspace_dir == working_dir，落在已隔离好的 per-container 目录。
         lightrag_kwargs: dict[str, Any] = dict(
             working_dir=str(working_dir),
+            workspace="",
             llm_model_func=make_llm_func(llm_chain),
             embedding_func=embedding_func,
         )
