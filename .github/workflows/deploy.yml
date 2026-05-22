@@ -274,6 +274,39 @@ jobs:
             $DEPLOY_SUDO docker compose logs --tail=80 rag-server || true
             exit 1
           fi
+          # Post-deploy cleanup: the new image is confirmed healthy and
+          # serving, so every other image of this repo is a superseded
+          # release — reclaim it now. The pre-pull prune keeps rolling
+          # :full/:lite tags (the running container may be on one), so only
+          # this post-deploy pass can drop a stale rolling tag an earlier
+          # release left behind — that accretion is what eventually fills
+          # the disk and ENOSPCs a future pull.
+          #
+          # Compare image IDs, not tags: a rolling tag still pointing at the
+          # live image is kept; one pointing at an old image is dropped — and
+          # ID comparison sidesteps the docker.io/ prefix mismatch (docker
+          # displays Hub repos without the registry prefix). `docker rmi`
+          # without -f is a safety net: it refuses anything a container holds.
+          # We filter with `docker images <repo>` on the Hub-normalized repo
+          # (docker.io/ prefix stripped) so it matches regardless of how the
+          # daemon prints the registry; non-Hub registries keep their prefix.
+          repo_match=${image_base#docker.io/}
+          repo_match=${repo_match#index.docker.io/}
+          keep_id=$($DEPLOY_SUDO docker image inspect \
+            --format '{{.Id}}' "$TM_IMAGE" 2>/dev/null || true)
+          ( $DEPLOY_SUDO docker images "$repo_match" \
+              --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+              | while read -r ref; do
+                  case "$ref" in *'<none>'*) continue ;; esac
+                  ref_id=$($DEPLOY_SUDO docker image inspect \
+                    --format '{{.Id}}' "$ref" 2>/dev/null || true)
+                  [ -n "$ref_id" ] && [ "$ref_id" != "$keep_id" ] || continue
+                  echo "[prune] removing superseded image: $ref"
+                  $DEPLOY_SUDO docker rmi "$ref" 2>/dev/null || true
+                done
+          ) || true
+          # Sweep any now-untagged layers the tag removals left dangling.
+          $DEPLOY_SUDO docker image prune -f >/dev/null 2>&1 || true
           REMOTE
 
       - name: Smoke test

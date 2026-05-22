@@ -310,7 +310,9 @@ def test_rerank_cohere_v2_compatible_schema(monkeypatch):
 
 
 def test_rerank_malformed_response_raises(monkeypatch):
-    """上游返回非预期 schema（缺 results）→ 应抛 ValueError 暴露问题。"""
+    """上游返回非预期 schema（缺 results）→ 单 profile 链重试用尽后由
+    run_with_fallback 归一为 NoUpstreamAvailable（RuntimeError 子类），
+    错误信息保留根因 'missing results'。"""
     profile = _make_profile()
     reg = _make_registry()
     func, _ = reg.build_rerank_func(profile)
@@ -318,7 +320,7 @@ def test_rerank_malformed_response_raises(monkeypatch):
     # 三次都返回坏 schema：重试用尽后抛
     bad_resp = [_MockResponse(200, {"data": [{"index": 0, "score": 0.5}]}) for _ in range(3)]
     _install_fake_httpx(monkeypatch, bad_resp)
-    with pytest.raises(ValueError, match=r"missing 'results'"):
+    with pytest.raises(RuntimeError, match=r"missing.+results"):
         asyncio.run(func("q", ["d0"], top_n=1))
 
 

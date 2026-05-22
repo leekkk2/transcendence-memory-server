@@ -19,10 +19,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# 通用 fallback 核心 —— LLM chat 链路用 run_with_fallback 跨 profile 切换。
+# 双重 import + 模块身份归一，与 embedding_registry 同款（worker/server 两种
+# 入口共用同一份 breaker dict）。
+model_fallback = (
+    sys.modules.get('scripts.model_fallback')
+    or sys.modules.get('model_fallback')
+)
+if model_fallback is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import model_fallback  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import model_fallback  # type: ignore[no-redef]
+sys.modules.setdefault('model_fallback', model_fallback)
+sys.modules.setdefault('scripts.model_fallback', model_fallback)
 
 # LLM 仍由 env 直接驱动（multi-LLM 升级是后续 phase，本次只动 embedding）。
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
@@ -110,7 +126,51 @@ async def call_openai_chat(
     raise last_exc
 
 
+def make_llm_func(chain: list) -> Any:
+    """构造注入 LightRAG 的 ``llm_model_func`` —— 按 chain 顺序 fallback 的 LLM 调用。
+
+    Args:
+        chain: ``[primary, *fallbacks]`` 的 LLMProfile 列表。主 profile 不可用
+            （429/5xx/超时/typed quota 等）时由 run_with_fallback 切下一条；
+            单元素链（无 fallback 配置 / legacy env）行为等价单 profile。
+
+    Returns:
+        async ``(prompt, system_prompt=None, **kwargs) -> str``，签名与 LightRAG
+        期望的 llm_model_func 对齐。
+
+    设计：``call_openai_chat`` 保持为单 profile 执行器（per-profile 指数退避
+    重试不变）；本工厂只在其外面套一层跨 profile fallback。
+    """
+    async def _llm_func(prompt: str, system_prompt: str | None = None, **_: Any) -> str:
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        async def _executor(profile: Any) -> str:
+            return await call_openai_chat(
+                base_url=profile.base_url,
+                api_key=profile.api_key,
+                model=profile.model,
+                messages=messages,
+                timeout=profile.timeout_s,
+                label="LLM",
+            )
+
+        return await model_fallback.run_with_fallback(
+            model_fallback.CATEGORY_LLM, chain, _executor,
+        )
+
+    return _llm_func
+
+
 async def _llm_func(prompt: str, system_prompt: str | None = None, **_: Any) -> str:
+    """legacy 单 profile LLM 调用 —— 由 env (`LLM_*`) 直接驱动。
+
+    保留为 module-level 函数供 `raganything_engine` import 兼容（RAGAnything 的
+    `llm_model_func` 参数）。LightRAG 实例的 LLM 走 `make_llm_func(chain)`，
+    支持数组级 fallback。
+    """
     messages: list[dict[str, Any]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -122,6 +182,32 @@ async def _llm_func(prompt: str, system_prompt: str | None = None, **_: Any) -> 
         messages=messages,
         label="LLM",
     )
+
+
+def _build_llm_chain(route: Any) -> list:
+    """按 route 解析 LLM fallback 链 ``[primary, *fallbacks]``。
+
+    route.llm 为 None（v2 yaml 未配 llm）时合成单元素 legacy 链 —— 用 module
+    级 env 常量构造，行为等价改造前的 env-driven `_llm_func`。
+    """
+    try:
+        from profiles_loader import LLMProfile  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - package import path
+        from scripts.profiles_loader import LLMProfile  # type: ignore[import-not-found]
+
+    if route.llm is None:
+        return [LLMProfile(
+            name="legacy-llm",
+            model=LLM_MODEL,
+            base_url=LLM_BASE_URL,
+            api_key=LLM_API_KEY,
+        )]
+    try:
+        from embedding_registry import get_registry  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - package import path
+        from scripts.embedding_registry import get_registry  # type: ignore[import-not-found]
+    llms = get_registry().profiles.llms
+    return [llms[route.llm], *(llms[fb] for fb in route.llm_fallbacks)]
 
 
 def _container_working_dir(container: str) -> Path:
@@ -172,9 +258,13 @@ def _resolve_route_emb_rrk(
         except ImportError:  # pragma: no cover - 兼容 sys.path 注入 scripts/ 的部署
             from reranker_registry import get_reranker_registry  # type: ignore
         rrk_registry = get_reranker_registry()
-        rrk_profile = rrk_registry.get_profile(route.reranker)
-        rerank_func, rrk_sig = rrk_registry.build_rerank_func(rrk_profile)
-        min_score = rrk_profile.min_score
+        # 展开 reranker fallback 链 [primary, *fallbacks]，整条交给 build_rerank_func。
+        rrk_chain = [
+            rrk_registry.get_profile(route.reranker),
+            *(rrk_registry.get_profile(fb) for fb in route.reranker_fallbacks),
+        ]
+        rerank_func, rrk_sig = rrk_registry.build_rerank_func(rrk_chain)
+        min_score = rrk_chain[0].min_score
 
     return route, embedding_func, emb_sig, rerank_func, rrk_sig, min_score
 
@@ -215,11 +305,15 @@ async def get_lightrag(container: str) -> Any:
         working_dir = _container_working_dir(container)
         working_dir.mkdir(parents=True, exist_ok=True)
 
+        # LLM 按 route 展开 fallback 链注入 —— 无 LLM profile 配置时 chain 退化
+        # 为 legacy env 合成的单元素，行为等价改造前。
+        llm_chain = _build_llm_chain(route)
+
         # 只在 route 实际配置 reranker 时才传 rerank_model_func / min_rerank_score；
         # 否则保持 v0.7.0 行为完全等价 — 不动 LightRAG 默认值。
         lightrag_kwargs: dict[str, Any] = dict(
             working_dir=str(working_dir),
-            llm_model_func=_llm_func,
+            llm_model_func=make_llm_func(llm_chain),
             embedding_func=embedding_func,
         )
         if rerank_func is not None:

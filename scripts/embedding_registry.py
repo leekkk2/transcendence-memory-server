@@ -23,9 +23,10 @@ import logging
 import random
 import re
 import sys
-import threading
-import time
-from dataclasses import dataclass, field
+# time 仍 import：测试通过 `monkeypatch.setattr(embedding_registry.time, ...)`
+# 控制虚拟时钟，需 time 模块在本模块命名空间可达（与 model_fallback 共用同一
+# stdlib 模块对象）。
+import time  # noqa: F401
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -75,150 +76,63 @@ _RETRY_MAX_DELAY_S = 30.0
 _JITTER_RATIO = 0.25
 _MIN_DELAY_S = 0.5
 
-# Circuit breaker 参数 — 默认值可被同名 env 覆盖（运维调参不重新打包）。
-# 选 5/60s/30s：上游短时抽风 ≤ 3-4 次能自愈，5 次定性为持续不可用；30s
-# cooling 比 60s 窗口短，确保偶发抽风快速恢复，又不至于刚 reset 就再次打爆
-# 上游。
-_BREAKER_FAIL_THRESHOLD = 5
-_BREAKER_WINDOW_S = 60.0
-_BREAKER_COOLING_S = 30.0
+# 通用 fallback 核心 — 熔断器 + 泛型 runner 已抽到 scripts/model_fallback.py，
+# 本模块改为它的消费者。沿用 embedding_errors 同款双重 import + 模块身份归一：
+# worker subprocess（bare import）与 server 进程（package import）必须共用同一份
+# breaker dict 与同一份类对象，否则跨副本 isinstance / breaker 计数会失效。
+model_fallback = (
+    sys.modules.get('scripts.model_fallback')
+    or sys.modules.get('model_fallback')
+)
+if model_fallback is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import model_fallback  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import model_fallback  # type: ignore[no-redef]
+sys.modules.setdefault('model_fallback', model_fallback)
+sys.modules.setdefault('scripts.model_fallback', model_fallback)
 
+# re-export：保旧 import 路径不破 — 外部调用方与测试直接
+# `from scripts.embedding_registry import NoUpstreamAvailable / BreakerOpen / ...`。
+NoUpstreamAvailable = model_fallback.NoUpstreamAvailable
+BreakerOpen = model_fallback.BreakerOpen
+BreakerState = model_fallback.BreakerState
+_is_fallback_eligible = model_fallback._is_fallback_eligible
+_clear_all_breakers = model_fallback._clear_all_breakers
+# _breakers 是同一份 dict 对象引用 — 测试直读 embedding_registry._breakers 仍可。
+# 注意：key 现为复合 {category}:{profile}，embedding 链路统一前缀 "embed:"。
+_breakers = model_fallback._breakers
+_BREAKER_FAIL_THRESHOLD = model_fallback._BREAKER_FAIL_THRESHOLD
+_BREAKER_WINDOW_S = model_fallback._BREAKER_WINDOW_S
+_BREAKER_COOLING_S = model_fallback._BREAKER_COOLING_S
 
-class NoUpstreamAvailable(RuntimeError):
-    """所有 primary + fallback 都不可用时抛出 — 区别于单点 HTTP 错误，
-    让上层（rag_engine / lightrag worker）能识别为「整条链路熔断」而非
-    「某次请求失败」。"""
-
-
-class BreakerOpen(RuntimeError):
-    """单个 profile 在 cooling 期间被请求时抛出。fallback 链路 catch 此异常
-    跳到下一条 profile；最后一条仍 open 时升级为 NoUpstreamAvailable。"""
-
-
-@dataclass
-class BreakerState:
-    """Per-profile breaker 状态。closed → open → half-open → closed 状态机。
-
-    - consecutive_fails: 60s 滚动窗口内连续失败计数
-    - last_fail_ts: 最近一次失败的时间戳（用于窗口滚动判定）
-    - cooling_until_ts: > now 时 breaker open；<= now 时为 half-open（允许探活）
-    - half_open: True 时下一次请求是探活请求；成功 reset，失败回 open
-    """
-
-    consecutive_fails: int = 0
-    last_fail_ts: float = 0.0
-    cooling_until_ts: float = 0.0
-    half_open: bool = False
-
-
-# 模块级 breaker 字典 + 锁 — 跨协程并发安全。breaker 状态变更是 O(1)，
-# 锁粒度全表无所谓；breaker 决策路径不调 HTTP，不会成为瓶颈。
-_breakers: dict[str, BreakerState] = {}
-_breakers_lock = threading.Lock()
-
-
-def _get_breaker(name: str) -> BreakerState:
-    """惰性初始化 — 第一次见到的 profile 自动建一条 closed 状态记录。"""
-    with _breakers_lock:
-        state = _breakers.get(name)
-        if state is None:
-            state = BreakerState()
-            _breakers[name] = state
-        return state
-
-
-def _breaker_should_skip(name: str) -> bool:
-    """判定是否要绕过 profile：open 且 cooling 未到期 → True；
-    cooling 到期 → 自动切 half-open（允许下一次请求过去），返回 False。"""
-    state = _get_breaker(name)
-    now = time.monotonic()
-    with _breakers_lock:
-        if state.cooling_until_ts > 0 and now < state.cooling_until_ts:
-            return True  # 真 open，跳过
-        if state.cooling_until_ts > 0 and now >= state.cooling_until_ts:
-            # cooling 到期 — 进入 half-open（cooling_until_ts 暂不清零，
-            # 等 _breaker_mark_success 或 _breaker_mark_failure 决定下一步）
-            state.half_open = True
-    return False
-
-
-def _breaker_mark_failure(name: str) -> None:
-    """记一次失败 — 累加计数；half-open 时直接重新 open；窗口内达阈值 → open。"""
-    state = _get_breaker(name)
-    now = time.monotonic()
-    with _breakers_lock:
-        # 窗口外的失败重置计数 — 60s 之前的失败不参与本轮判定
-        if now - state.last_fail_ts > _BREAKER_WINDOW_S:
-            state.consecutive_fails = 0
-        state.consecutive_fails += 1
-        state.last_fail_ts = now
-        if state.half_open:
-            # half-open 探活失败 → 立刻回到 open，cooling 重新计时
-            state.cooling_until_ts = now + _BREAKER_COOLING_S
-            state.half_open = False
-            logger.warning(
-                "circuit breaker profile=%s half-open probe failed, "
-                "cooling another %.1fs",
-                name, _BREAKER_COOLING_S,
-            )
-        elif state.consecutive_fails >= _BREAKER_FAIL_THRESHOLD:
-            # 窗口内达阈值 → open
-            state.cooling_until_ts = now + _BREAKER_COOLING_S
-            logger.warning(
-                "circuit breaker profile=%s opened after %d consecutive failures, "
-                "cooling %.1fs",
-                name, state.consecutive_fails, _BREAKER_COOLING_S,
-            )
-
-
-def _breaker_mark_success(name: str) -> None:
-    """记一次成功 — half-open 探活成功或正常请求成功，都重置计数。"""
-    state = _get_breaker(name)
-    with _breakers_lock:
-        if state.cooling_until_ts > 0 or state.consecutive_fails > 0:
-            logger.info(
-                "circuit breaker profile=%s reset after success "
-                "(prev fails=%d)", name, state.consecutive_fails,
-            )
-        state.consecutive_fails = 0
-        state.last_fail_ts = 0.0
-        state.cooling_until_ts = 0.0
-        state.half_open = False
+# embedding 链路的 breaker category 前缀 — 复合 key {category}:{profile} 让
+# 同名 profile 在 embed / llm / vlm / rerank 各类别下互不串号。
+_EMBED_CATEGORY = "embed"
 
 
 def reset_breaker(profile_name: str) -> bool:
-    """显式清空指定 profile 的 breaker 状态。
+    """显式清空指定 embedding profile 的 breaker 状态。
 
-    供 /admin/probe-embedding 探活成功后调用 — 让运维能手动「拔保险丝」，
-    不必等 30s 自动 half-open。未知 profile 名 no-op，不抛异常（端点已校验
-    profile 存在性，这里宽松处理便于运维脚本批量重置）。
+    保留 v0.9.0 单参数签名（/admin/probe-embedding 探活端点直接调用）；内部
+    转发到通用核心，category 固定为 embed。
 
     Returns:
-        True 表示重置了一条已存在的 breaker 状态；False 表示该 profile
+        True 表示重置了一条已存在的非空 breaker 状态；False 表示该 profile
         从未触发过 breaker（即「无需重置」）。
     """
-    with _breakers_lock:
-        state = _breakers.get(profile_name)
-        if state is None:
-            return False
-        had_state = (
-            state.consecutive_fails > 0
-            or state.cooling_until_ts > 0
-            or state.half_open
-        )
-        state.consecutive_fails = 0
-        state.last_fail_ts = 0.0
-        state.cooling_until_ts = 0.0
-        state.half_open = False
-    if had_state:
-        logger.info("circuit breaker profile=%s explicitly reset", profile_name)
-    return had_state
+    return model_fallback.reset_breaker(_EMBED_CATEGORY, profile_name)
 
 
-def _clear_all_breakers() -> None:
-    """测试专用：清空全部 breaker 状态。"""
-    with _breakers_lock:
-        _breakers.clear()
+def _breaker_mark_failure(profile_name: str) -> None:
+    """embedding profile 的 breaker 失败计数 —— 转发到通用核心（category=embed）。
+
+    保留单参数签名供 /admin/probe-embedding 探活失败时累加计数；内部补上
+    embed category 前缀构造复合 key。
+    """
+    model_fallback._breaker_mark_failure(
+        model_fallback._breaker_key(_EMBED_CATEGORY, profile_name)
+    )
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -249,35 +163,6 @@ def _embed_backoff(attempt: int, retry_after: float | None) -> float:
     if retry_after is not None:
         delay = max(delay, min(retry_after, _RETRY_MAX_DELAY_S))
     return delay
-
-
-def _is_fallback_eligible(exc: Exception) -> bool:
-    """判定异常是否值得跨 profile fallback。
-
-    fallback-eligible（上游不可用，换一家可能成功）：
-    - 429 Too Many Requests（限流）
-    - 5xx Server Error（上游故障 / 维护）
-    - httpx.TransportError（网络层抖动 / DNS / TCP）
-    - ValueError（响应体损坏 / JSON 错 — 等价于服务异常）
-
-    非 fallback（客户端配置错，换 profile 没用）：
-    - 400 Bad Request（payload 不合法）
-    - 401 Unauthorized（key 错 — 用户配置）
-    - 403 Forbidden（无权限 — 用户配置）
-    - 其他 4xx 非 429（404/405/422 等都是配置或代码问题）
-
-    typed embedding exception（embedding_errors.EmbeddingError）自带权威类别：
-    quota / timeout / transient 可 fallback，permanent 不可。其余 legacy
-    httpx / ValueError 分支保留 —— hotpatch 半应用期间仍能优雅降级。
-    """
-    if isinstance(exc, embedding_errors.EmbeddingError):
-        return exc.error_class in embedding_errors.RETRYABLE_CLASSES
-    if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
-        return code == 429 or code >= 500
-    if isinstance(exc, (httpx.TransportError, ValueError)):
-        return True
-    return False
 
 
 async def _http_embed_single(
@@ -376,12 +261,15 @@ async def _http_embed_with_fallback(
     profiles_chain: list[EmbeddingProfile],
     texts: list[str],
 ) -> np.ndarray:
-    """跨 profile fallback 主入口：按 chain 顺序尝试，breaker open 跳过。
+    """跨 profile fallback 主入口 —— 委托给通用 run_with_fallback。
+
+    行为与 v0.9.0 内嵌实现等价（回归测试保证）：按 chain 顺序尝试，breaker
+    open 跳过，4xx 非 429 / permanent / context-overflow 直接上抛，全挂抛
+    NoUpstreamAvailable。
 
     Args:
-        profiles_chain: [primary, fallback1, fallback2, ...] 已 resolve 的
-            profile 实例列表。调用方负责按 route.embedding_fallbacks 顺序
-            提前展开。
+        profiles_chain: [primary, fallback1, ...] 已 resolve 的 profile 列表。
+            调用方负责按 route.embedding_fallbacks 顺序提前展开。
         texts: 待 embed 的文本列表。
 
     Returns:
@@ -389,72 +277,18 @@ async def _http_embed_with_fallback(
         （已由 profiles_loader 校验等维）。
 
     Raises:
-        NoUpstreamAvailable: 全部 profile 都不可用（breaker open 或失败）
-        httpx.HTTPStatusError: 401/403/400 等用户配置错（不 fallback 直接抛）
+        NoUpstreamAvailable: 全部 profile 都不可用（breaker open 或失败）。
+        httpx.HTTPStatusError: 401/403/400 等用户配置错（不 fallback 直接抛）。
     """
-    if not profiles_chain:
-        raise NoUpstreamAvailable("empty embedding profile chain")
 
-    last_exc: Exception | None = None
-    last_failed_profile: str | None = None
-    skipped_due_to_breaker: list[str] = []
+    # executor 在调用时才读模块属性 _http_embed —— 让测试 monkeypatch
+    # `setattr(reg_mod, "_http_embed", fake)` 仍然生效（v0.7.0/v0.8.0 测试
+    # 约定，必须保留 backward compat）。运行期等价于 _http_embed_single。
+    async def _executor(profile: EmbeddingProfile) -> np.ndarray:
+        return await _http_embed(profile, texts)
 
-    # 通过模块属性间接调用 _http_embed —— 让测试 monkeypatch
-    # `setattr(reg_mod, "_http_embed", fake)` 仍然生效（v0.7.0/v0.8.0
-    # 测试约定，必须保留 backward compat）。运行期等价于 _http_embed_single。
-    embed_callable = _http_embed
-
-    for idx, profile in enumerate(profiles_chain):
-        # breaker 检查：open 状态直接跳，不调 HTTP 节省时间和 quota
-        if _breaker_should_skip(profile.name):
-            skipped_due_to_breaker.append(profile.name)
-            logger.warning(
-                "skipping profile=%s (circuit breaker open); trying next",
-                profile.name,
-            )
-            continue
-        try:
-            result = await embed_callable(profile, texts)
-            # 成功 — 重置 breaker；如果是 fallback 命中，warn 级别 log 让运维
-            # 能在监控里看到「主线挂了，副线接管」
-            _breaker_mark_success(profile.name)
-            if idx > 0:
-                logger.warning(
-                    "embedding fallback succeeded: profile=fallback_%s "
-                    "(primary=%s failed)",
-                    profile.name, profiles_chain[0].name,
-                )
-            return result
-        except Exception as exc:
-            if not _is_fallback_eligible(exc):
-                # 401/403/400 类用户配置错 — 不消耗 fallback quota，
-                # 不计入 breaker（这不是「上游不可用」，是「我们配错了」）
-                logger.warning(
-                    "profile=%s raised non-fallback error %s; "
-                    "not trying fallbacks",
-                    profile.name, exc,
-                )
-                raise
-            # 标记失败 → 累加 breaker；如果阈值达到本次调用即让它 open
-            _breaker_mark_failure(profile.name)
-            last_exc = exc
-            last_failed_profile = profile.name
-            logger.warning(
-                "embedding profile=%s failed: %s; trying next in chain",
-                profile.name, exc,
-            )
-            continue
-
-    # 链路全挂 — 区分「全部被 breaker 跳过」和「全部尝试都失败」给 log 更可读
-    chain_names = ",".join(p.name for p in profiles_chain)
-    if last_exc is None:
-        raise NoUpstreamAvailable(
-            f"all embedding profiles unavailable (chain=[{chain_names}], "
-            f"all in breaker cooling: {skipped_due_to_breaker})"
-        )
-    raise NoUpstreamAvailable(
-        f"all embedding profiles failed (chain=[{chain_names}], "
-        f"last_failed={last_failed_profile}, last_error={last_exc!r})"
+    return await model_fallback.run_with_fallback(
+        _EMBED_CATEGORY, profiles_chain, _executor,
     )
 
 

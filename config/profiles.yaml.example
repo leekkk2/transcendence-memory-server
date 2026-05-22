@@ -5,7 +5,9 @@
 # Security: api_key_env is **indirection** — yaml never holds the secret value itself.
 # Set the actual env var (e.g. GEMINI_API_KEY=sk-...) in docker-compose .env or systemd.
 
-version: 1
+# version 2 新增 llms / vlms 节点与 route 的 llm/vlm/reranker fallback 字段。
+# version 1 文件（仅 embedding + reranker）仍兼容 —— 不写新节点即可。
+version: 2
 
 # v0.11.0：当客户端只指定 container=X 时，自动 union 到 sibling X_openai 镜像
 # （双轨召回，gemini + openai 同时查）。默认 false 保持向后兼容；启用前请确保
@@ -126,12 +128,63 @@ rerankers:
     timeout_s: 30
     min_score: 0.0
 
+# === LLM profiles（version 2 新增）===
+# 知识图谱抽取 / 查询用的 chat 模型。与 embedding 不同，LLM 无向量维度锁约束，
+# 故 fallback 链可跨任意模型 —— route 的 llm_fallbacks 引用下面任意 name。
+# 未提供 llms 节点（或用 version 1 文件）时，服务从 LLM_* env 合成单元素链，
+# 行为等价旧版本。provider 默认 openai_compatible（走 /chat/completions）。
+llms:
+  - name: primary-llm
+    provider: openai_compatible
+    model: <chat-model-id>                  # 你的网关上注册的 chat 模型 id
+    base_url: https://<your-gateway-host>/v1
+    api_key_env: PRIMARY_GATEWAY_KEY
+    timeout_s: 180                          # 生成类调用比 embedding 慢，留足
+    max_retries: 4
+
+  - name: backup-llm
+    provider: openai_compatible
+    model: <another-chat-model-id>          # 备用链路 —— 不同模型 / 不同网关
+    base_url: https://<backup-gateway-host>/v1
+    api_key_env: BACKUP_GATEWAY_KEY
+    timeout_s: 180
+    max_retries: 4
+
+# === VLM profiles（version 2 新增）===
+# 视觉 / 多模态生成模型。RAGAnything 的图像转写、/embed-multimodal 的媒体
+# caption 生成都走 VLM 链；route 的 vlm_fallbacks 引用下面任意 name。
+# 未提供 vlms 节点时，服务从 VLM_* env 合成单元素链。
+vlms:
+  - name: primary-vlm
+    provider: openai_compatible
+    model: <vision-chat-model-id>
+    base_url: https://<your-gateway-host>/v1
+    api_key_env: PRIMARY_GATEWAY_KEY
+    timeout_s: 180
+    max_retries: 4
+
+  - name: backup-vlm
+    provider: openai_compatible
+    model: <another-vision-chat-model-id>
+    base_url: https://<backup-gateway-host>/v1
+    api_key_env: BACKUP_GATEWAY_KEY
+    timeout_s: 180
+    max_retries: 4
+
 routes:
-  # 示例 1: exact match + embedding fallback (same dim required by loader)
+  # 示例 1: exact match + 各链路 fallback。
+  # embedding_fallbacks 必须同 dim（LanceDB 向量维度锁）；llm/vlm/reranker
+  # fallback 无此约束，可跨任意模型。每条 *_fallbacks 是「按序尝试」的备用
+  # 链：主 profile 不可用（429/5xx/超时）时自动切下一条；4xx 非 429 不切。
   - match: {exact: critical-container-name}
     embedding: high-dim-primary
     embedding_fallbacks: [direct-provider-fallback]  # ⚠ loader enforces dim must match
     reranker: aggregator-rerank
+    reranker_fallbacks: [direct-provider-rerank]     # reranker 全挂 → 检索降级为无 rerank
+    llm: primary-llm
+    llm_fallbacks: [backup-llm]                      # 主 LLM 挂掉 → 知识图谱抽取/查询切备用
+    vlm: primary-vlm
+    vlm_fallbacks: [backup-vlm]                      # 主 VLM 挂掉 → 图像转写/caption 切备用
     rerank: {enabled: true, chunk_top_k: 30, top_k: 8}
 
   # 示例 2: glob 匹配某类 container（例如所有"低维镜像"类容器）
@@ -161,8 +214,11 @@ routes:
   - match: {exact: ge2-test}
     embedding: gemini-embedding-2
 
-  # 兜底：所有未命中以上的 container 用主 embedding 配置（必须恰好 1 个 default）
+  # 兜底：所有未命中以上的 container 用主 embedding 配置（必须恰好 1 个 default）。
+  # llm / vlm 缺省（不写）时退化为 LLM_* / VLM_* env 合成的单元素链。
   - match: {default: true}
     embedding: high-dim-primary
     reranker: aggregator-rerank
+    llm: primary-llm
+    vlm: primary-vlm
     rerank: {enabled: false}                         # default 不开 rerank，按需 per-call 启用

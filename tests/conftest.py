@@ -86,6 +86,24 @@ def make_workspace(tmp_path: Path) -> Path:
     return workspace
 
 
+@pytest.fixture(autouse=True)
+def _reset_model_breakers():
+    """每个测试前后清空全局 circuit breaker 状态。
+
+    模型 fallback 链路（embed / llm / vlm / rerank）共用 model_fallback 里一份
+    模块级 ``_breakers`` dict —— 不清会让前一个测试留下的 cooling 在 60s 窗口
+    内污染后一个测试（被误跳过 profile → 莫名其妙的 NoUpstreamAvailable）。
+    """
+    try:
+        from scripts.model_fallback import _clear_all_breakers
+    except ImportError:  # pragma: no cover - model_fallback 未加载时无需清理
+        yield
+        return
+    _clear_all_breakers()
+    yield
+    _clear_all_breakers()
+
+
 @pytest.fixture
 def workspace_and_client(tmp_path, monkeypatch):
     """返回 (workspace, TestClient) 元组。"""

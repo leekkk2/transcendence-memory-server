@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import sys
 from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable
 
@@ -43,6 +44,20 @@ except ImportError:  # pragma: no cover - package import path
         RerankerProfile,
         load_profiles,
     )
+
+# 通用 fallback 核心 —— reranker 链路用 run_with_fallback 跨 profile 切换。
+# 双重 import + 模块身份归一，与 embedding_registry 同款。
+model_fallback = (
+    sys.modules.get('scripts.model_fallback')
+    or sys.modules.get('model_fallback')
+)
+if model_fallback is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import model_fallback  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import model_fallback  # type: ignore[no-redef]
+sys.modules.setdefault('model_fallback', model_fallback)
+sys.modules.setdefault('scripts.model_fallback', model_fallback)
 
 logger = logging.getLogger(__name__)
 
@@ -199,29 +214,47 @@ class RerankerRegistry:
 
     def build_rerank_func(
         self,
-        profile: RerankerProfile,
+        chain: RerankerProfile | list[RerankerProfile],
         min_score: float | None = None,
     ) -> tuple[RerankFunc, str]:
         """构造 LightRAG 期望的 rerank_model_func + cache signature。
 
         Args:
-            profile: 已 resolve 的 reranker profile（caller 已做 get_profile）。
-            min_score: 客户端侧过滤阈值；None 时退化到 profile.min_score。
-                LightRAG 自身也有 min_rerank_score 字段，此处主要用于 sig 不变
-                时让 build 调用方掌控阈值（不污染 module-level）。
+            chain: ``[primary, *fallbacks]`` 的 RerankerProfile 列表。也接受单个
+                RerankerProfile（向后兼容旧调用方与测试），内部归一为单元素链。
+                主 reranker 不可用（429/5xx/传输错）时由 run_with_fallback 切
+                下一条；单元素链行为等价单 profile。
+            min_score: 客户端侧过滤阈值；None 时退化到 chain[0].min_score。
+                LightRAG 自身也有 min_rerank_score 字段，此处主要用于让 build
+                调用方掌控阈值（不污染 module-level）。
 
         Returns:
-            (async rerank_func, "rerank:{profile.name}")
+            (async rerank_func, "rerank:{p0}" 或 "rerank:{p0}+{p1}+...")
             rerank_func 签名匹配 lightrag/utils.py:apply_rerank_if_enabled 调用：
                 async (query, documents, top_n) -> list[{"index", "relevance_score"}]
 
         Behavior:
             - 空 documents 直接返回 []，不调 HTTP（与上游 LightRAG 早返一致）
+            - 链上每条 profile 内部仍走 429/5xx 重试；profile 级失败后切下一条
+            - 全链挂掉抛 NoUpstreamAvailable（上层 apply_rerank_if_enabled /
+              /search catch 后降级为无 rerank）
             - relevance_score < min_score 的项过滤掉
             - 按 score 降序排序；top_n 截断在排序后做
-            - HTTP 层错误透传给上层（LightRAG apply_rerank_if_enabled 会 catch 并降级）
         """
-        threshold = profile.min_score if min_score is None else float(min_score)
+        # 接受单 profile 或链；归一为列表。按「是否 list/tuple」判定 —— 不依赖
+        # RerankerProfile 的 isinstance（worker/server 双重 import 下类对象可能
+        # 不是同一份，isinstance 会误判）。RerankerProfile 是 frozen dataclass，
+        # 不是序列，单 profile 不会被误当成链。
+        chain_list = (
+            list(chain) if isinstance(chain, (list, tuple)) else [chain]
+        )
+        if not chain_list:
+            raise ValueError(
+                "build_rerank_func requires at least one reranker profile"
+            )
+        threshold = (
+            chain_list[0].min_score if min_score is None else float(min_score)
+        )
 
         async def _rerank(
             query: str,
@@ -232,8 +265,17 @@ class RerankerRegistry:
             # 早返：documents 为空时不消耗一次网络 RTT
             if not documents:
                 return []
+            docs = list(documents)
 
-            raw = await _http_rerank(profile, query, list(documents), top_n)
+            # per-profile 执行器 —— 单 profile 的 /rerank 调用（含 429/5xx 重试）。
+            async def _executor(
+                profile: RerankerProfile,
+            ) -> list[tuple[int, float]]:
+                return await _http_rerank(profile, query, docs, top_n)
+
+            raw = await model_fallback.run_with_fallback(
+                model_fallback.CATEGORY_RERANK, chain_list, _executor,
+            )
 
             # 客户端过滤 + 降序排序 + top_n 截断。三步分开是为了：
             # 1) 过滤优先，避免 top_n 把高分项挤掉再被 min_score 删
@@ -250,7 +292,7 @@ class RerankerRegistry:
                 for idx, score in filtered
             ]
 
-        sig = f"rerank:{profile.name}"
+        sig = "rerank:" + "+".join(p.name for p in chain_list)
         return _rerank, sig
 
 

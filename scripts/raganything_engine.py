@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,20 @@ except ModuleNotFoundError:  # pragma: no cover
         LLM_API_KEY as _RAG_LLM_API_KEY,
         LLM_MODEL as _RAG_LLM_MODEL,
     )
+
+# 通用 fallback 核心 —— VLM 视觉调用链路用 run_with_fallback 跨 profile 切换。
+# 双重 import + 模块身份归一，与 embedding_registry 同款。
+model_fallback = (
+    sys.modules.get('scripts.model_fallback')
+    or sys.modules.get('model_fallback')
+)
+if model_fallback is None:  # pragma: no cover - 取决于运行入口
+    try:
+        import model_fallback  # type: ignore[no-redef]
+    except ImportError:
+        from scripts import model_fallback  # type: ignore[no-redef]
+sys.modules.setdefault('model_fallback', model_fallback)
+sys.modules.setdefault('scripts.model_fallback', model_fallback)
 
 logger = logging.getLogger(__name__)
 
@@ -75,45 +90,104 @@ def _image_url_field(img: str) -> str:
     return f"data:image/png;base64,{img}"
 
 
-async def _vision_model_func(
-    prompt: str = "",
-    system_prompt: str | None = None,
-    history_messages: list[dict[str, Any]] | None = None,
-    image_data: str | list[str] | None = None,
-    messages: list[dict[str, Any]] | None = None,
-    **_: Any,
-) -> str:
-    """OpenAI 兼容的 vision chat/completions 调用，带指数退避重试。
+def _build_vision_messages(
+    prompt: str,
+    system_prompt: str | None,
+    history_messages: list[dict[str, Any]] | None,
+    image_data: str | list[str] | None,
+    messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """把 RAGAnything 的两种 vision 调用签名归一为 chat/completions messages。
 
-    兼容 RAGAnything 的两种调用签名：
-      1) 直接传 `messages=[...]`（含混排 text/image_url content）
-      2) 传 `prompt` + `image_data`（URL / data URI / 绝对路径 / base64 字符串）
+    1) 直接传 `messages=[...]`（含混排 text/image_url content）→ 原样返回。
+    2) 传 `prompt` + `image_data`（URL / data URI / 绝对路径 / base64 字符串）
+       → 拼成单条 user 消息（text + image_url content 混排）。
     """
-    if messages is None:
-        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-        images: list[str] = []
-        if isinstance(image_data, str):
-            images = [image_data]
-        elif isinstance(image_data, list):
-            images = list(image_data)
-        for img in images:
-            content.append({"type": "image_url", "image_url": {"url": _image_url_field(img)}})
-        msgs: list[dict[str, Any]] = []
-        if system_prompt:
-            msgs.append({"role": "system", "content": system_prompt})
-        if history_messages:
-            msgs.extend(history_messages)
-        msgs.append({"role": "user", "content": content})
-    else:
-        msgs = messages
+    if messages is not None:
+        return messages
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    images: list[str] = []
+    if isinstance(image_data, str):
+        images = [image_data]
+    elif isinstance(image_data, list):
+        images = list(image_data)
+    for img in images:
+        content.append({"type": "image_url", "image_url": {"url": _image_url_field(img)}})
+    msgs: list[dict[str, Any]] = []
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt})
+    if history_messages:
+        msgs.extend(history_messages)
+    msgs.append({"role": "user", "content": content})
+    return msgs
 
-    return await call_openai_chat(
-        base_url=VLM_BASE_URL,
-        api_key=VLM_API_KEY,
-        model=VLM_MODEL,
-        messages=msgs,
-        label="VLM",
-    )
+
+def make_vision_model_func(chain: list) -> Any:
+    """构造注入 RAGAnything 的 ``vision_model_func`` —— 按 chain fallback 的 VLM 调用。
+
+    Args:
+        chain: ``[primary, *fallbacks]`` 的 VLMProfile 列表。主 VLM 不可用
+            （429/5xx/超时/typed quota 等）时由 run_with_fallback 切下一条；
+            单元素链（无 fallback 配置 / legacy env）行为等价单 profile。
+
+    Returns:
+        async vision callable，兼容 RAGAnything 的两种调用签名（messages= 或
+        prompt+image_data）。``call_openai_chat`` 保持为单 profile 执行器
+        （per-profile 指数退避重试不变）。
+    """
+    async def _vision_model_func(
+        prompt: str = "",
+        system_prompt: str | None = None,
+        history_messages: list[dict[str, Any]] | None = None,
+        image_data: str | list[str] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        **_: Any,
+    ) -> str:
+        msgs = _build_vision_messages(
+            prompt, system_prompt, history_messages, image_data, messages,
+        )
+
+        async def _executor(profile: Any) -> str:
+            return await call_openai_chat(
+                base_url=profile.base_url,
+                api_key=profile.api_key,
+                model=profile.model,
+                messages=msgs,
+                timeout=profile.timeout_s,
+                label="VLM",
+            )
+
+        return await model_fallback.run_with_fallback(
+            model_fallback.CATEGORY_VLM, chain, _executor,
+        )
+
+    return _vision_model_func
+
+
+def _build_vlm_chain(route: Any) -> list:
+    """按 route 解析 VLM fallback 链 ``[primary, *fallbacks]``。
+
+    route.vlm 为 None（v2 yaml 未配 vlm）时合成单元素 legacy 链 —— 用 module
+    级 env 常量构造，行为等价改造前 env-driven 的 `_vision_model_func`。
+    """
+    try:
+        from profiles_loader import VLMProfile  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - package import path
+        from scripts.profiles_loader import VLMProfile  # type: ignore[import-not-found]
+
+    if route.vlm is None:
+        return [VLMProfile(
+            name="legacy-vlm",
+            model=VLM_MODEL,
+            base_url=VLM_BASE_URL,
+            api_key=VLM_API_KEY,
+        )]
+    try:
+        from embedding_registry import get_registry  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - package import path
+        from scripts.embedding_registry import get_registry  # type: ignore[import-not-found]
+    vlms = get_registry().profiles.vlms
+    return [vlms[route.vlm], *(vlms[fb] for fb in route.vlm_fallbacks)]
 
 
 async def _get_lock(container: str) -> asyncio.Lock:
@@ -143,7 +217,13 @@ def _resolve_route_emb_rrk(
     registry = get_registry()
     route = registry.resolve(container)
     embedding_func, emb_sig = registry.build_embedding_func(route)
-    rrk_sig = f"rerank:{route.reranker}" if route.reranker else ""
+    # rrk_sig 含 reranker 主 + fallback 链名，与 reranker_registry.build_rerank_func
+    # 产出的 sig 格式一致，保证 RAGAnything 与底层 LightRAG 的 cache key 对齐。
+    if route.reranker:
+        rrk_names = [route.reranker, *route.reranker_fallbacks]
+        rrk_sig = "rerank:" + "+".join(rrk_names)
+    else:
+        rrk_sig = ""
     return route, embedding_func, emb_sig, rrk_sig
 
 
@@ -187,10 +267,14 @@ async def get_raganything(container: str) -> Any:
             enable_equation_processing=True,
         )
 
+        # VLM 按 route 展开 fallback 链注入 —— 无 VLM profile 配置时 chain 退化
+        # 为 legacy env 合成的单元素，行为等价改造前。
+        vlm_chain = _build_vlm_chain(route)
+
         instance = RAGAnything(
             lightrag=lightrag,
             llm_model_func=_llm_func,
-            vision_model_func=_vision_model_func,
+            vision_model_func=make_vision_model_func(vlm_chain),
             embedding_func=embedding_func,
             config=config,
         )

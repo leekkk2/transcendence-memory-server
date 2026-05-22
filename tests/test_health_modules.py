@@ -410,11 +410,13 @@ def test_admin_probe_embedding_resets_breaker_on_success(tmp_path, monkeypatch):
     # 的也是顶层那份；两边都要 setup 才能保证测试不依赖 import 顺序。
     er._clear_all_breakers()
     er_top._clear_all_breakers()
-    for mod in (er, er_top):
-        state = mod._get_breaker("gemini-3072")
-        state.consecutive_fails = 5
-        state.cooling_until_ts = 999999999.0
-        state.last_fail_ts = 1.0
+    # 熔断器已抽到 model_fallback：embedding_registry 双副本现共用同一份
+    # _breakers dict；breaker key 为复合 {category}:{profile}。
+    import scripts.model_fallback as _mf
+    state = _mf._get_breaker(_mf._breaker_key("embed", "gemini-3072"))
+    state.consecutive_fails = 5
+    state.cooling_until_ts = 999999999.0
+    state.last_fail_ts = 1.0
 
     client = TestClient(server.app)
     resp = client.post('/admin/probe-embedding?profile=gemini-3072', headers=auth_headers())
@@ -427,7 +429,7 @@ def test_admin_probe_embedding_resets_breaker_on_success(tmp_path, monkeypatch):
 
     # 端点实际走的那份模块的 state 已清空（用 server 端点同款 import 顺序定位）
     actual_mod = er_top  # endpoint 先 try 顶层 import
-    state_after = actual_mod._breakers.get('gemini-3072')
+    state_after = actual_mod._breakers.get('embed:gemini-3072')
     assert state_after is not None
     assert state_after.consecutive_fails == 0
     assert state_after.cooling_until_ts == 0.0
@@ -467,7 +469,7 @@ def test_admin_probe_embedding_failure_marks_breaker_no_reset(tmp_path, monkeypa
     # breaker 计数 +1（503 是 fallback-eligible 错误）
     # endpoint 先 try 顶层 embedding_registry → 失败计数写到 er_top._breakers
     actual_mod = er_top
-    state = actual_mod._breakers.get('gemini-3072')
+    state = actual_mod._breakers.get('embed:gemini-3072')
     assert state is not None, "probe failure 应触发 breaker mark"
     assert state.consecutive_fails == 1
 

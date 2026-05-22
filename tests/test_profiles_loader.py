@@ -469,3 +469,196 @@ def test_union_search_default_legacy_env_is_false(monkeypatch):
     monkeypatch.setenv("EMBEDDING_API_KEY", "k")
     ps = load_profiles()
     assert ps.union_search_default is False
+
+
+# ---- v2 schema：llms / vlms 节点 + route 的 LLM/VLM 字段 -----------------
+
+def test_load_yaml_v2_with_llms_vlms(tmp_path, monkeypatch):
+    """version 2：解析 llms / vlms 节点与 route 的 llm/llm_fallbacks/vlm 字段。"""
+    _clear_legacy_env(monkeypatch)
+    for k in ("EK", "LK", "VK"):
+        monkeypatch.setenv(k, f"{k}-secret")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 2
+embeddings:
+  - {name: e1, model: em, dim: 8, base_url: https://x/v1, api_key_env: EK}
+llms:
+  - {name: l1, model: chat-a, base_url: https://x/v1, api_key_env: LK}
+  - name: l2
+    model: chat-b
+    provider: gemini_native
+    base_url: https://y/v1
+    api_key_env: LK
+    timeout_s: 90
+    max_retries: 2
+vlms:
+  - {name: v1, model: vis-a, base_url: https://x/v1, api_key_env: VK}
+routes:
+  - match: {default: true}
+    embedding: e1
+    llm: l1
+    llm_fallbacks: [l2]
+    vlm: v1
+""",
+    )
+    ps = load_profiles(str(yaml_path))
+    assert set(ps.llms) == {"l1", "l2"}
+    assert set(ps.vlms) == {"v1"}
+    l1, l2 = ps.llms["l1"], ps.llms["l2"]
+    assert l1.provider == "openai_compatible"
+    assert l1.timeout_s == 180.0 and l1.max_retries == 4  # 默认值
+    assert l2.provider == "gemini_native"
+    assert l2.timeout_s == 90.0 and l2.max_retries == 2
+    r = ps.default_route
+    assert r.llm == "l1"
+    assert r.llm_fallbacks == ("l2",)
+    assert r.vlm == "v1"
+    assert r.vlm_fallbacks == ()
+    # repr 必须脱敏 api_key
+    assert "LK-secret" not in repr(l1)
+    assert "***" in repr(l1) and "***" in repr(ps.vlms["v1"])
+
+
+def test_v1_yaml_has_empty_llms_vlms(tmp_path, monkeypatch):
+    """v1 文件不写 llms/vlms → 解析为空 dict，route.llm/vlm 为 None（向后兼容）。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("K", "v")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 1
+embeddings:
+  - {name: p1, model: m, dim: 8, base_url: https://x/v1, api_key_env: K}
+routes:
+  - match: {default: true}
+    embedding: p1
+""",
+    )
+    ps = load_profiles(str(yaml_path))
+    assert ps.llms == {} and ps.vlms == {}
+    assert ps.default_route.llm is None
+    assert ps.default_route.vlm is None
+    assert ps.default_route.llm_fallbacks == ()
+
+
+def test_route_references_unknown_llm(tmp_path, monkeypatch):
+    """route 引用不存在的 llm profile 必须 raise。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("K", "v")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 2
+embeddings:
+  - {name: p1, model: m, dim: 8, base_url: https://x/v1, api_key_env: K}
+routes:
+  - match: {default: true}
+    embedding: p1
+    llm: ghost-llm
+""",
+    )
+    with pytest.raises(ValueError, match=r"ghost-llm"):
+        load_profiles(str(yaml_path))
+
+
+def test_route_references_unknown_vlm_fallback(tmp_path, monkeypatch):
+    """route 的 vlm_fallbacks 引用不存在的 vlm profile 必须 raise。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("K", "v")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 2
+embeddings:
+  - {name: p1, model: m, dim: 8, base_url: https://x/v1, api_key_env: K}
+vlms:
+  - {name: v1, model: vis, base_url: https://x/v1, api_key_env: K}
+routes:
+  - match: {default: true}
+    embedding: p1
+    vlm: v1
+    vlm_fallbacks: [ghost-vlm]
+""",
+    )
+    with pytest.raises(ValueError, match=r"ghost-vlm"):
+        load_profiles(str(yaml_path))
+
+
+def test_route_references_unknown_reranker_fallback(tmp_path, monkeypatch):
+    """route 的 reranker_fallbacks 引用不存在的 reranker 必须 raise。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("K", "v")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 2
+embeddings:
+  - {name: p1, model: m, dim: 8, base_url: https://x/v1, api_key_env: K}
+routes:
+  - match: {default: true}
+    embedding: p1
+    reranker_fallbacks: [ghost-rr]
+""",
+    )
+    with pytest.raises(ValueError, match=r"ghost-rr"):
+        load_profiles(str(yaml_path))
+
+
+def test_legacy_env_synthesizes_llm_and_vlm(monkeypatch):
+    """无 YAML → 从 LLM_* / VLM_* env 合成 legacy-llm / legacy-vlm profile。"""
+    _clear_legacy_env(monkeypatch)
+    for k in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY",
+              "VLM_MODEL", "VLM_BASE_URL", "VLM_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("LLM_MODEL", "my-chat")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "llm-key")
+    monkeypatch.setenv("VLM_MODEL", "my-vision")
+    ps = load_profiles()
+    assert set(ps.llms) == {"legacy-llm"}
+    assert set(ps.vlms) == {"legacy-vlm"}
+    llm = ps.llms["legacy-llm"]
+    assert llm.model == "my-chat"
+    assert llm.base_url == "https://llm.test/v1"
+    assert llm.api_key == "llm-key"
+    vlm = ps.vlms["legacy-vlm"]
+    assert vlm.model == "my-vision"
+    # VLM_BASE_URL/API_KEY 缺省 → 回落到 legacy-llm
+    assert vlm.base_url == "https://llm.test/v1"
+    assert vlm.api_key == "llm-key"
+    assert ps.default_route.llm == "legacy-llm"
+    assert ps.default_route.vlm == "legacy-vlm"
+
+
+def test_legacy_llm_base_url_falls_back_to_embedding(monkeypatch):
+    """LLM_BASE_URL 缺失时回落到 EMBEDDING_BASE_URL（保留历史 env 兜底链）。"""
+    _clear_legacy_env(monkeypatch)
+    for k in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://shared.test/v1")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "shared-key")
+    ps = load_profiles()
+    llm = ps.llms["legacy-llm"]
+    assert llm.base_url == "https://shared.test/v1"
+    assert llm.api_key == "shared-key"
+
+
+def test_v2_version_accepted(tmp_path, monkeypatch):
+    """version 2 显式被接受（不报 unsupported）。"""
+    _clear_legacy_env(monkeypatch)
+    monkeypatch.setenv("K", "v")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+version: 2
+embeddings:
+  - {name: p1, model: m, dim: 8, base_url: https://x/v1, api_key_env: K}
+routes:
+  - match: {default: true}
+    embedding: p1
+""",
+    )
+    ps = load_profiles(str(yaml_path))
+    assert "p1" in ps.embeddings
