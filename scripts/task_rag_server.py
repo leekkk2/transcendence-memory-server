@@ -398,7 +398,7 @@ def child_env(
     Phase 1 的最小注入面：env var，不动 worker CLI 签名。
 
     container：当前请求作用的 container 名。注入 `CONTAINER` env 让 subprocess
-    (task_rag_search.py 等) 的 task_rag_runtime._resolve_profile_for_worker 走
+    (task_rag_search.py 等) 的 task_rag_runtime._resolve_chain_for_worker 走
     "CONTAINER env → registry.resolve(container)" 路径，而不是退化到 default route。
     v0.10.1 修了 JobWorker 路径同名 bug；v0.10.2 这里补全同步 subprocess 路径。
     """
@@ -865,9 +865,17 @@ def _resolve_search_rerank(req: SearchReq, targets: list[str]) -> tuple[bool, An
         return False, None, profile_name, candidate_topk
 
     rrk_registry = get_reranker_registry()
-    profile = rrk_registry.get_profile(profile_name)
-    rerank_func, _sig = rrk_registry.build_rerank_func(profile)
-    return True, rerank_func, profile.name, candidate_topk
+    # req.reranker_model 显式 override 时只用该单 profile —— route 的 fallback
+    # 链是相对 route.reranker 定义的，对 override 不适用；否则展开 route 链。
+    if req.reranker_model:
+        chain = [rrk_registry.get_profile(req.reranker_model)]
+    else:
+        chain = [
+            rrk_registry.get_profile(route.reranker),
+            *(rrk_registry.get_profile(fb) for fb in route.reranker_fallbacks),
+        ]
+    rerank_func, _sig = rrk_registry.build_rerank_func(chain)
+    return True, rerank_func, chain[0].name, candidate_topk
 
 
 def _apply_search_rerank(
@@ -2247,6 +2255,39 @@ def _resolve_gemini_native_profile(container: str):
     return profile
 
 
+def _resolve_caption_vlm_chain(container: str, embed_profile) -> list:
+    """解析 /embed-multimodal caption 生成的 VLM fallback 链 [primary, *fallbacks]。
+
+    优先用 route 配置的 VLM 链；route 未配 VLM 时合成单元素链 —— 复用
+    gemini_native embedding profile 的 relay base_url + token，caption 模型用
+    `GE2_CAPTION_VLM_MODEL` 默认（与历史 /embed-multimodal caption 行为一致）。
+    """
+    try:
+        from embedding_registry import get_registry
+        from profiles_loader import VLMProfile
+        import gemini_native_embed as _gne
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.embedding_registry import get_registry
+        from scripts.profiles_loader import VLMProfile
+        import scripts.gemini_native_embed as _gne
+
+    reg = get_registry()
+    route = reg.resolve(container)
+    if route.vlm is None:
+        # route 未配 VLM —— caption 复用 embedding relay，模型走 caption 默认。
+        return [VLMProfile(
+            name='caption-default',
+            model=_gne._DEFAULT_CAPTION_MODEL,
+            base_url=embed_profile.base_url,
+            api_key=embed_profile.api_key,
+            provider='gemini_native',
+            timeout_s=embed_profile.timeout_s,
+            max_retries=embed_profile.max_retries,
+        )]
+    vlms = reg.profiles.vlms
+    return [vlms[route.vlm], *(vlms[fb] for fb in route.vlm_fallbacks)]
+
+
 @app.post('/embed-multimodal', dependencies=[Depends(verify_auth)])
 async def embed_multimodal(
     container: str = Form(...),
@@ -2305,14 +2346,29 @@ async def embed_multimodal(
         raise HTTPException(
             status_code=502, detail=f'gemini multimodal embed failed: {str(exc)[:300]}')
 
-    # P1 caption 混合检索：经 Gemini relay VLM 为媒体生成文字 caption。
-    # best-effort —— caption 链路失败不阻塞媒体行落库（媒体原生向量仍可检回）。
-    # 用户显式 caption 优先于自动生成（用户最了解语境）。
+    # P1 caption 混合检索：经 Gemini relay VLM 为媒体生成文字 caption，按 route
+    # 的 VLM fallback 链逐条尝试（主 VLM 挂掉切下一条）。
+    # best-effort —— caption 链路全挂（NoUpstreamAvailable）或其它异常都不阻塞
+    # 媒体行落库（媒体原生向量仍可检回）。用户显式 caption 优先于自动生成。
     vlm_caption: str | None = None
     if not caption:
         try:
-            vlm_caption = await generate_media_caption_async(profile, mime, raw)
+            from model_fallback import CATEGORY_VLM, run_with_fallback
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.model_fallback import CATEGORY_VLM, run_with_fallback
+        vlm_chain = _resolve_caption_vlm_chain(container, profile)
+
+        async def _caption_executor(vlm_profile):
+            return await generate_media_caption_async(
+                vlm_profile, mime, raw, model=vlm_profile.model,
+            )
+
+        try:
+            vlm_caption = await run_with_fallback(
+                CATEGORY_VLM, vlm_chain, _caption_executor,
+            )
         except Exception as exc:
+            # NoUpstreamAvailable（全链挂）也落这里 —— caption 缺省为 None。
             logger.warning(
                 'embed-multimodal caption generation failed for %r: %s',
                 filename, str(exc)[:200])

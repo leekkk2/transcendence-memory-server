@@ -30,7 +30,7 @@ def server_module(monkeypatch, tmp_path):
 
 def test_child_env_injects_container(server_module):
     """v0.10.2 regression：child_env 收到 container 参数 → 注入 CONTAINER env，
-    让 subprocess 中的 task_rag_runtime._resolve_profile_for_worker 命中
+    让 subprocess 中的 task_rag_runtime._resolve_chain_for_worker 命中
     'CONTAINER env → registry.resolve(container)' 路径。"""
     env = server_module.child_env(container="myapp_openai")
     assert env.get("CONTAINER") == "myapp_openai"
@@ -50,7 +50,7 @@ def test_child_env_omits_container_when_empty(server_module, monkeypatch):
     env_empty = server_module.child_env(container="")
     assert "CONTAINER" not in env_empty, (
         "child_env(container='') 不应注入空字符串 CONTAINER；"
-        "下游 _resolve_profile_for_worker 用 os.environ.get('CONTAINER') 拿到 None 才能 fallback 到 default route"
+        "下游 _resolve_chain_for_worker 用 os.environ.get('CONTAINER') 拿到 None 才能 fallback 到 default route"
     )
 
     # 完全省略参数
@@ -62,7 +62,7 @@ def test_child_env_omits_container_when_empty(server_module, monkeypatch):
 
 def test_child_env_container_coexists_with_embedding_override(server_module):
     """同时传 container + embedding_override → 两个 env 都注入。
-    runtime 内 override 优先级更高（_resolve_profile_for_worker 先看 override）。"""
+    runtime 内 override 优先级更高（_resolve_chain_for_worker 先看 override）。"""
     env = server_module.child_env(
         embedding_override="openai-small-1024",
         container="my-container_openai",
