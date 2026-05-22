@@ -226,9 +226,17 @@ export EMBEDDING_API_KEY="your-key"
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/documents/text` | POST | Ingest text into knowledge graph |
-| `/documents/upload` | POST | Upload PDF/image/MD files |
+| `/documents/text` | POST | Ingest text into knowledge graph (async — returns a job id) |
+| `/documents/file` | POST | Upload a PDF/image/MD/Office file (async — returns a job id) |
+| `/documents/upload` | POST | Alias of `/documents/file` |
 | `/query` | POST | RAG query with LLM-generated answer |
+
+Knowledge-graph ingestion (`/documents/text`, `/documents/file`,
+`/documents/upload`) is **asynchronous**: building the graph takes tens of
+seconds to minutes, so the request would otherwise trip edge-proxy timeouts.
+Each call stages the input, enqueues a background job, and returns immediately
+with a `CommandResponse` whose `pid` field is the job id. Poll
+`GET /jobs/{pid}` until `status` is `done` (or `failed`) to learn the outcome.
 
 ### Management
 
