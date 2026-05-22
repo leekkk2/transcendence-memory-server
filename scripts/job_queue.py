@@ -11,7 +11,8 @@ exponential backoff and coalescing, surviving restarts.
 Schema:
     CREATE TABLE jobs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      op TEXT,                  -- 'embed', 'ingest-memory', 'ingest-structured'
+      op TEXT,                  -- 'embed', 'ingest-memory', 'ingest-structured',
+                                --   'ingest-document-text', 'ingest-document-file'
       container TEXT,
       payload_json TEXT,        -- JSON: extra args for subprocess
       status TEXT,              -- 'pending', 'running', 'done', 'failed', 'cancelled'
