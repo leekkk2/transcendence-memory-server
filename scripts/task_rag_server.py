@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
@@ -21,7 +22,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 import tempfile
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, BackgroundTasks
 from fastapi.responses import StreamingResponse
@@ -150,6 +151,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.container_metadata import ContainerMetadata
 
+try:
+    from container_aliases import ContainerAliases, VALID_STATUSES as _ALIAS_VALID_STATUSES
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.container_aliases import ContainerAliases, VALID_STATUSES as _ALIAS_VALID_STATUSES
+
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 
@@ -206,6 +212,11 @@ def container_metadata_uri() -> str:
 
 
 _container_metadata_store: ContainerMetadata | None = None
+_container_aliases_store: ContainerAliases | None = None
+# 进程内 alias 缓存：alias name → row dict（含 None 哨兵以缓存"未命中"）。
+# SIGHUP / 重启即清空；admin upsert/delete alias 主动失效对应 key。
+_alias_cache: dict[str, Optional[dict]] = {}
+_alias_cache_lock = threading.Lock()
 
 
 def get_container_metadata_store() -> ContainerMetadata:
@@ -214,6 +225,83 @@ def get_container_metadata_store() -> ContainerMetadata:
     if _container_metadata_store is None:
         _container_metadata_store = ContainerMetadata(container_metadata_uri())
     return _container_metadata_store
+
+
+def get_container_aliases_store() -> ContainerAliases:
+    """单例 ContainerAliases；首次访问时连库。共用 container_metadata 的 LanceDB uri。"""
+    global _container_aliases_store
+    if _container_aliases_store is None:
+        _container_aliases_store = ContainerAliases(container_metadata_uri())
+    return _container_aliases_store
+
+
+def _alias_cache_invalidate(alias: str | None = None) -> None:
+    """alias 写入 / 删除后失效缓存。alias=None 时清整张表。"""
+    with _alias_cache_lock:
+        if alias is None:
+            _alias_cache.clear()
+        else:
+            _alias_cache.pop(alias, None)
+
+
+def resolve_container_or_raise(name: str) -> tuple[str, Optional[dict]]:
+    """把客户端传入的 container name 解析为 canonical。
+
+    返回 ``(canonical_name, alias_row_or_None)``：
+      - 未命中 alias 表 → ``(name, None)``。caller 沿用原有"已有即用、新名自动创建"
+        逻辑，行为完全向后兼容。
+      - status='active'     → ``(canonical, row)``，无感透传。
+      - status='deprecated' → 同 active，但记 warning 日志（提示客户端升级）。
+      - status='removed'    → 抛 ``HTTPException(410)``，防客户端"幽灵重建"已删容器。
+
+    使用进程内缓存（含 None 哨兵）减少 LanceDB 重复读；alias 写入 / 删除路径
+    主动 invalidate；进程重启 / SIGHUP 自动清空。
+    """
+    if not name:
+        return (name, None)
+    # 缓存读
+    with _alias_cache_lock:
+        cached = _alias_cache.get(name, _MISSING)
+    if cached is _MISSING:
+        try:
+            row = get_container_aliases_store().resolve(name)
+        except Exception:  # pragma: no cover - 表故障不应阻塞主路径
+            logger.exception("alias table read failed for %r; treating as canonical", name)
+            row = None
+        with _alias_cache_lock:
+            _alias_cache[name] = row
+    else:
+        row = cached
+
+    if row is None:
+        return (name, None)
+
+    status = row.get("status", "active")
+    if status == "removed":
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "container_removed",
+                "removed_alias": name,
+                "removed_at": row.get("updated_at"),
+                "reason": row.get("reason"),
+                "suggestion": (
+                    row.get("notes")
+                    or "Use 'sanva-yzjx' (default) or contact ops for a current canonical container."
+                ),
+            },
+        )
+    if status == "deprecated":
+        logger.warning(
+            "deprecated alias %r → %r (suggested upgrade)",
+            name,
+            row.get("canonical"),
+        )
+    return (row["canonical"], row)
+
+
+# Sentinel 用于区分"未缓存"与"缓存了 None"。
+_MISSING: Any = object()
 
 
 def memory_objects_path(container: str) -> Path:
@@ -797,6 +885,10 @@ def _resolve_search_targets(req: SearchReq) -> tuple[list[str], bool]:
 
     优先级：containers > container_pattern > container（含 v0.11.0 union 扩展）。
     返回 (targets, union_applied)：union_applied=True 表示触发了 sibling _openai 自动追加。
+
+    alias resolution：每个入参容器都经 ``resolve_container_or_raise`` 透传到
+    canonical；status='removed' 直接 410（防客户端"幽灵重建"）。pattern 同时匹配
+    canonical 容器名 + 已注册 alias 的 alias 字段。
     """
     if req.containers:
         # 显式 containers list → 用户已掌控全部目标，不再触发 union 扩展
@@ -805,22 +897,38 @@ def _resolve_search_targets(req: SearchReq) -> tuple[list[str], bool]:
         seen: set[str] = set()
         ordered: list[str] = []
         for name in req.containers:
-            if name not in seen:
-                ordered.append(name)
-                seen.add(name)
+            canonical, _ = resolve_container_or_raise(name)
+            if canonical not in seen:
+                ordered.append(canonical)
+                seen.add(canonical)
         return ordered, False
 
     if req.container_pattern is not None:
         # 显式 pattern → 同上，用户已掌控
         _validate_pattern(req.container_pattern)
-        names = [
+        # canonical 容器名直接命中
+        canonical_names = [
             p.name for p in _list_container_dirs()
             if _match_container(p.name, req.container_pattern, req.pattern_mode)
         ]
-        return names, False
+        # alias 命中（active / deprecated）→ 追加 canonical，避免遗漏旧名
+        try:
+            aliases = get_container_aliases_store().list_all()
+        except Exception:  # pragma: no cover - 表故障不应阻塞 pattern 主路径
+            aliases = []
+        canonical_set = set(canonical_names)
+        for row in aliases:
+            if row.get("status") == "removed":
+                continue
+            if _match_container(row["alias"], req.container_pattern, req.pattern_mode):
+                canonical = row["canonical"]
+                if canonical not in canonical_set:
+                    canonical_names.append(canonical)
+                    canonical_set.add(canonical)
+        return canonical_names, False
 
     validate_container_name(req.container)
-    main = req.container
+    main, _ = resolve_container_or_raise(req.container)
     targets = [main]
 
     # v0.11.0 union 扩展：解析 union flag —— 显式优先；None 时走 ProfileSet 全局默认
@@ -1284,7 +1392,12 @@ def search(req: SearchReq) -> SearchResponse:
         merged = deduped[: req.topk]
 
     has_any_ok = any(s == 'ok' for s in per_status.values())
-    primary_container = targets[0] if len(targets) == 1 else (req.container if req.container in targets else targets[0])
+    # response.container 客户端无感原则：单容器入参保留客户端传入的原名；多容器
+    # 入参（containers / pattern）则用 canonical 的第一个（targets 已经是 canonical）。
+    if req.containers or req.container_pattern is not None:
+        primary_container = targets[0] if targets else req.container
+    else:
+        primary_container = req.container
 
     # v0.11.0 degraded：任一容器超时 / 失败 / 未初始化都算降级（结果不完整）
     degraded = any(
@@ -1495,9 +1608,10 @@ def _job_to_command_response(job: Job, timed_out_wait: bool = False) -> CommandR
 
 @app.post('/embed', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def embed(req: ContainerReq, background_tasks: BackgroundTasks) -> CommandResponse:
+    canonical, _ = resolve_container_or_raise(req.container)
     resp = _enqueue_or_run(
         op='embed',
-        container=req.container,
+        container=canonical,
         payload={},
         timeout_s=req.timeout_s,
         wait=req.wait,
@@ -1505,7 +1619,7 @@ def embed(req: ContainerReq, background_tasks: BackgroundTasks) -> CommandRespon
         embedding_override=req.embedding_model,
     )
     # Also trigger background sync of all existing memory_objects to LightRAG!
-    background_tasks.add_task(_sync_existing_memories_to_lightrag, req.container)
+    background_tasks.add_task(_sync_existing_memories_to_lightrag, canonical)
     # 说明静默重试 backlog：embedding 失败的对象不会丢，会进 backlog 后台重试。
     resp.note = f'{resp.note} {_BACKLOG_NOTE}'.strip() if resp.note else _BACKLOG_NOTE
     return resp
@@ -1518,6 +1632,7 @@ def build_manifest(_req: ContainerReq) -> CommandResponse:
 
 @app.post('/ingest-memory', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def ingest_memory(req: IngestMemoryReq) -> CommandResponse:
+    canonical, _ = resolve_container_or_raise(req.container)
     payload = {}
     if req.memory_dir:
         payload['memory_dir'] = req.memory_dir
@@ -1525,7 +1640,7 @@ def ingest_memory(req: IngestMemoryReq) -> CommandResponse:
         payload['archive_dir'] = req.archive_dir
     return _enqueue_or_run(
         op='ingest-memory',
-        container=req.container,
+        container=canonical,
         payload=payload,
         timeout_s=req.timeout_s,
         wait=req.wait,
@@ -1553,7 +1668,9 @@ def ingest_contract() -> dict[str, object]:
 @app.post('/ingest-memory/objects', response_model=ClientIngestResponse, dependencies=[Depends(verify_auth)])
 def ingest_objects(req: ClientIngestReq, background_tasks: BackgroundTasks) -> ClientIngestResponse:
     validate_container_name(req.container)
-    path = memory_objects_path(req.container)
+    # alias 透传：客户端传 sanva → 实际写 sanva-personal；removed 直接 410。
+    canonical, _ = resolve_container_or_raise(req.container)
+    path = memory_objects_path(canonical)
     lines = []
     for obj in req.objects:
         payload = obj.model_dump(mode='json')
@@ -1562,14 +1679,14 @@ def ingest_objects(req: ClientIngestReq, background_tasks: BackgroundTasks) -> C
     # POSIX O_APPEND is atomic only for writes < PIPE_BUF (~4 KB). A single
     # large object can tear if two requests race; a per-container lock
     # serializes appends on the same JSONL file.
-    container_lock = GATE._container_lock(req.container)  # noqa: SLF001 — intentional reuse
+    container_lock = GATE._container_lock(canonical)  # noqa: SLF001 — intentional reuse
     with container_lock:
         with path.open('a', encoding='utf-8') as handle:
             for line in lines:
                 handle.write(line + '\n')
 
     # Background sync to LightRAG knowledge graph
-    background_tasks.add_task(_async_sync_to_lightrag, req.container, req.objects)
+    background_tasks.add_task(_async_sync_to_lightrag, canonical, req.objects)
 
     # auto_embed: enqueue a background embed job. The persistent queue coalesces
     # duplicate enqueues for the same container, so even posting many objects
@@ -1582,7 +1699,7 @@ def ingest_objects(req: ClientIngestReq, background_tasks: BackgroundTasks) -> C
             embed_payload['embedding_model'] = req.embedding_model
         try:
             get_job_queue().enqueue(
-                op='embed', container=req.container, payload=embed_payload, label='auto-embed',
+                op='embed', container=canonical, payload=embed_payload, label='auto-embed',
                 max_pending=_env_int('TM_QUEUE_MAX_PENDING', 1000),
             )
         except QueueFullError as exc:
@@ -1599,6 +1716,7 @@ def ingest_objects(req: ClientIngestReq, background_tasks: BackgroundTasks) -> C
         index_hint = 'Run /embed for this container to refresh LanceDB after storing new objects.'
     # 说明静默重试 backlog：后续 embedding 若失败，对象进 backlog 后台重试不丢失。
     index_hint = f'{index_hint} {_BACKLOG_NOTE}'
+    # response.container 保留客户端传入的原名（无感原则）。
     return ClientIngestResponse(
         container=req.container,
         accepted=len(lines),
@@ -1610,6 +1728,7 @@ def ingest_objects(req: ClientIngestReq, background_tasks: BackgroundTasks) -> C
 
 @app.post('/ingest-structured', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def ingest_structured(req: StructuredIngestReq) -> CommandResponse:
+    canonical, _ = resolve_container_or_raise(req.container)
     payload = {
         'input_path': req.input_path,
         'doc_type': req.doc_type,
@@ -1618,7 +1737,7 @@ def ingest_structured(req: StructuredIngestReq) -> CommandResponse:
         payload['doc_id'] = req.doc_id
     return _enqueue_or_run(
         op='ingest-structured',
-        container=req.container,
+        container=canonical,
         payload=payload,
         timeout_s=req.timeout_s,
         wait=req.wait,
@@ -1776,6 +1895,18 @@ def list_containers(pattern: str | None = None, mode: str = 'substring'):
         logging.exception("container_metadata read failed; returning containers without metadata")
         metadata_by_name = {}
 
+    # 反向 alias lookup：canonical → list[alias dict]，让 GET /containers 一目了然
+    # 这个 canonical 容器被哪些旧名透传。removed 不入此表（避免误导，已 410 拒收）。
+    aliases_by_canonical: dict[str, list[dict]] = {}
+    try:
+        for row in get_container_aliases_store().list_all():
+            if row.get('status') == 'removed':
+                continue
+            aliases_by_canonical.setdefault(row['canonical'], []).append(row)
+    except Exception:  # pragma: no cover - alias 表故障不影响主列表
+        logging.exception("container_aliases read failed; returning containers without aliases")
+        aliases_by_canonical = {}
+
     dirs = _list_container_dirs()
     result = []
     for p in dirs:
@@ -1800,6 +1931,9 @@ def list_containers(pattern: str | None = None, mode: str = 'substring'):
             'last_modified': last_mod,
             'index_state': status['state'] if status else 'unknown',
             'metadata': metadata_by_name.get(p.name),
+            # alias 反向 lookup：列出指向该 canonical 的全部非 removed alias 名。
+            # 为空数组（而非 null）方便客户端简单 .length 判断。
+            'aliases': [a['alias'] for a in aliases_by_canonical.get(p.name, [])],
         })
     return {'containers': result, 'count': len(result)}
 
@@ -1816,11 +1950,13 @@ def upsert_container_metadata(name: str, payload: ContainerMetadataPayload):
     - 首次写入时 created_at 落盘；updated_at 每次刷新。
     - tags / policy 在表里以 JSON string 形式存储，API 透明 encode/decode。
     - 容器目录不存在也可写 metadata —— 允许"先声明命名规范，后写入数据"。
+    - 入参 name 若是 alias → 写到 canonical（避免双写漂移）。removed 抛 410。
     """
     validate_container_name(name)
+    canonical, _ = resolve_container_or_raise(name)
     store = get_container_metadata_store()
     fields = payload.model_dump(exclude_none=True)
-    row = store.upsert(name, **fields)
+    row = store.upsert(canonical, **fields)
     return row
 
 
@@ -1836,9 +1972,15 @@ def dump_container(name: str):
     - 容器不存在或为空时返回空响应（200 + 0 字节）。
     - vector 列在 memory_objects.jsonl 中本就不存在；该端点只 dump JSONL，
       重导时由 /embed 重新生成 embedding。
+    - 入参 name 若是 alias → 解析到 canonical 后 dump。removed 抛 410。
     """
     validate_container_name(name)
-    path = memory_objects_path(name) if (WS / 'tasks' / 'rag' / 'containers' / name).exists() else None
+    canonical, _ = resolve_container_or_raise(name)
+    path = (
+        memory_objects_path(canonical)
+        if (WS / 'tasks' / 'rag' / 'containers' / canonical).exists()
+        else None
+    )
 
     def gen():
         if path is None or not path.exists():
@@ -1859,6 +2001,80 @@ def dump_container(name: str):
                 yield json.dumps(obj, ensure_ascii=False) + '\n'
 
     return StreamingResponse(gen(), media_type='application/x-ndjson')
+
+
+# --- container_aliases: 透明 alias 路由管理端点 ---
+
+
+from pydantic import BaseModel as _BaseModel  # 局部 import 避免顶部 import 链改动
+
+
+class AliasPayload(_BaseModel):
+    """upsert alias 请求体。canonical / reason 必填；status / notes 可选。"""
+
+    alias: str
+    canonical: str
+    reason: str = ''
+    status: str = 'active'  # active | deprecated | removed
+    notes: str = ''
+
+
+@app.post('/containers/aliases', dependencies=[Depends(verify_auth)])
+def upsert_alias(payload: AliasPayload):
+    """upsert 一条 alias 路由（admin only）。
+
+    - alias / canonical 走 ``validate_container_name`` 校验（防路径遍历）。
+    - status 必须 ∈ {active, deprecated, removed}；否则 400。
+    - 写入后失效进程内 alias 缓存对应 key。
+    """
+    validate_container_name(payload.alias)
+    validate_container_name(payload.canonical)
+    if payload.status not in _ALIAS_VALID_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f'invalid status {payload.status!r}; '
+                f'expected one of {_ALIAS_VALID_STATUSES}'
+            ),
+        )
+    try:
+        row = get_container_aliases_store().upsert(
+            alias=payload.alias,
+            canonical=payload.canonical,
+            reason=payload.reason,
+            status=payload.status,
+            notes=payload.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _alias_cache_invalidate(payload.alias)
+    return row
+
+
+@app.get('/containers/aliases', dependencies=[Depends(verify_auth)])
+def list_aliases():
+    """列出所有 alias 路由（admin only）。"""
+    try:
+        rows = get_container_aliases_store().list_all()
+    except Exception:  # pragma: no cover - 表故障
+        logger.exception("alias table read failed")
+        rows = []
+    return {'aliases': rows, 'count': len(rows)}
+
+
+@app.delete('/containers/aliases/{alias}', dependencies=[Depends(verify_auth)])
+def delete_alias(alias: str):
+    """物理删除一条 alias 路由（admin only）。
+
+    删除的是 alias 表里的路由记录，**不**触碰 canonical 容器的物理数据。
+    删除后该 alias 名会回退到"未注册"，下次写入会被当作新容器自动创建。
+    """
+    validate_container_name(alias)
+    deleted = get_container_aliases_store().delete(alias)
+    _alias_cache_invalidate(alias)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f'alias not found: {alias}')
+    return {'deleted': True, 'alias': alias}
 
 
 # --- 容器索引状态机 / embedding backlog 端点 ---
@@ -1997,9 +2213,13 @@ def all_index_status() -> IndexStatusListResponse:
     dependencies=[Depends(verify_auth)],
 )
 def container_index_status(name: str) -> IndexStatusResponse:
-    """单容器索引状态机：state + 对象计数 + backlog 摘要 + next_retry_at。"""
+    """单容器索引状态机：state + 对象计数 + backlog 摘要 + next_retry_at。
+
+    入参若是 alias → 解析到 canonical 后查询。removed 抛 410。
+    """
     validate_container_name(name)
-    status = _compute_container_index_status(name)
+    canonical, _ = resolve_container_or_raise(name)
+    status = _compute_container_index_status(canonical)
     if status is None:
         raise HTTPException(status_code=404, detail=f'container not found: {name}')
     return IndexStatusResponse(**status)
@@ -2020,15 +2240,18 @@ def container_backlog(
     - status：可选过滤 waiting / retrying / resolved / dead；非法值 → 400。
     - limit：1..500。
     - 每项 last_error 截断，避免响应体被长 traceback 撑大。
+    - 入参若是 alias → 解析到 canonical 后查询。removed 抛 410。
     """
     validate_container_name(name)
+    canonical, _ = resolve_container_or_raise(name)
     limit = max(1, min(500, int(limit)))
     store = get_backlog_store()
     try:
-        items = store.list_items(name, status=status, limit=limit)
+        items = store.list_items(canonical, status=status, limit=limit)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    summary = store.summary(name)
+    summary = store.summary(canonical)
+    # response.container 保留客户端入参，避免暴露 canonical（无感原则）。
     return BacklogListResponse(
         container=name,
         count=len(items),
@@ -2040,7 +2263,32 @@ def container_backlog(
 
 @app.delete('/containers/{name}', response_model=ContainerDeleteResponse, dependencies=[Depends(verify_auth)])
 def delete_container(name: str) -> ContainerDeleteResponse:
+    """物理删除 canonical 容器。**不 resolve alias** —— 防止客户端传 alias 名误删
+    背后的 canonical（多客户端共享 canonical 时副作用极大）。
+
+    若传入名称是已注册 alias，返 400 让 caller 显式用 canonical 名重试。
+    """
     validate_container_name(name)
+    # 检测是否传入 alias —— 是则拒绝，要求 caller 显式用 canonical
+    try:
+        alias_row = get_container_aliases_store().resolve(name)
+    except Exception:  # pragma: no cover - alias 表故障不应阻塞物理删除
+        alias_row = None
+    if alias_row is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                'error': 'cannot_delete_via_alias',
+                'alias': name,
+                'canonical': alias_row.get('canonical'),
+                'hint': (
+                    "DELETE /containers/{name} accepts only canonical container names "
+                    f"to prevent accidental data loss. Retry with the canonical name "
+                    f"'{alias_row.get('canonical')}' if you truly intend to delete it, "
+                    "or DELETE /containers/aliases/{alias} to remove only the alias."
+                ),
+            },
+        )
     target = WS / 'tasks' / 'rag' / 'containers' / name
     if not target.exists():
         raise HTTPException(status_code=404, detail=f'container not found: {name}')
@@ -2055,7 +2303,8 @@ def delete_container(name: str) -> ContainerDeleteResponse:
 )
 def update_memory(container: str, memory_id: str, req: UpdateMemoryReq) -> MemoryUpdateResponse:
     validate_container_name(container)
-    rows = read_memory_objects(container)
+    canonical, _ = resolve_container_or_raise(container)
+    rows = read_memory_objects(canonical)
     found = False
     for row in rows:
         if row.get('id') == memory_id:
@@ -2074,7 +2323,7 @@ def update_memory(container: str, memory_id: str, req: UpdateMemoryReq) -> Memor
             break
     if not found:
         raise HTTPException(status_code=404, detail=f'memory object not found: {memory_id}')
-    write_memory_objects(container, rows)
+    write_memory_objects(canonical, rows)
     return MemoryUpdateResponse(
         container=container,
         id=memory_id,
@@ -2091,11 +2340,12 @@ def update_memory(container: str, memory_id: str, req: UpdateMemoryReq) -> Memor
 )
 def delete_memory(container: str, memory_id: str) -> MemoryDeleteResponse:
     validate_container_name(container)
-    rows = read_memory_objects(container)
+    canonical, _ = resolve_container_or_raise(container)
+    rows = read_memory_objects(canonical)
     new_rows = [r for r in rows if r.get('id') != memory_id]
     if len(new_rows) == len(rows):
         raise HTTPException(status_code=404, detail=f'memory object not found: {memory_id}')
-    write_memory_objects(container, new_rows)
+    write_memory_objects(canonical, new_rows)
     return MemoryDeleteResponse(
         container=container,
         id=memory_id,
@@ -2348,8 +2598,9 @@ def _require_lightrag_ready() -> None:
 @app.post('/documents/text', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
     validate_container_name(req.container)
+    canonical, _ = resolve_container_or_raise(req.container)
     _require_lightrag_ready()
-    _admit_or_503(req.container, op='documents/text')
+    _admit_or_503(canonical, op='documents/text')
     # embedding_model override 在 in-process LightRAG 路径暂不生效（Phase 1+：
     # 需要 β 的 registry-based cache key 才能切换 instance）。当前接受字段以保持
     # API 兼容，但若客户端真的指定了 override，记一行 warning 提示无效。
@@ -2362,7 +2613,7 @@ async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
     # Cap concurrent lightrag writes — each call drives many embedding+LLM
     # invocations and holds the container's KV graph lock.
     async with _RAG_WRITE_SEM:
-        lightrag = await get_lightrag(req.container)
+        lightrag = await get_lightrag(canonical)
         await lightrag.ainsert(req.text)
     return QueryResponse(
         status='ok',
@@ -2403,12 +2654,13 @@ async def ingest_document_file(
     OOM a 1.5 GB container.
     """
     validate_container_name(container)
+    canonical, _ = resolve_container_or_raise(container)
     _require_lightrag_ready()
     if get_raganything is None:
         raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
 
     filename = _sanitize_upload_filename(file.filename)
-    _admit_or_503(container, op='documents/file')
+    _admit_or_503(canonical, op='documents/file')
     if embedding_model:
         # 与 /documents/text 同样的 Phase 1 限制：in-process RAGAnything 还未接到 registry 切换
         logger.warning(
@@ -2445,7 +2697,7 @@ async def ingest_document_file(
                         )
                     f.write(chunk)
 
-            rag = await get_raganything(container)
+            rag = await get_raganything(canonical)
             parse_output = tmp_dir / 'parsed'
             parse_output.mkdir(exist_ok=True)
             parser_kwargs: dict[str, Any] = {}
@@ -2524,8 +2776,9 @@ async def embed_multimodal(
     可读文本；缺省时文本回退为文件名。
     """
     validate_container_name(container)
+    canonical, _ = resolve_container_or_raise(container)
     filename = _sanitize_upload_filename(file.filename)
-    profile = _resolve_gemini_native_profile(container)
+    profile = _resolve_gemini_native_profile(canonical)
 
     raw = await file.read()
     if not raw:
@@ -2577,7 +2830,9 @@ async def embed_multimodal(
     effective_caption = caption or vlm_caption
     caption_source = 'user' if caption else ('vlm' if vlm_caption else 'none')
 
-    stable = doc_id or f'mm-{hashlib.sha1(f"{container}/{filename}".encode()).hexdigest()[:16]}'
+    # doc_id 用 canonical 算哈希，确保 alias / canonical 走到同一稳定 id（避免 sanva
+     # 与 sanva-personal 两次上传同一文件得到不同 doc_id）。
+    stable = doc_id or f'mm-{hashlib.sha1(f"{canonical}/{filename}".encode()).hexdigest()[:16]}'
     modality = modality_of(mime)
     media_chunk_id = f'{stable}#multimodal'
     media_row = {
@@ -2648,11 +2903,11 @@ async def embed_multimodal(
         from task_rag_lancedb_ingest import ingest_precomputed_rows
     except ModuleNotFoundError:  # pragma: no cover - package import path
         from scripts.task_rag_lancedb_ingest import ingest_precomputed_rows
-    summary = ingest_precomputed_rows(container, rows)
+    summary = ingest_precomputed_rows(canonical, rows)
 
     return {
         'status': 'ok',
-        'container': container,
+        'container': container,  # 保留客户端入参，无感原则
         'doc_id': stable,
         'chunk_id': media_chunk_id,
         'caption_chunk_id': caption_chunk_id,
@@ -2671,8 +2926,9 @@ async def embed_multimodal(
 @app.post('/query', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
+    canonical, _ = resolve_container_or_raise(req.container)
     _require_lightrag_ready()
-    _admit_or_503(req.container, op='query')
+    _admit_or_503(canonical, op='query')
     # Phase 2：rerank / chunk_top_k 字段透传到 LightRAG QueryParam。
     # embedding_model / reranker_model 仍只记录日志（per-call profile 切换需要
     # 重建 LightRAG instance，Phase 3 才实现 — 当前 instance 由 route 静态决定）。
@@ -2685,7 +2941,7 @@ async def query_rag(req: QueryReq) -> QueryResponse:
     from lightrag import QueryParam
     # Cap concurrent queries — each runs LLM + embedding fan-out.
     async with _RAG_QUERY_SEM:
-        lightrag = await get_lightrag(req.container)
+        lightrag = await get_lightrag(canonical)
         # QueryParam 字段按 LightRAG 默认值兜底；只在 req 显式给出时覆盖。
         # rerank=None 表示走 route 默认（由 LightRAG instance 的 enable_rerank=True
         # 默认 + rerank_model_func 是否为 None 共同决定）。
