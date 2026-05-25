@@ -15,15 +15,16 @@ import signal
 import subprocess
 import sys
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
 
 from contextlib import asynccontextmanager
 
+import tempfile
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, BackgroundTasks
+import asyncio
 
 try:
     from task_rag_server_models import (
@@ -157,12 +158,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Async semaphore for the unbounded-cost RAG query path. Document ingestion
-# (text/file) no longer runs in-process — it is deferred to the background job
-# worker via the persistent queue — so its write/upload semaphores are gone.
+# Async semaphores for unbounded-cost RAG paths (lightrag write/query, mineru
+# upload). One semaphore per category so they don't starve each other.
 import asyncio as _asyncio
 
+_RAG_WRITE_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_RAG_WRITES', 1))
 _RAG_QUERY_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_RAG_QUERIES', 2))
+_DOC_FILE_SEM = _asyncio.Semaphore(_env_int('TM_MAX_CONCURRENT_DOC_FILES', 1))
 SERVER_SCRIPTS = Path(__file__).resolve().parent
 WORKSPACE_SCRIPTS = WS / 'scripts'
 RAG_API_KEY = os.environ.get('RAG_API_KEY', '')
@@ -397,7 +399,7 @@ def child_env(
     Phase 1 的最小注入面：env var，不动 worker CLI 签名。
 
     container：当前请求作用的 container 名。注入 `CONTAINER` env 让 subprocess
-    (task_rag_search.py 等) 的 task_rag_runtime._resolve_chain_for_worker 走
+    (task_rag_search.py 等) 的 task_rag_runtime._resolve_profile_for_worker 走
     "CONTAINER env → registry.resolve(container)" 路径，而不是退化到 default route。
     v0.10.1 修了 JobWorker 路径同名 bug；v0.10.2 这里补全同步 subprocess 路径。
     """
@@ -819,21 +821,173 @@ def _run_single_search(
     timeout_s: int,
     embedding_override: str | None = None,
 ) -> tuple[CommandResponse, dict]:
-    result = run(
-        [str(script_path('task_rag_search.py')), '--query', query, '--topk', str(topk), '--container', container],
-        timeout_s,
-        embedding_override=embedding_override,
-        container=container,
-        # P0：查询侧 embedding 走 asymmetric query 前缀。
-        embed_mode='query',
-    )
     try:
-        payload = json.loads(result.stdout) if result.stdout.strip() else {}
-    except json.JSONDecodeError:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    return result, payload
+        import lancedb
+        try:
+            from task_rag_runtime import embed_text, lancedb_dir
+        except ModuleNotFoundError:
+            from scripts.task_rag_runtime import embed_text, lancedb_dir
+
+        db_path = str(lancedb_dir(container))
+        db = lancedb.connect(db_path)
+        
+        # Helper to get table names
+        def _table_names(db) -> list[str]:
+            try:
+                raw = db.list_tables()
+            except Exception:
+                return []
+            names: list[str] = []
+            for item in raw:
+                if isinstance(item, str):
+                    names.append(item)
+                elif isinstance(item, (list, tuple)) and item:
+                    names.append(str(item[0]))
+                elif isinstance(item, dict):
+                    names.append(str(item.get('name') or item.get('table_name') or ''))
+                else:
+                    name = getattr(item, 'name', '')
+                    if name:
+                        names.append(str(name))
+            return [name for name in names if name]
+
+        if 'chunks' not in set(_table_names(db)):
+            try:
+                table = db.open_table('chunks')
+            except Exception:
+                payload = {
+                    'code': 'container_not_initialized',
+                    'message': f"Container '{container}' has no searchable LanceDB table yet. Run /embed first.",
+                    'container': container,
+                    'initialized': False,
+                    'results': [],
+                }
+                return CommandResponse(command=['in-process-search'], code=0, stdout=json.dumps(payload)), payload
+        else:
+            table = db.open_table('chunks')
+
+        # Run embedding using custom override if specified
+        if embedding_override:
+            old_model = os.environ.get('TM_EMBEDDING_MODEL')
+            os.environ['TM_EMBEDDING_MODEL'] = embedding_override
+            try:
+                vector = embed_text(query, mode='query')
+            finally:
+                if old_model is not None:
+                    os.environ['TM_EMBEDDING_MODEL'] = old_model
+                else:
+                    os.environ.pop('TM_EMBEDDING_MODEL', None)
+        else:
+            vector = embed_text(query, mode='query')
+
+        cleaned: list[dict[str, object]] = []
+        for row in table.search(vector).limit(topk).to_list():
+            item = dict(row)
+            distance = item.pop('_distance', None)
+            item.pop('vector', None)
+            if distance is not None:
+                item['score'] = float(distance)
+            raw_meta = item.get('metadata')
+            if isinstance(raw_meta, str):
+                try:
+                    parsed = json.loads(raw_meta)
+                    item['metadata'] = parsed if isinstance(parsed, dict) else {}
+                except (TypeError, ValueError):
+                    item['metadata'] = {}
+            cleaned.append(item)
+
+        payload = {
+            'code': 'ok',
+            'container': container,
+            'initialized': True,
+            'results': cleaned,
+        }
+        return CommandResponse(command=['in-process-search'], code=0, stdout=json.dumps(payload)), payload
+    except Exception as exc:
+        logging.exception("Failed in-process LanceDB search; falling back to subprocess")
+        result = run(
+            [str(script_path('task_rag_search.py')), '--query', query, '--topk', str(topk), '--container', container],
+            timeout_s,
+            embedding_override=embedding_override,
+            container=container,
+            embed_mode='query',
+        )
+        try:
+            payload = json.loads(result.stdout) if result.stdout.strip() else {}
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return result, payload
+
+
+async def _async_sync_to_lightrag(container: str, objects: list):
+    try:
+        try:
+            from rag_engine import get_lightrag
+        except ModuleNotFoundError:
+            from scripts.rag_engine import get_lightrag
+        
+        lightrag = await get_lightrag(container)
+        batch_texts = []
+        for obj in objects:
+            tags = obj.tags or []
+            tags_str = f" | Tags: {', '.join(tags)}" if tags else ""
+            text_segment = f"[Memory {obj.id}] {obj.text}{tags_str}"
+            batch_texts.append(text_segment)
+        
+        if batch_texts:
+            merged_text = "\n\n---\n\n".join(batch_texts)
+            await lightrag.ainsert(merged_text)
+        logging.info(f"Successfully synced {len(objects)} memories to LightRAG graph for container={container}")
+    except Exception as exc:
+        logging.exception(f"Failed to sync memories to LightRAG graph for container={container}")
+
+
+async def _sync_existing_memories_to_lightrag(container: str):
+    try:
+        try:
+            from rag_engine import get_lightrag
+        except ModuleNotFoundError:
+            from scripts.rag_engine import get_lightrag
+
+        path = memory_objects_path(container)
+        if not path.exists():
+            return
+
+        records = []
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+                if isinstance(payload, dict) and payload.get('id') and payload.get('text'):
+                    records.append(payload)
+            except Exception:
+                continue
+
+        if not records:
+            return
+
+        lightrag = await get_lightrag(container)
+        for i in range(0, len(records), 50):
+            batch = records[i:i+50]
+            batch_texts = []
+            for obj in batch:
+                tags = obj.get('tags') or []
+                tags_str = f" | Tags: {', '.join(tags)}" if tags else ""
+                text_segment = f"[Memory {obj['id']}] {obj['text']}{tags_str}"
+                batch_texts.append(text_segment)
+            
+            if batch_texts:
+                merged_text = "\n\n---\n\n".join(batch_texts)
+                await lightrag.ainsert(merged_text)
+            logging.info(f"Synced batch {i//50 + 1} ({len(batch)} memories) to LightRAG for container={container}")
+            await asyncio.sleep(1)
+            
+        logging.info(f"Finished full sync of {len(records)} memories to LightRAG for container={container}")
+    except Exception as exc:
+        logging.exception(f"Failed to sync existing memories to LightRAG for container={container}")
 
 
 def _resolve_search_rerank(req: SearchReq, targets: list[str]) -> tuple[bool, Any, str | None, int]:
@@ -864,17 +1018,9 @@ def _resolve_search_rerank(req: SearchReq, targets: list[str]) -> tuple[bool, An
         return False, None, profile_name, candidate_topk
 
     rrk_registry = get_reranker_registry()
-    # req.reranker_model 显式 override 时只用该单 profile —— route 的 fallback
-    # 链是相对 route.reranker 定义的，对 override 不适用；否则展开 route 链。
-    if req.reranker_model:
-        chain = [rrk_registry.get_profile(req.reranker_model)]
-    else:
-        chain = [
-            rrk_registry.get_profile(route.reranker),
-            *(rrk_registry.get_profile(fb) for fb in route.reranker_fallbacks),
-        ]
-    rerank_func, _sig = rrk_registry.build_rerank_func(chain)
-    return True, rerank_func, chain[0].name, candidate_topk
+    profile = rrk_registry.get_profile(profile_name)
+    rerank_func, _sig = rrk_registry.build_rerank_func(profile)
+    return True, rerank_func, profile.name, candidate_topk
 
 
 def _apply_search_rerank(
@@ -1172,19 +1318,6 @@ def _build_ingest_cmd(op: str, container: str, payload: dict) -> list[str]:
         if payload.get('doc_id'):
             cmd += ['--doc-id', str(payload['doc_id'])]
         return cmd
-    if op in ('ingest-document-text', 'ingest-document-file'):
-        mode = 'text' if op == 'ingest-document-text' else 'file'
-        cmd = [
-            str(script_path('task_rag_graph_ingest.py')),
-            '--container', container,
-            '--mode', mode,
-            '--input', str(payload.get('input_path', '')),
-        ]
-        if payload.get('description'):
-            cmd += ['--description', str(payload['description'])]
-        if payload.get('parse_method'):
-            cmd += ['--parse-method', str(payload['parse_method'])]
-        return cmd
     raise ValueError(f'unknown op: {op}')
 
 
@@ -1196,15 +1329,12 @@ def _enqueue_or_run(
     wait: bool,
     label: str = '',
     embedding_override: str | None = None,
-    coalesce: bool = True,
 ) -> CommandResponse:
     """Dispatch one of the three ingest ops, choosing between three modes:
 
     1. wait=False (default): enqueue into persistent SQLite queue, return job_id.
        The single background worker drains the queue at a steady, host-friendly
-       pace. Coalescing prevents duplicate enqueues for (op, container) — pass
-       coalesce=False for ops whose payload carries a distinct per-call input
-       (e.g. document ingestion) so concurrent posts are not collapsed/lost.
+       pace. Coalescing prevents duplicate enqueues for (op, container).
 
     2. wait=True with worker running: enqueue + poll queue until done/timeout.
        Lets a synchronous client share the same coalescing/backoff machinery
@@ -1238,7 +1368,6 @@ def _enqueue_or_run(
             job_id = queue.enqueue(
                 op=op, container=container, payload=payload,
                 label=label or op, max_pending=max_pending,
-                coalesce=coalesce,
             )
         except QueueFullError as exc:
             raise HTTPException(
@@ -1262,7 +1391,6 @@ def _enqueue_or_run(
             job_id = queue.enqueue(
                 op=op, container=container, payload=payload,
                 label=label or op, max_pending=max_pending,
-                coalesce=coalesce,
             )
         except QueueFullError as exc:
             raise HTTPException(
@@ -1336,7 +1464,7 @@ def _job_to_command_response(job: Job, timed_out_wait: bool = False) -> CommandR
 
 
 @app.post('/embed', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
-def embed(req: ContainerReq) -> CommandResponse:
+def embed(req: ContainerReq, background_tasks: BackgroundTasks) -> CommandResponse:
     resp = _enqueue_or_run(
         op='embed',
         container=req.container,
@@ -1346,6 +1474,8 @@ def embed(req: ContainerReq) -> CommandResponse:
         label='embed',
         embedding_override=req.embedding_model,
     )
+    # Also trigger background sync of all existing memory_objects to LightRAG!
+    background_tasks.add_task(_sync_existing_memories_to_lightrag, req.container)
     # 说明静默重试 backlog：embedding 失败的对象不会丢，会进 backlog 后台重试。
     resp.note = f'{resp.note} {_BACKLOG_NOTE}'.strip() if resp.note else _BACKLOG_NOTE
     return resp
@@ -1391,7 +1521,7 @@ def ingest_contract() -> dict[str, object]:
 
 
 @app.post('/ingest-memory/objects', response_model=ClientIngestResponse, dependencies=[Depends(verify_auth)])
-def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
+def ingest_objects(req: ClientIngestReq, background_tasks: BackgroundTasks) -> ClientIngestResponse:
     validate_container_name(req.container)
     path = memory_objects_path(req.container)
     lines = []
@@ -1407,6 +1537,9 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
         with path.open('a', encoding='utf-8') as handle:
             for line in lines:
                 handle.write(line + '\n')
+
+    # Background sync to LightRAG knowledge graph
+    background_tasks.add_task(_async_sync_to_lightrag, req.container, req.objects)
 
     # auto_embed: enqueue a background embed job. The persistent queue coalesces
     # duplicate enqueues for the same container, so even posting many objects
@@ -2112,54 +2245,31 @@ def _require_lightrag_ready() -> None:
     raise HTTPException(status_code=503, detail=f'LightRAG not available.{pkg}{missing}')
 
 
-def _inbox_dir(container: str) -> Path:
-    """container 的异步入库暂存目录，建图 CLI 子进程从这里读输入并在成功后清理。"""
-    d = WS / 'tasks' / 'rag' / 'containers' / container / '_inbox'
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _stage_inbox_text(container: str, text: str) -> Path:
-    """把 /documents/text 的正文落到 container 的 _inbox，返回绝对路径。
-
-    用 uuid 命名（不依赖 job_id —— job_id 要 enqueue 后才有，会形成先有鸡先有
-    蛋的依赖）。"""
-    path = _inbox_dir(container) / f'text-{uuid.uuid4().hex}.txt'
-    path.write_text(text, encoding='utf-8')
-    return path.resolve()
-
-
-@app.post('/documents/text', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
-def ingest_document_text(req: DocumentTextReq) -> CommandResponse:
-    """把纯文本异步入库到 container 知识图谱。
-
-    建图（LightRAG ainsert）会跑数十秒到数分钟 —— 同步等待会撞边缘代理的
-    100s 超时。这里把正文落到 _inbox 后立即入队并返回 job 标识；后台 worker
-    驱动 task_rag_graph_ingest.py 子进程完成建图。轮询 GET /jobs/{pid} 查进度。
-    """
+@app.post('/documents/text', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
+async def ingest_document_text(req: DocumentTextReq) -> QueryResponse:
     validate_container_name(req.container)
     _require_lightrag_ready()
-    # embedding_model override 在建图路径暂不生效（需 registry-based cache key
-    # 才能切换 instance）。接受字段以保持 API 兼容，指定时记一行 warning。
+    _admit_or_503(req.container, op='documents/text')
+    # embedding_model override 在 in-process LightRAG 路径暂不生效（Phase 1+：
+    # 需要 β 的 registry-based cache key 才能切换 instance）。当前接受字段以保持
+    # API 兼容，但若客户端真的指定了 override，记一行 warning 提示无效。
     if req.embedding_model:
         logger.warning(
-            'documents/text received embedding_model=%r but the graph-ingest path '
-            'does not honor per-request override yet; using route default.',
+            'documents/text received embedding_model=%r but in-process LightRAG path '
+            'does not honor per-request override in Phase 1; using route default.',
             req.embedding_model,
         )
-    input_path = _stage_inbox_text(req.container, req.text)
-    payload: dict[str, Any] = {'input_path': str(input_path)}
-    if req.description:
-        payload['description'] = req.description
-    return _enqueue_or_run(
-        op='ingest-document-text',
+    # Cap concurrent lightrag writes — each call drives many embedding+LLM
+    # invocations and holds the container's KV graph lock.
+    async with _RAG_WRITE_SEM:
+        lightrag = await get_lightrag(req.container)
+        await lightrag.ainsert(req.text)
+    return QueryResponse(
+        status='ok',
+        query='',
         container=req.container,
-        payload=payload,
-        timeout_s=300,
-        wait=False,
-        label='ingest-document-text',
-        embedding_override=req.embedding_model,
-        coalesce=False,
+        answer=f'Text ingested into container {req.container} knowledge graph.',
+        mode='insert',
     )
 
 
@@ -2176,99 +2286,91 @@ def _sanitize_upload_filename(raw: str | None) -> str:
     return name
 
 
-async def _stage_inbox_upload(container: str, filename: str, file: UploadFile) -> Path:
-    """把上传文件流式落到 container 的 _inbox，做大小上限校验，返回绝对路径。
-
-    流式写盘（1 MB 分块）避免把大文件整体读进内存；超过 MAX_UPLOAD_BYTES 即
-    413 并清理半成品。"""
-    inbox = _inbox_dir(container)
-    saved = inbox / f'file-{uuid.uuid4().hex}-{filename}'
-    # 防御性：验证 resolve 后仍在 inbox 内
-    if not str(saved.resolve()).startswith(str(inbox.resolve()) + os.sep):
-        raise HTTPException(status_code=400, detail='invalid filename: path traversal')
-    total = 0
-    try:
-        with saved.open('wb') as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f'file exceeds max upload size {_MAX_UPLOAD_BYTES} bytes',
-                    )
-                f.write(chunk)
-    except Exception:
-        saved.unlink(missing_ok=True)
-        raise
-    return saved.resolve()
-
-
-async def _ingest_uploaded_document(
-    container: str,
-    file: UploadFile,
-    parse_method: str | None,
-    embedding_model: str | None,
-) -> CommandResponse:
-    """/documents/file 与 /documents/upload 的共享异步入库逻辑。
-
-    把上传文件落到 _inbox 后立即入队（op=ingest-document-file）并返回 job 标识；
-    后台 worker 驱动 task_rag_graph_ingest.py 子进程跑 RAG-Anything 解析 + 建图，
-    避免同步等待数十秒到数分钟撞边缘代理 100s 超时。
-    """
-    validate_container_name(container)
-    _require_lightrag_ready()
-    if get_raganything is None:
-        raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
-    filename = _sanitize_upload_filename(file.filename)
-    if embedding_model:
-        logger.warning(
-            'documents/file received embedding_model=%r but the graph-ingest path '
-            'does not honor per-request override yet; using route default.',
-            embedding_model,
-        )
-    saved = await _stage_inbox_upload(container, filename, file)
-    payload: dict[str, Any] = {'input_path': str(saved)}
-    if parse_method:
-        payload['parse_method'] = parse_method
-    return _enqueue_or_run(
-        op='ingest-document-file',
-        container=container,
-        payload=payload,
-        timeout_s=600,
-        wait=False,
-        label='ingest-document-file',
-        embedding_override=embedding_model,
-        coalesce=False,
-    )
-
-
-@app.post('/documents/file', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
+@app.post('/documents/file', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def ingest_document_file(
     container: str = Form(...),
     file: UploadFile = File(...),
     parse_method: str | None = Form(default=None),
     embedding_model: str | None = Form(default=None),
-) -> CommandResponse:
-    """多模态文档异步入库：PDF / Office / 图片 / HTML / Markdown 等。
+) -> QueryResponse:
+    """多模态文档入库：PDF / Office / 图片 / HTML / Markdown 等。
 
-    底层走 RAGAnything.process_document_complete → mineru parser → LightRAG，
-    与 /documents/text 写入同一容器知识图谱。轮询 GET /jobs/{pid} 查进度。
+    底层走 RAGAnything.process_document_complete → mineru parser → LightRAG。
+    与 /documents/text 共享同一个 container working_dir，写入同一知识图谱。
+
+    Mineru parsing routinely uses 1-2 GB RAM; we admit-gate + serialize via
+    _DOC_FILE_SEM (default concurrency=1) so two simultaneous uploads can't
+    OOM a 1.5 GB container.
     """
-    return await _ingest_uploaded_document(container, file, parse_method, embedding_model)
+    validate_container_name(container)
+    _require_lightrag_ready()
+    if get_raganything is None:
+        raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
 
+    filename = _sanitize_upload_filename(file.filename)
+    _admit_or_503(container, op='documents/file')
+    if embedding_model:
+        # 与 /documents/text 同样的 Phase 1 限制：in-process RAGAnything 还未接到 registry 切换
+        logger.warning(
+            'documents/file received embedding_model=%r but in-process RAGAnything path '
+            'does not honor per-request override in Phase 1; using route default.',
+            embedding_model,
+        )
 
-@app.post('/documents/upload', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
-async def upload_document(
-    container: str = Form(...),
-    file: UploadFile = File(...),
-    parse_method: str | None = Form(default=None),
-    embedding_model: str | None = Form(default=None),
-) -> CommandResponse:
-    """/documents/file 的别名路由，行为完全一致（异步入队多模态文档）。"""
-    return await _ingest_uploaded_document(container, file, parse_method, embedding_model)
+    # Stage uploads under /data/scratch (persistent volume, ~no size cap)
+    # rather than /tmp tmpfs (128 MB), since MAX_UPLOAD_BYTES defaults to
+    # 200 MB and mineru's intermediate parse output can be hundreds of MB more.
+    scratch_root = WS / 'scratch' / 'uploads'
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix='tm-upload-', dir=str(scratch_root)))
+    saved = tmp_dir / filename
+    # 防御性：验证 resolve 后仍在 tmp_dir 内
+    if not str(saved.resolve()).startswith(str(tmp_dir.resolve()) + os.sep):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail='invalid filename: path traversal')
+
+    total = 0
+    try:
+        async with _DOC_FILE_SEM:
+            with saved.open('wb') as f:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f'file exceeds max upload size {_MAX_UPLOAD_BYTES} bytes',
+                        )
+                    f.write(chunk)
+
+            rag = await get_raganything(container)
+            parse_output = tmp_dir / 'parsed'
+            parse_output.mkdir(exist_ok=True)
+            parser_kwargs: dict[str, Any] = {}
+            backend = os.environ.get('RAG_PARSER_BACKEND')
+            if backend:
+                parser_kwargs['backend'] = backend
+            lang = os.environ.get('RAG_PARSER_LANG')
+            if lang:
+                parser_kwargs['lang'] = lang
+            await rag.process_document_complete(
+                file_path=str(saved),
+                output_dir=str(parse_output),
+                parse_method=parse_method or os.environ.get('RAG_PARSE_METHOD', 'auto'),
+                **parser_kwargs,
+            )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return QueryResponse(
+        status='ok',
+        query='',
+        container=container,
+        answer=f'Document {filename} ({total} bytes) ingested into container {container}.',
+        mode='insert',
+    )
 
 
 _EMBED_MM_MAX_BYTES = int(os.environ.get('EMBED_MM_MAX_BYTES', str(20 * 1024 * 1024)))
@@ -2301,39 +2403,6 @@ def _resolve_gemini_native_profile(container: str):
             ),
         )
     return profile
-
-
-def _resolve_caption_vlm_chain(container: str, embed_profile) -> list:
-    """解析 /embed-multimodal caption 生成的 VLM fallback 链 [primary, *fallbacks]。
-
-    优先用 route 配置的 VLM 链；route 未配 VLM 时合成单元素链 —— 复用
-    gemini_native embedding profile 的 relay base_url + token，caption 模型用
-    `GE2_CAPTION_VLM_MODEL` 默认（与历史 /embed-multimodal caption 行为一致）。
-    """
-    try:
-        from embedding_registry import get_registry
-        from profiles_loader import VLMProfile
-        import gemini_native_embed as _gne
-    except ModuleNotFoundError:  # pragma: no cover - package import path
-        from scripts.embedding_registry import get_registry
-        from scripts.profiles_loader import VLMProfile
-        import scripts.gemini_native_embed as _gne
-
-    reg = get_registry()
-    route = reg.resolve(container)
-    if route.vlm is None:
-        # route 未配 VLM —— caption 复用 embedding relay，模型走 caption 默认。
-        return [VLMProfile(
-            name='caption-default',
-            model=_gne._DEFAULT_CAPTION_MODEL,
-            base_url=embed_profile.base_url,
-            api_key=embed_profile.api_key,
-            provider='gemini_native',
-            timeout_s=embed_profile.timeout_s,
-            max_retries=embed_profile.max_retries,
-        )]
-    vlms = reg.profiles.vlms
-    return [vlms[route.vlm], *(vlms[fb] for fb in route.vlm_fallbacks)]
 
 
 @app.post('/embed-multimodal', dependencies=[Depends(verify_auth)])
@@ -2394,29 +2463,14 @@ async def embed_multimodal(
         raise HTTPException(
             status_code=502, detail=f'gemini multimodal embed failed: {str(exc)[:300]}')
 
-    # P1 caption 混合检索：经 Gemini relay VLM 为媒体生成文字 caption，按 route
-    # 的 VLM fallback 链逐条尝试（主 VLM 挂掉切下一条）。
-    # best-effort —— caption 链路全挂（NoUpstreamAvailable）或其它异常都不阻塞
-    # 媒体行落库（媒体原生向量仍可检回）。用户显式 caption 优先于自动生成。
+    # P1 caption 混合检索：经 Gemini relay VLM 为媒体生成文字 caption。
+    # best-effort —— caption 链路失败不阻塞媒体行落库（媒体原生向量仍可检回）。
+    # 用户显式 caption 优先于自动生成（用户最了解语境）。
     vlm_caption: str | None = None
     if not caption:
         try:
-            from model_fallback import CATEGORY_VLM, run_with_fallback
-        except ModuleNotFoundError:  # pragma: no cover - package import path
-            from scripts.model_fallback import CATEGORY_VLM, run_with_fallback
-        vlm_chain = _resolve_caption_vlm_chain(container, profile)
-
-        async def _caption_executor(vlm_profile):
-            return await generate_media_caption_async(
-                vlm_profile, mime, raw, model=vlm_profile.model,
-            )
-
-        try:
-            vlm_caption = await run_with_fallback(
-                CATEGORY_VLM, vlm_chain, _caption_executor,
-            )
+            vlm_caption = await generate_media_caption_async(profile, mime, raw)
         except Exception as exc:
-            # NoUpstreamAvailable（全链挂）也落这里 —— caption 缺省为 None。
             logger.warning(
                 'embed-multimodal caption generation failed for %r: %s',
                 filename, str(exc)[:200])
