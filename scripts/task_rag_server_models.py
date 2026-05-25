@@ -419,3 +419,31 @@ class QueryResponse(BaseModel):
     container: str
     answer: str
     mode: str
+
+
+class ContainerMetadataPayload(BaseModel):
+    """container_metadata 表的 upsert 请求体（所有字段可选 / partial update）。"""
+
+    description: str | None = None
+    tags: list[str] | None = None
+    scope: str | None = Field(
+        default=None,
+        description='凭证体系：team | personal | shared',
+    )
+    entity: str | None = Field(
+        default=None,
+        description='项目名 / 设备名 / agent 名',
+    )
+    purpose: str | None = Field(
+        default=None,
+        description='eng | runbook | playbook | personal | active | archive | prime',
+    )
+    owner: str | None = None
+    policy: dict | None = Field(
+        default=None,
+        description='策略字典（retention_days / max_objects / auto_reembed 等）',
+    )
+    archived_at: str | None = Field(
+        default=None,
+        description='ISO8601 归档时间；None 表示未归档',
+    )
