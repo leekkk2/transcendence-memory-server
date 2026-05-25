@@ -9,6 +9,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+# Ensure repo root is on sys.path at collection time so pure-unit tests can
+# `from scripts.X import Y` without first calling load_server() (which does
+# the same insertion lazily). scripts/ has no __init__.py — it's a namespace
+# package, which only resolves when its parent dir is on sys.path.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
 API_KEY = "test-rag-key"
 DEFAULT_CONTAINER = "testbox"
 
@@ -25,10 +34,6 @@ def load_server(workspace: Path, monkeypatch, extra_env: dict[str, str] | None =
     monkeypatch.setenv("TM_DISABLE_WORKER", "1")
     for key, value in (extra_env or {}).items():
         monkeypatch.setenv(key, value)
-
-    repo_root = Path(__file__).resolve().parents[1]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
 
     # 清除缓存的模块以重新加载。
     # server_protection 暴露的全局单例 GATE/RETRY_LIMITER/BG_TRACKER 是模块级状态，
