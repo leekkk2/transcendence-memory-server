@@ -24,6 +24,7 @@ import tempfile
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, BackgroundTasks
+from fastapi.responses import StreamingResponse
 import asyncio
 
 try:
@@ -36,6 +37,7 @@ try:
         ConnectionTokenResponse,
         ContainerDeleteResponse,
         ContainerListResponse,
+        ContainerMetadataPayload,
         ContainerReq,
         DEFAULT_CONTAINER,
         DocumentTextReq,
@@ -69,6 +71,7 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         ConnectionTokenResponse,
         ContainerDeleteResponse,
         ContainerListResponse,
+        ContainerMetadataPayload,
         ContainerReq,
         DEFAULT_CONTAINER,
         DocumentTextReq,
@@ -142,6 +145,11 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.embed_backlog import BacklogItem, BacklogStore
     from scripts.index_state import IndexStateStore, compute_index_state
 
+try:
+    from container_metadata import ContainerMetadata
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.container_metadata import ContainerMetadata
+
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 
@@ -184,6 +192,28 @@ def container_root(container: str) -> Path:
     path = WS / 'tasks' / 'rag' / 'containers' / container
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def container_metadata_uri() -> str:
+    """容器命名规范元数据表（container_metadata）所在 LanceDB 目录。
+
+    与每容器自有的 ``containers/<c>/lancedb/`` 物理隔离，独占一个 connection。
+    懒创建：首次 upsert 时由 ContainerMetadata 内部 create_table。
+    """
+    base = WS / 'tasks' / 'rag' / 'meta' / 'lancedb'
+    base.mkdir(parents=True, exist_ok=True)
+    return str(base)
+
+
+_container_metadata_store: ContainerMetadata | None = None
+
+
+def get_container_metadata_store() -> ContainerMetadata:
+    """单例 ContainerMetadata；首次访问时连库。"""
+    global _container_metadata_store
+    if _container_metadata_store is None:
+        _container_metadata_store = ContainerMetadata(container_metadata_uri())
+    return _container_metadata_store
 
 
 def memory_objects_path(container: str) -> Path:
@@ -375,7 +405,7 @@ async def _enforce_upload_limit(request, call_next):
             except ValueError:
                 size = -1
             if size > _MAX_UPLOAD_BYTES_ENV:
-                from fastapi.responses import JSONResponse
+                from fastapi.responses import JSONResponse, StreamingResponse
                 return JSONResponse(
                     status_code=413,
                     content={'detail': f'file exceeds max upload size {_MAX_UPLOAD_BYTES_ENV} bytes'},
@@ -1728,11 +1758,23 @@ def list_containers(pattern: str | None = None, mode: str = 'substring'):
 
     - pattern: 大小写不敏感的匹配字符串，留空时返回全部
     - mode: substring（默认）/ prefix / glob
+
+    每个容器额外返回 ``metadata`` 字段（LEFT JOIN container_metadata 表，
+    名字未注册的容器为 ``null``）。Phase 1.2 引入，向后兼容旧字段。
     """
     if mode not in ('substring', 'prefix', 'glob'):
         raise HTTPException(status_code=400, detail=f'invalid mode: {mode}')
     if pattern is not None:
         _validate_pattern(pattern)
+
+    # 一次性把 container_metadata 全表读出，避免逐容器查库（N+1）。
+    metadata_by_name: dict[str, dict] = {}
+    try:
+        for row in get_container_metadata_store().list_all():
+            metadata_by_name[row['name']] = row
+    except Exception:  # pragma: no cover - 元数据表故障不影响主列表
+        logging.exception("container_metadata read failed; returning containers without metadata")
+        metadata_by_name = {}
 
     dirs = _list_container_dirs()
     result = []
@@ -1757,8 +1799,66 @@ def list_containers(pattern: str | None = None, mode: str = 'substring'):
             'indexed': indexed,
             'last_modified': last_mod,
             'index_state': status['state'] if status else 'unknown',
+            'metadata': metadata_by_name.get(p.name),
         })
     return {'containers': result, 'count': len(result)}
+
+
+# --- container_metadata: upsert + dump endpoints (Phase 1.2) ---
+
+@app.post(
+    '/containers/{name}/metadata',
+    dependencies=[Depends(verify_auth)],
+)
+def upsert_container_metadata(name: str, payload: ContainerMetadataPayload):
+    """upsert 容器元数据（命名规范 scope/entity/purpose + tags + policy）。
+
+    - 首次写入时 created_at 落盘；updated_at 每次刷新。
+    - tags / policy 在表里以 JSON string 形式存储，API 透明 encode/decode。
+    - 容器目录不存在也可写 metadata —— 允许"先声明命名规范，后写入数据"。
+    """
+    validate_container_name(name)
+    store = get_container_metadata_store()
+    fields = payload.model_dump(exclude_none=True)
+    row = store.upsert(name, **fields)
+    return row
+
+
+@app.get(
+    '/containers/{name}/dump',
+    dependencies=[Depends(verify_auth)],
+)
+def dump_container(name: str):
+    """流式导出容器全部 row 为 NDJSON。
+
+    用于 Phase 1.3 容器清理前的逐容器 JSONL dump，再人审 / 重导。
+    - 每行一个 JSON 对象，对应 memory_objects.jsonl 中的一条原始记录。
+    - 容器不存在或为空时返回空响应（200 + 0 字节）。
+    - vector 列在 memory_objects.jsonl 中本就不存在；该端点只 dump JSONL，
+      重导时由 /embed 重新生成 embedding。
+    """
+    validate_container_name(name)
+    path = memory_objects_path(name) if (WS / 'tasks' / 'rag' / 'containers' / name).exists() else None
+
+    def gen():
+        if path is None or not path.exists():
+            return
+        with path.open('r', encoding='utf-8') as fh:
+            for line in fh:
+                line = line.rstrip('\n')
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (TypeError, ValueError):
+                    # 跳过损坏行；不让单条坏 JSON 中断整流。
+                    continue
+                # dump 用于人审 / 重导，去掉向量字段（若 memory_objects 里也意外含 vector）。
+                if isinstance(obj, dict):
+                    obj.pop('vector', None)
+                yield json.dumps(obj, ensure_ascii=False) + '\n'
+
+    return StreamingResponse(gen(), media_type='application/x-ndjson')
 
 
 # --- 容器索引状态机 / embedding backlog 端点 ---
