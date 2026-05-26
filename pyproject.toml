@@ -55,4 +55,6 @@ packages = ["src/tm_server"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "scripts"]
-addopts = "-q"
+# --ignore=tests/test_cli: cli tests 属于 transcendence-memory-cli 独立 wheel,
+# 不在 server test 范围内，由 .github/workflows/publish-cli.yml 单独跑
+addopts = "-q --ignore=tests/test_cli"
