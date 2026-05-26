@@ -109,6 +109,44 @@ def _reset_model_breakers():
     _clear_all_breakers()
 
 
+@pytest.fixture(autouse=True)
+def _reset_profile_registries():
+    """每个测试前后清空 embedding / reranker registry 单例缓存 + task_rag_runtime module。
+
+    1. **Registry 单例**：embedding/reranker registry 各 cache 一个 profileSet，
+       fixture 仅 monkeypatch.setenv 不会让 cached profile 重新读 env。两个
+       registry 模块都没做身份归一，sys.modules 可能同存 `scripts.X` 与 `X`
+       两份副本，各持独立 `_registry` 单例 —— 必须双侧都清。
+
+    2. **task_rag_runtime.WS**：module import 时执行
+       ``WS = Path(os.environ.get('WORKSPACE', ...))``，路径在 import 时就固化。
+       前个 test 用 tmp_path_A 加载 runtime → WS=A；后个 test 设 WORKSPACE=B
+       但 lazy import 拿到 cached runtime → 仍 WS=A → lancedb_dir 错路径 →
+       in-process /search 报 container 'not_initialized'。pop 掉 sys.modules
+       让下次 import 重读 env。
+    """
+    def _clear():
+        for mod_name in ('scripts.embedding_registry', 'embedding_registry'):
+            mod = sys.modules.get(mod_name)
+            if mod is not None and hasattr(mod, 'clear_registry'):
+                try:
+                    mod.clear_registry()
+                except Exception:  # pragma: no cover
+                    pass
+        for mod_name in ('scripts.reranker_registry', 'reranker_registry'):
+            mod = sys.modules.get(mod_name)
+            if mod is not None and hasattr(mod, 'clear_reranker_registry'):
+                try:
+                    mod.clear_reranker_registry()
+                except Exception:  # pragma: no cover
+                    pass
+        for mod_name in ('scripts.task_rag_runtime', 'task_rag_runtime'):
+            sys.modules.pop(mod_name, None)
+    _clear()
+    yield
+    _clear()
+
+
 @pytest.fixture
 def workspace_and_client(tmp_path, monkeypatch):
     """返回 (workspace, TestClient) 元组。"""
