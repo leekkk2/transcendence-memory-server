@@ -178,7 +178,10 @@ jobs:
           : "${DEPLOY_SUDO:=}"
           : "${DEPLOY_REF:=}"
           cd "$DEPLOY_PATH"
-          git fetch --tags --prune origin
+          # --force needed when origin tags have been rewritten (sanitization
+          # force-push, retag scenarios). Without --force a single conflicting
+          # tag aborts the entire fetch and downstream checkout fails.
+          git fetch --tags --prune --force origin
           if [ -n "$DEPLOY_REF" ]; then
             git checkout --detach "$DEPLOY_REF"
           else
