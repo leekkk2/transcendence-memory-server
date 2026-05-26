@@ -60,6 +60,12 @@ try:
         SearchResponse,
         StructuredIngestReq,
         UpdateMemoryReq,
+        UsageCleanupRequest,
+        UsageCleanupResponse,
+        UsageContainersResponse,
+        UsageEndpointsResponse,
+        UsageSummaryResponse,
+        UsageTimeseriesResponse,
     )
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.task_rag_server_models import (
@@ -94,6 +100,12 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         SearchResponse,
         StructuredIngestReq,
         UpdateMemoryReq,
+        UsageCleanupRequest,
+        UsageCleanupResponse,
+        UsageContainersResponse,
+        UsageEndpointsResponse,
+        UsageSummaryResponse,
+        UsageTimeseriesResponse,
     )
 
 try:
@@ -154,6 +166,13 @@ try:
     from container_aliases import ContainerAliases, VALID_STATUSES as _ALIAS_VALID_STATUSES
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.container_aliases import ContainerAliases, VALID_STATUSES as _ALIAS_VALID_STATUSES
+
+try:
+    import usage_analytics
+    from usage_analytics import UsageMiddleware
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import usage_analytics
+    from scripts.usage_analytics import UsageMiddleware
 
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
@@ -497,6 +516,19 @@ async def _enforce_upload_limit(request, call_next):
                     content={'detail': f'file exceeds max upload size {_MAX_UPLOAD_BYTES_ENV} bytes'},
                 )
     return await call_next(request)
+
+
+# Usage analytics middleware (v0.17). Registered once, lazily creates the
+# SQLite tables on first request. Gated by TM_USAGE_ANALYTICS so a
+# deployment can turn it off without rebuilding the image.
+if os.environ.get('TM_USAGE_ANALYTICS', '1') in ('1', 'true', 'True'):
+    app.add_middleware(
+        UsageMiddleware,
+        db_path=str(_queue_db_path()),
+        enabled=True,
+        log_ua=os.environ.get('TM_USAGE_LOG_UA', '1') in ('1', 'true', 'True'),
+        max_body_inspect=int(os.environ.get('TM_USAGE_MAX_BODY_INSPECT', str(1_048_576))),
+    )
 
 
 def child_env(
@@ -2984,3 +3016,72 @@ async def query_rag(req: QueryReq) -> QueryResponse:
         answer=answer or '(no answer generated)',
         mode=req.mode,
     )
+
+
+# ---------------------------------------------------------------------------
+# Usage analytics admin endpoints (v0.17 — feeds dashboard Analytics view).
+# Handlers are thin wrappers around the pure functions in usage_analytics; all
+# query parameter validation lives there to keep this file readable.
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    '/admin/usage/summary',
+    response_model=UsageSummaryResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def admin_usage_summary(window: str = '24h') -> UsageSummaryResponse:
+    data = usage_analytics.summary(_queue_db_path(), window=window)
+    return UsageSummaryResponse(**data)
+
+
+@app.get(
+    '/admin/usage/endpoints',
+    response_model=UsageEndpointsResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def admin_usage_endpoints(
+    window: str = '7d',
+    sort: str = 'calls',
+    limit: int = 20,
+) -> UsageEndpointsResponse:
+    data = usage_analytics.endpoints(_queue_db_path(), window=window, sort=sort, limit=limit)
+    return UsageEndpointsResponse(**data)
+
+
+@app.get(
+    '/admin/usage/containers',
+    response_model=UsageContainersResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def admin_usage_containers(
+    window: str = '7d',
+    sort: str = 'calls',
+    limit: int = 50,
+) -> UsageContainersResponse:
+    data = usage_analytics.containers(_queue_db_path(), window=window, sort=sort, limit=limit)
+    return UsageContainersResponse(**data)
+
+
+@app.get(
+    '/admin/usage/timeseries',
+    response_model=UsageTimeseriesResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def admin_usage_timeseries(
+    path: str,
+    window: str = '7d',
+    bucket: str = '1h',
+) -> UsageTimeseriesResponse:
+    data = usage_analytics.timeseries(_queue_db_path(), path=path, window=window, bucket=bucket)
+    return UsageTimeseriesResponse(**data)
+
+
+@app.post(
+    '/admin/usage/cleanup',
+    response_model=UsageCleanupResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def admin_usage_cleanup(req: UsageCleanupRequest) -> UsageCleanupResponse:
+    data = usage_analytics.cleanup(_queue_db_path(), retention_days=req.retention_days)
+    return UsageCleanupResponse(**data)
