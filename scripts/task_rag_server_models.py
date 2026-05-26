@@ -538,3 +538,33 @@ class ContainerMetadataPayload(BaseModel):
         default=None,
         description='ISO8601 归档时间；None 表示未归档',
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard (`/admin/ui/*`) request / response models.
+# ---------------------------------------------------------------------------
+
+
+class LoginRequest(BaseModel):
+    """Body for ``POST /admin/ui/login``.
+
+    The only thing the dashboard ships at login time is the api key — every
+    other property (IP, UA) is read off the request directly by the server,
+    not echoed back from the client where it could be spoofed.
+    """
+
+    api_key: str = Field(..., description='RAG_API_KEY plaintext; never stored — only its sha256 hash')
+
+
+class SessionInfoResponse(BaseModel):
+    """Body for ``GET /admin/ui/me``.
+
+    Returns nothing sensitive — only the truncated hash (first 12 chars) so the
+    dashboard can show a "logged in as …" hint without ever surfacing the raw
+    api key in the SPA, plus the absolute expiry so the client can show a
+    countdown / proactively re-login before a deep-link 401 fires.
+    """
+
+    api_key_hash: str = Field(..., description='First 12 chars of sha256(api_key) — display only')
+    expires_at: int = Field(..., description='Unix timestamp at which this session lapses')
+    env: str = Field(default='dev', description='TM_ENV — drives the topbar badge colour (prod/staging/dev)')
