@@ -23,6 +23,21 @@ ARG TM_VERSION=dev
 ARG TM_SOURCE_REV=dev
 
 # -----------------------------------------------------------------------------
+# Stage: ui-builder  — produces /app/static/admin (the Vite-built React SPA).
+# Decoupled from deps/ so a Python-only change doesn't invalidate the JS
+# install cache, and a UI-only change doesn't pay the pip resolver cost.
+# -----------------------------------------------------------------------------
+FROM node:20-alpine AS ui-builder
+WORKDIR /ui
+# Manifest layer cached against pnpm-lock.yaml: dep install only re-runs when
+# the lockfile actually changes.
+COPY dashboard/package.json dashboard/pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile --prod=false
+COPY dashboard/ ./
+RUN pnpm build
+# Output: /ui/dist/ → copied verbatim into runtime stages as /app/static/admin.
+
+# -----------------------------------------------------------------------------
 # Stage: deps  — resolve and install runtime Python deps. Cached aggressively
 # because we only re-execute when pyproject.toml or constraints.txt change.
 # -----------------------------------------------------------------------------
@@ -147,6 +162,9 @@ COPY --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 RUN printf '%s\n' "$TM_SOURCE_REV" > /app/.tm-source-rev
 COPY --chown=tm:tm scripts/ ./scripts/
 COPY --chown=tm:tm src/ ./src/
+# Admin dashboard bundle (Vite output) lands here; the FastAPI server detects
+# the directory at startup and mounts it under /admin/ui.
+COPY --from=ui-builder --chown=tm:tm /ui/dist /app/static/admin
 RUN chmod 755 /app/scripts/*.sh /app/scripts/*.py
 
 # -----------------------------------------------------------------------------
@@ -165,4 +183,5 @@ COPY --from=deps-full --chown=tm:tm /root/.cache/mineru /home/tm/.cache/mineru
 RUN printf '%s\n' "$TM_SOURCE_REV" > /app/.tm-source-rev
 COPY --chown=tm:tm scripts/ ./scripts/
 COPY --chown=tm:tm src/ ./src/
+COPY --from=ui-builder --chown=tm:tm /ui/dist /app/static/admin
 RUN chmod 755 /app/scripts/*.sh /app/scripts/*.py

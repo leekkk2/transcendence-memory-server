@@ -24,8 +24,9 @@ from contextlib import asynccontextmanager
 
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 try:
     from task_rag_server_models import (
@@ -374,13 +375,86 @@ def build_connection_onboarding(endpoint: str, container: str, api_key: str) -> 
     return pairing_auth, onboarding
 
 
+# ---------------------------------------------------------------------------
+# Admin dashboard session + login rate limit — module-level singletons,
+# lazily constructed under the workspace just like JOB_QUEUE et al. We
+# centralise the path here so tests can drive both stores through their
+# WORKSPACE override without poking module internals.
+# ---------------------------------------------------------------------------
+
+_UI_SESSION_STORE: 'auth_session.SessionStore | None' = None
+_UI_LOGIN_LIMIT: 'auth_session.LoginRateLimit | None' = None
+
+
+def _ui_db_path() -> Path:
+    """Single SQLite file co-located with the queue DB.
+
+    Lives under tasks/rag/ alongside queue.db so the entire mutable runtime
+    state stays in one subtree — easier to back up and to wipe in tests.
+    """
+    return WS / 'tasks' / 'rag' / 'ui_sessions.db'
+
+
+def get_ui_session_store():
+    """Return the process-wide ``SessionStore`` singleton, building it on demand."""
+    global _UI_SESSION_STORE
+    if _UI_SESSION_STORE is None:
+        from scripts import auth_session  # local import keeps cold-start cheap
+        _UI_SESSION_STORE = auth_session.SessionStore(
+            _ui_db_path(), ttl_sec=auth_session.env_ttl()
+        )
+    return _UI_SESSION_STORE
+
+
+def get_ui_login_limit():
+    """Return the process-wide ``LoginRateLimit`` singleton."""
+    global _UI_LOGIN_LIMIT
+    if _UI_LOGIN_LIMIT is None:
+        from scripts import auth_session
+        _UI_LOGIN_LIMIT = auth_session.LoginRateLimit(
+            _ui_db_path(),
+            lockout_count=auth_session.env_lockout_count(),
+            window_sec=auth_session.env_lockout_window(),
+        )
+    return _UI_LOGIN_LIMIT
+
+
+def _reset_ui_singletons() -> None:
+    """Test helper — wipes the lazily built stores so a per-test WORKSPACE
+    override is honoured the next time ``get_ui_session_store`` is called."""
+    global _UI_SESSION_STORE, _UI_LOGIN_LIMIT
+    _UI_SESSION_STORE = None
+    _UI_LOGIN_LIMIT = None
+
+
 def verify_auth(
+    request: Request,
     x_api_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ) -> None:
+    """Gate every protected endpoint. Cookie session is preferred — header
+    auth is the legacy CLI / programmatic path and stays first-class so older
+    clients keep working without rebuilding around the dashboard.
+
+    Resolution order:
+      1. ``tm_sid`` cookie → resolve via SessionStore (browser path)
+      2. ``X-API-KEY`` / ``Authorization: Bearer`` header (CLI / SDK path)
+    Either match succeeds; otherwise 401.
+    """
     if not RAG_API_KEY:
         raise HTTPException(status_code=500, detail='RAG_API_KEY not set')
 
+    # 1) cookie session — preferred for the SPA so the api key never has to
+    #    live in JS memory after login. Validity check is O(1) sqlite lookup.
+    token = request.cookies.get('tm_sid') if request is not None else None
+    if token:
+        session = get_ui_session_store().validate(token)
+        if session is not None and session.api_key_hash:
+            from scripts.auth_session import hash_api_key
+            if session.api_key_hash == hash_api_key(RAG_API_KEY):
+                return
+
+    # 2) header — what the CLI / curl / SDK clients have always used.
     key = None
     if authorization and authorization.lower().startswith('bearer '):
         key = authorization.split(' ', 1)[1]
@@ -3085,3 +3159,195 @@ def admin_usage_timeseries(
 def admin_usage_cleanup(req: UsageCleanupRequest) -> UsageCleanupResponse:
     data = usage_analytics.cleanup(_queue_db_path(), retention_days=req.retention_days)
     return UsageCleanupResponse(**data)
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard (`/admin/ui/*`) — Lane D
+#
+# Cookie-based session login that proxies the existing api-key gate. Three
+# JSON endpoints (login / logout / me) plus a SPA fallback that serves the
+# built React bundle out of /app/static/admin when present.
+#
+# Cookie hardening: HttpOnly + SameSite=Strict always; Secure flag is enabled
+# unless TM_ENV explicitly says "dev" (so the local docker-compose setup over
+# plain HTTP still works while production stays strict). CSRF defence is the
+# SameSite cookie plus a mandatory `X-Requested-With: XMLHttpRequest` header
+# on POST routes — fetch() in the SPA sets it, a cross-site form submission
+# cannot.
+# ---------------------------------------------------------------------------
+
+try:
+    from task_rag_server_models import LoginRequest  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.task_rag_server_models import LoginRequest  # noqa: E402
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP behind an upstream proxy. Trusts the leftmost
+    ``X-Forwarded-For`` entry only when an upstream proxy is presumably in
+    front (compose default uses host networking + nginx)."""
+    fwd = request.headers.get('x-forwarded-for')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    if request.client is not None:
+        return request.client.host or ''
+    return ''
+
+
+def _cookie_secure() -> bool:
+    """``Secure`` cookie flag — on by default, off only when TM_ENV=dev so
+    plain-HTTP local debugging works. Never gate this on request.url.scheme
+    alone — behind nginx the scheme upstream is always http."""
+    return (os.environ.get('TM_ENV', 'prod') or 'prod').lower() not in ('dev', 'development', 'local')
+
+
+def _require_csrf_header(request: Request) -> None:
+    """POST routes refuse if the X-Requested-With header is missing. Combined
+    with SameSite=Strict on the session cookie this blocks the obvious CSRF
+    vectors (form post from another origin); browsers will not let JS code at
+    another origin add this header without going through CORS preflight, which
+    we don't allow."""
+    if request.headers.get('x-requested-with', '').lower() != 'xmlhttprequest':
+        raise HTTPException(status_code=400, detail='missing X-Requested-With header')
+
+
+@app.post('/admin/ui/login')
+async def admin_ui_login(req: LoginRequest, request: Request, response: Response) -> dict:
+    """Verify the api key, mint a session, return the truncated hash + expiry.
+
+    Lockout precedes the constant-time key check so timing oracles can't
+    measure "was my key close" vs "am I rate-limited". A successful login also
+    wipes the IP's failure log so a legit user who mistyped twice and then
+    typed correctly is not penalised.
+    """
+    _require_csrf_header(request)
+    if not RAG_API_KEY:
+        raise HTTPException(status_code=500, detail='RAG_API_KEY not set')
+
+    try:
+        from auth_session import constant_time_equals, hash_api_key
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.auth_session import constant_time_equals, hash_api_key
+
+    ip = _client_ip(request)
+    ua = request.headers.get('user-agent', '')
+    limit = get_ui_login_limit()
+    if limit.is_locked(ip):
+        limit.check_and_record(ip, success=False)
+        raise HTTPException(status_code=429, detail='too many failed logins; try again later')
+
+    ok = constant_time_equals(req.api_key or '', RAG_API_KEY)
+    allowed = limit.check_and_record(ip, success=ok)
+    if not allowed:
+        raise HTTPException(status_code=429, detail='too many failed logins; try again later')
+    if not ok:
+        raise HTTPException(status_code=401, detail='invalid api key')
+
+    info = get_ui_session_store().create(api_key=RAG_API_KEY, ip=ip, user_agent=ua)
+    response.set_cookie(
+        key='tm_sid',
+        value=info.token,
+        max_age=max(60, info.expires_at - int(time.time())),
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite='strict',
+        path='/',
+    )
+    return {
+        'api_key_hash': hash_api_key(RAG_API_KEY)[:12],
+        'expires_at': info.expires_at,
+        'env': os.environ.get('TM_ENV', 'dev'),
+    }
+
+
+@app.post('/admin/ui/logout')
+async def admin_ui_logout(request: Request, response: Response) -> dict:
+    """Revoke the current cookie (if any) and clear the browser-side cookie."""
+    _require_csrf_header(request)
+    token = request.cookies.get('tm_sid')
+    if token:
+        get_ui_session_store().revoke(token)
+    response.delete_cookie('tm_sid', path='/')
+    return {'status': 'ok'}
+
+
+@app.get('/admin/ui/me')
+async def admin_ui_me(request: Request) -> dict:
+    """Cheap session probe used by the SPA's ``useMe()`` hook on every nav.
+
+    Returns 401 if the cookie is missing or invalid; the React router uses that
+    to bounce the browser to ``/admin/ui/login``. We don't fall back to the
+    header path here — the dashboard is cookie-only by design.
+    """
+    try:
+        from auth_session import hash_api_key
+    except ModuleNotFoundError:  # pragma: no cover - package import path
+        from scripts.auth_session import hash_api_key
+
+    token = request.cookies.get('tm_sid')
+    info = get_ui_session_store().validate(token)
+    if info is None:
+        raise HTTPException(status_code=401, detail='no session')
+    return {
+        'api_key_hash': hash_api_key(RAG_API_KEY)[:12] if RAG_API_KEY else '',
+        'expires_at': info.expires_at,
+        'env': os.environ.get('TM_ENV', 'dev'),
+    }
+
+
+# StaticFiles mount for the built SPA. The Dockerfile copies the Vite output
+# to /app/static/admin; for local dev (running uvicorn from a checkout) the
+# same relative path resolves under the repo root if a build was produced.
+# When neither exists we skip the mount — `/admin/ui/login` etc. still answer
+# JSON so the API contract is preserved even without the front-end assets.
+_UI_STATIC_DIR_CANDIDATES = [
+    Path('/app/static/admin'),
+    Path(__file__).resolve().parent.parent / 'static' / 'admin',
+    Path(__file__).resolve().parent.parent / 'dashboard' / 'dist',
+]
+
+
+def _resolve_ui_static_dir() -> Path | None:
+    for candidate in _UI_STATIC_DIR_CANDIDATES:
+        if candidate.is_dir() and (candidate / 'index.html').exists():
+            return candidate
+    return None
+
+
+_UI_STATIC_DIR = _resolve_ui_static_dir()
+if _UI_STATIC_DIR is not None:
+    if (_UI_STATIC_DIR / 'assets').is_dir():
+        app.mount(
+            '/admin/ui/assets',
+            StaticFiles(directory=str(_UI_STATIC_DIR / 'assets')),
+            name='admin_ui_assets',
+        )
+
+    @app.get('/admin/ui')
+    async def admin_ui_root_noslash() -> FileResponse:
+        return FileResponse(str(_UI_STATIC_DIR / 'index.html'))
+
+    @app.get('/admin/ui/')
+    async def admin_ui_root() -> FileResponse:
+        return FileResponse(str(_UI_STATIC_DIR / 'index.html'))
+
+    @app.get('/admin/ui/{full_path:path}')
+    async def admin_ui_spa_fallback(full_path: str) -> FileResponse:
+        """SPA deep-link fallback. ``/admin/ui/containers/foo`` is owned by
+        React Router; if the path matches a real file under the static dir
+        we serve it, otherwise we return index.html and let the client-side
+        router take it from there.
+
+        The explicit JSON endpoints (`login` / `logout` / `me`) are registered
+        before this catch-all, so FastAPI's router resolves them first."""
+        candidate = (_UI_STATIC_DIR / full_path).resolve()
+        try:
+            candidate.relative_to(_UI_STATIC_DIR.resolve())
+        except ValueError:
+            raise HTTPException(status_code=404, detail='not found')
+        if candidate.is_file():
+            return FileResponse(str(candidate))
+        index_path = _UI_STATIC_DIR / 'index.html'
+        if not index_path.exists():
+            raise HTTPException(status_code=404, detail='dashboard bundle missing')
+        return FileResponse(str(index_path))

@@ -66,3 +66,9 @@ deploy/
 # Dev-only utilities and legacy scripts
 dev/
 tests/
+
+# Dashboard SPA — the dashboard/ source ships into the build context for the
+# ui-builder stage to compile; node_modules and any host-side dist must be
+# excluded so they don't bloat the image / leak local caches.
+dashboard/node_modules
+dashboard/dist
