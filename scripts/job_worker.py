@@ -54,6 +54,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.embed_backlog import BacklogStore
 
+try:
+    import usage_analytics
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import usage_analytics  # type: ignore[no-redef]
+
 logger = logging.getLogger("transcendence-memory-server.worker")
 
 
@@ -115,6 +120,18 @@ class JobWorker:
         )
         self._last_backlog_drain_ts = 0.0
         self._backlog_store: BacklogStore | None = None
+        # Usage analytics: daily rollup runs on the same tick cadence as
+        # _maybe_purge — once per check window we materialise yesterday's
+        # api_request_log into daily_usage_rollup. Gated by env so a
+        # deployment that runs without analytics gets a no-op.
+        self.usage_rollup_enabled = os.environ.get(
+            "TM_USAGE_ANALYTICS", "1"
+        ) in ("1", "true", "True")
+        self.usage_rollup_interval_sec = _env_int(
+            "TM_USAGE_ROLLUP_INTERVAL_SEC", 3600
+        )
+        self._last_usage_rollup_ts = 0.0
+        self._last_usage_rollup_day: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -162,6 +179,9 @@ class JobWorker:
         # Promote due embedding-backlog rows into retry jobs (no-op within the
         # cadence window, or when TM_BACKLOG_ENABLED is off).
         self._maybe_drain_backlog()
+        # Materialise the previous UTC day into daily_usage_rollup once it
+        # has flipped (cheap idempotent INSERT OR REPLACE).
+        self._maybe_rollup_usage()
 
         # Pre-flight: refuse to claim a job if the host is under pressure.
         # The job stays in the queue; we'll check again next tick.
@@ -251,6 +271,39 @@ class JobWorker:
                 "backlog drain queued embed-backlog-retry for container=%s",
                 container,
             )
+
+    def _maybe_rollup_usage(self) -> None:
+        """Materialise yesterday's ``api_request_log`` into ``daily_usage_rollup``.
+
+        cadence: at most once per ``TM_USAGE_ROLLUP_INTERVAL_SEC`` (default
+        1 h). The rollup itself is keyed by ``(day, path)`` so re-running is
+        a cheap ``INSERT OR REPLACE`` — we don't try to be clever about
+        "only roll up at midnight". This keeps us robust to workers that
+        restart in the middle of the night.
+
+        No-op if usage analytics is disabled or the queue DB does not yet
+        exist (fresh deploy, first tick before any request landed).
+        """
+        if not self.usage_rollup_enabled or self.usage_rollup_interval_sec <= 0:
+            return
+        now = time.time()
+        if (now - self._last_usage_rollup_ts) < self.usage_rollup_interval_sec:
+            return
+        self._last_usage_rollup_ts = now
+        if not Path(self.queue.db_path).exists():
+            return
+        try:
+            result = usage_analytics.rollup_day(self.queue.db_path)
+            day = result.get("day")
+            if day != self._last_usage_rollup_day and result.get("paths_rolled_up"):
+                logger.info(
+                    "usage rollup wrote %s rows for day=%s",
+                    result.get("paths_rolled_up"),
+                    day,
+                )
+            self._last_usage_rollup_day = day
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("usage rollup failed: %s", exc)
 
     def _execute(self, job: Job) -> None:
         try:
