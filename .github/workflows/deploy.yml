@@ -231,7 +231,29 @@ jobs:
             fi
           }
           export TM_IMAGE
-          # Pre-pull cleanup: drop untagged dangling images and old transcendence
+          # Pre-pull cleanup phase 0: kill non-compose-managed ad-hoc containers
+          # older than 24h. Root cause of 2026-05-26 disk surge: a random-name
+          # container left behind by an interactive `docker run` (no --rm) held
+          # a reference to the previous release's 6.58 GB image, preventing
+          # `docker image prune` and the explicit `docker rmi` pass below from
+          # reclaiming it. Result: two 6.58 GB images coexisted on disk and
+          # consumed all free space. We never touch compose-managed containers
+          # (filter on the com.docker.compose.project label) so production
+          # services are untouched. < 24h grace period leaves room for the
+          # operator's in-progress interactive debugging session.
+          cutoff_epoch=$(( $(date +%s) - 86400 ))
+          for cid in $($DEPLOY_SUDO docker ps -a \
+              --filter "label!=com.docker.compose.project" -q 2>/dev/null); do
+            created_iso=$($DEPLOY_SUDO docker inspect -f '{{.Created}}' "$cid" 2>/dev/null) || continue
+            created_epoch=$(date -d "$created_iso" +%s 2>/dev/null) || continue
+            if [ "$created_epoch" -lt "$cutoff_epoch" ]; then
+              name=$($DEPLOY_SUDO docker inspect -f '{{.Name}}' "$cid" | sed 's|^/||')
+              echo "[cleanup] removing non-compose ad-hoc container > 24h: $name ($cid)"
+              $DEPLOY_SUDO docker stop "$cid" >/dev/null 2>&1 || true
+              $DEPLOY_SUDO docker rm "$cid" >/dev/null 2>&1 || true
+            fi
+          done
+          # Pre-pull cleanup phase 1: drop untagged dangling images and old transcendence
           # tags that are not currently in use. Without this, every release
           # accretes a 6+ GB layer set on disk and we eventually hit ENOSPC
           # mid-pull. Errors are tolerated (doesn't block the deploy).
