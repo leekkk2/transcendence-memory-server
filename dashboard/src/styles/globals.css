@@ -1,0 +1,94 @@
+/*
+ * Global stylesheet — Tailwind v4 + design-doc palette.
+ *
+ * Variables follow the design doc §"视觉系统" table; dark is default with a
+ * `.light` override so the Settings page can flip themes without a router
+ * round-trip.
+ */
+@import 'tailwindcss';
+@import '@fontsource-variable/inter/index.css';
+@import '@fontsource-variable/jetbrains-mono/index.css';
+
+@theme {
+  --color-bg: #0b0d10;
+  --color-bg-elev: #13171c;
+  --color-bg-code: #080a0d;
+  --color-text: #e6edf3;
+  --color-text-dim: #8b949e;
+  --color-border: #1f2937;
+  --color-accent: #22d3ee;
+  --color-accent-hover: #67e8f9;
+  --color-green: #3fb950;
+  --color-yellow: #d29922;
+  --color-red: #f85149;
+
+  --font-sans: 'Inter Variable', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --bg-elev: #13171c;
+  --bg-code: #080a0d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --border: #1f2937;
+  --accent: #22d3ee;
+  --accent-hover: #67e8f9;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --red: #f85149;
+}
+
+:root.light {
+  color-scheme: light;
+  --bg: #fafafa;
+  --bg-elev: #ffffff;
+  --bg-code: #f4f4f5;
+  --text: #0f172a;
+  --text-dim: #64748b;
+  --border: #e2e8f0;
+  --accent: #0891b2;
+  --accent-hover: #0e7490;
+  --green: #16a34a;
+  --yellow: #ca8a04;
+  --red: #dc2626;
+}
+
+@layer base {
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  code,
+  pre,
+  .mono {
+    font-family: var(--font-mono);
+  }
+
+  * {
+    transition-duration: 200ms;
+    transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+}
+
+@layer utilities {
+  .panel {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .text-dim {
+    color: var(--text-dim);
+  }
+
+  .accent {
+    color: var(--accent);
+  }
+}
