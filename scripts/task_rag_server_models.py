@@ -421,6 +421,97 @@ class QueryResponse(BaseModel):
     mode: str
 
 
+# ---------------------------------------------------------------------------
+# Usage analytics response models (v0.17 — /admin/usage/*).
+# ---------------------------------------------------------------------------
+
+
+class UsageTopEndpoint(BaseModel):
+    path: str
+    calls: int
+    p95: int = 0
+
+
+class UsageSummaryResponse(BaseModel):
+    window: str
+    total_calls: int = 0
+    total_errors: int = 0
+    error_rate: float = 0.0
+    p50_latency_ms: int = 0
+    p95_latency_ms: int = 0
+    active_containers: int = 0
+    active_api_keys: int = 0
+    top_endpoints: list[UsageTopEndpoint] = Field(default_factory=list)
+
+
+class UsageEndpointRow(BaseModel):
+    path: str
+    calls: int = 0
+    errors: int = 0
+    p50_latency_ms: int = 0
+    p95_latency_ms: int = 0
+    distinct_containers: int = 0
+    last_called_at: int | None = None
+
+
+class UsageColdEndpoint(BaseModel):
+    path: str
+    calls: int = 0
+    last_called_at: int | None = None
+
+
+class UsageEndpointsResponse(BaseModel):
+    window: str
+    sort: Literal['calls', 'errors', 'p95'] = 'calls'
+    rows: list[UsageEndpointRow] = Field(default_factory=list)
+    cold_endpoints: list[UsageColdEndpoint] = Field(default_factory=list)
+
+
+class UsageContainerRow(BaseModel):
+    container: str
+    calls: int = 0
+    search_calls: int = 0
+    ingest_calls: int = 0
+    embed_calls: int = 0
+    last_active: int | None = None
+
+
+class UsageIdleContainer(BaseModel):
+    container: str
+    calls: int = 0
+    memory_count: int = 0
+    last_active: int | None = None
+
+
+class UsageContainersResponse(BaseModel):
+    window: str
+    rows: list[UsageContainerRow] = Field(default_factory=list)
+    idle_containers: list[UsageIdleContainer] = Field(default_factory=list)
+
+
+class UsageTimeseriesPoint(BaseModel):
+    ts: int
+    calls: int = 0
+    errors: int = 0
+    p95: int = 0
+
+
+class UsageTimeseriesResponse(BaseModel):
+    path: str
+    window: str
+    bucket: Literal['5m', '1h', '1d']
+    points: list[UsageTimeseriesPoint] = Field(default_factory=list)
+
+
+class UsageCleanupRequest(BaseModel):
+    retention_days: int = Field(default=30, ge=1, le=3650)
+
+
+class UsageCleanupResponse(BaseModel):
+    deleted_rows: int = 0
+    kept_rows: int = 0
+
+
 class ContainerMetadataPayload(BaseModel):
     """container_metadata 表的 upsert 请求体（所有字段可选 / partial update）。"""
 
