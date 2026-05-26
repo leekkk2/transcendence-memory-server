@@ -1,0 +1,52 @@
+name: publish-cli
+
+on:
+  push:
+    tags:
+      - "cli-v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build CLI wheel + sdist
+        working-directory: cli-package
+        run: |
+          python -m build
+          ls -la dist/
+
+      - name: Smoke install + --help
+        run: |
+          python -m pip install cli-package/dist/transcendence_memory_cli-*.whl
+          tm --help
+          tm version
+
+      - name: Run CLI unit tests
+        run: |
+          python -m pip install pytest httpx typer rich
+          pytest tests/test_cli/ -v
+
+      - name: Publish to PyPI
+        if: startsWith(github.ref, 'refs/tags/cli-v')
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN_CLI }}
+        run: |
+          twine upload cli-package/dist/*
