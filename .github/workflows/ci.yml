@@ -27,17 +27,22 @@ jobs:
 
   docker-validate:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         flavor: [lite, full]
-        # arm64 is now validated on every PR/push instead of only at tag time.
-        # Catches arch-specific regressions before release.
-        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
-      # full+arm64 emulated builds are disk-hungry — clean up runner first
+      # full builds are disk-hungry on the GHA runner — clean up first.
+      # Native arm64 runner doesn't need QEMU emulation, but still benefits.
       - name: Free up disk space (full flavor only)
         if: matrix.flavor == 'full'
         run: |
@@ -47,7 +52,6 @@ jobs:
             "$AGENT_TOOLSDIRECTORY"/Ruby "$AGENT_TOOLSDIRECTORY"/go || true
           sudo docker image prune --all --force || true
           df -h /
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Build ${{ matrix.flavor }} image (${{ matrix.platform }})
         uses: docker/build-push-action@v5
@@ -57,10 +61,11 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: false
           load: false
-          # Share cache with publish-docker so we don't rebuild from scratch
-          # at tag time. cache-from is read-only for this validate job; only
-          # publish-docker writes back.
-          cache-from: type=gha,scope=${{ matrix.flavor }}-${{ matrix.platform }}
+          # Share cache with publish-docker so it warm-starts off this build.
+          # cache-to is mode=max so all intermediate layers (including ui-builder
+          # and deps-full) land in the gha cache — not just the final stage.
+          cache-from: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }},mode=max
           build-args: |
             TM_VERSION=${{ github.sha }}
             TM_SOURCE_REV=${{ github.sha }}
@@ -120,15 +125,31 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
           python -m pip install --upgrade pip twine pkginfo
-          python -m twine upload release-assets/*.tar.gz release-assets/*.whl
+          # --skip-existing makes the upload idempotent: re-pushing the same
+          # tag (e.g. after a publish-docker failure) won't fail here because
+          # 0.17.0 already exists on PyPI from the first attempt.
+          python -m twine upload --skip-existing release-assets/*.tar.gz release-assets/*.whl
 
   publish-docker:
     needs: [test, docker-validate]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
+      # Per-platform matrix: each (flavor × platform) gets its own runner so
+      # disk / network / GHA cache API contention is eliminated. arm64 uses the
+      # native ubuntu-24.04-arm runner (public-repo free GA, 2026), avoiding
+      # QEMU emulation entirely. Without this split, single-step multi-platform
+      # publish hits a 6h job timeout (v0.17.0 evidence).
       matrix:
         flavor: [lite, full]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
       # ubuntu-latest runner 默认仅 ~14 GB 可用空间，full 镜像（mineru / opencv /
@@ -148,43 +169,84 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"/go
           sudo docker image prune --all --force || true
           df -h /
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Compute Docker tags
-        id: tags
-        run: |
-          image="${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server"
-          version="${GITHUB_REF_NAME#v}"
-          if [ "${{ matrix.flavor }}" = "lite" ]; then
-            echo "tags=${image}:${version}-lite,${image}:lite,${image}:latest" >> "$GITHUB_OUTPUT"
-          else
-            echo "tags=${image}:${version}-full,${image}:full" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Build and push
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           target: ${{ matrix.flavor }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          # Push only platform-specific image by digest — merge-manifests below
+          # combines all four (flavor × arch) digests into the canonical
+          # multi-arch tags. This avoids the registry-push contention that
+          # single-step multi-platform mode triggers.
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server,push-by-digest=true,name-canonical=true,push=true
           build-args: |
             TM_VERSION=${{ github.ref_name }}
             TM_SOURCE_REV=${{ github.sha }}
-          # Read+write the GHA cache shared with docker-validate so this job
-          # warm-starts off the validation build instead of from scratch.
-          cache-from: |
-            type=gha,scope=${{ matrix.flavor }}-linux/amd64
-            type=gha,scope=${{ matrix.flavor }}-linux/arm64
-          cache-to: type=gha,scope=${{ matrix.flavor }}-publish,mode=max
+          # Same cache scope as docker-validate (which writes mode=max). This
+          # job is effectively a re-execution with push enabled — the build
+          # graph should be a near-total cache hit.
+          cache-from: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }},mode=max
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.flavor }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-manifests:
+    needs: publish-docker
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [lite, full]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.flavor }}-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          image="${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server"
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${{ matrix.flavor }}" = "lite" ]; then
+            tag_args="-t ${image}:${version}-lite -t ${image}:lite -t ${image}:latest"
+          else
+            tag_args="-t ${image}:${version}-full -t ${image}:full"
+          fi
+          # Each filename in /tmp/digests is the digest hex (no sha256: prefix).
+          digest_args=$(printf "${image}@sha256:%s " *)
+          docker buildx imagetools create $tag_args $digest_args
+      - name: Verify manifest
+        run: |
+          image="${{ secrets.DOCKERHUB_USERNAME }}/transcendence-memory-server"
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools inspect "${image}:${version}-${{ matrix.flavor }}"
 
   github-release:
-    needs: [build-release-assets, publish-pypi, publish-docker]
+    needs: [build-release-assets, publish-pypi, merge-manifests]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
