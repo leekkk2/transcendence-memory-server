@@ -399,7 +399,7 @@ def get_ui_session_store():
     """Return the process-wide ``SessionStore`` singleton, building it on demand."""
     global _UI_SESSION_STORE
     if _UI_SESSION_STORE is None:
-        from scripts import auth_session  # local import keeps cold-start cheap
+        import auth_session  # local import keeps cold-start cheap
         _UI_SESSION_STORE = auth_session.SessionStore(
             _ui_db_path(), ttl_sec=auth_session.env_ttl()
         )
@@ -410,7 +410,7 @@ def get_ui_login_limit():
     """Return the process-wide ``LoginRateLimit`` singleton."""
     global _UI_LOGIN_LIMIT
     if _UI_LOGIN_LIMIT is None:
-        from scripts import auth_session
+        import auth_session
         _UI_LOGIN_LIMIT = auth_session.LoginRateLimit(
             _ui_db_path(),
             lockout_count=auth_session.env_lockout_count(),
@@ -450,7 +450,7 @@ def verify_auth(
     if token:
         session = get_ui_session_store().validate(token)
         if session is not None and session.api_key_hash:
-            from scripts.auth_session import hash_api_key
+            from auth_session import hash_api_key
             if session.api_key_hash == hash_api_key(RAG_API_KEY):
                 return
 
