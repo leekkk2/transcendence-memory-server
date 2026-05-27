@@ -40,6 +40,7 @@ fi
 
 CONTAINER="smoke-test-$(date +%s)"
 SMOKE_ID="smoke-$(date +%s%N)"
+COOKIE_JAR="$(mktemp -t tm-smoke-cookie.XXXXXX)"
 
 # pretty
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -64,6 +65,7 @@ req() {
 cleanup() {
     info "cleanup: deleting test container $CONTAINER"
     req DELETE "/containers/$CONTAINER" >/dev/null 2>&1 || true
+    rm -f "$COOKIE_JAR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -141,5 +143,46 @@ else
     fail "search did not find smoke memory within 90s — last response: $SEARCH"
 fi
 
+# 7-11. Admin dashboard session flow — catches the v0.17.0-class
+# import-path bug where /admin/ui/* and /admin/usage/* return 500 even though
+# /health and /search pass. Verifies the full login → authed GET → logout cycle.
+info "7. /admin/ui/me unauth (expect 401)"
+ME_UNAUTH=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$ENDPOINT/admin/ui/me" || true)
+[ "$ME_UNAUTH" = "401" ] || fail "/admin/ui/me unauth expected 401, got $ME_UNAUTH"
+pass "/admin/ui/me unauth -> 401"
+
+info "8. /admin/ui/login"
+LOGIN_BODY="$(mktemp -t tm-smoke-login.XXXXXX.json)"
+LOGIN_CODE=$(curl -sS -m 10 -c "$COOKIE_JAR" -o "$LOGIN_BODY" -w '%{http_code}' \
+    -X POST "$ENDPOINT/admin/ui/login" \
+    -H "Content-Type: application/json" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    --data "{\"api_key\":\"$RAG_API_KEY\"}")
+if [ "$LOGIN_CODE" != "200" ]; then
+    LOGIN_OUT="$(cat "$LOGIN_BODY")"
+    rm -f "$LOGIN_BODY"
+    fail "login expected 200, got $LOGIN_CODE: $LOGIN_OUT"
+fi
+rm -f "$LOGIN_BODY"
+grep -q tm_sid "$COOKIE_JAR" || fail "tm_sid cookie not issued"
+pass "/admin/ui/login -> 200 + tm_sid cookie"
+
+info "9. /admin/usage/summary?window=24h (Lane B coverage)"
+USAGE_CODE=$(curl -sS -m 10 -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' \
+    "$ENDPOINT/admin/usage/summary?window=24h")
+[ "$USAGE_CODE" = "200" ] || fail "GET /admin/usage/summary expected 200, got $USAGE_CODE"
+pass "/admin/usage/summary -> 200"
+
+info "10. /admin/ui/logout"
+LOGOUT_CODE=$(curl -sS -m 10 -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' \
+    -X POST "$ENDPOINT/admin/ui/logout" -H "X-Requested-With: XMLHttpRequest")
+[ "$LOGOUT_CODE" = "200" ] || fail "logout expected 200, got $LOGOUT_CODE"
+pass "/admin/ui/logout -> 200"
+
+info "11. /admin/ui/me post-logout (expect 401)"
+ME_POST=$(curl -sS -m 10 -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' "$ENDPOINT/admin/ui/me")
+[ "$ME_POST" = "401" ] || fail "/admin/ui/me post-logout expected 401, got $ME_POST"
+pass "/admin/ui/me post-logout -> 401"
+
 echo ""
-echo -e "${GREEN}=== all smoke checks passed ===${NC}"
+echo -e "${GREEN}=== all smoke checks passed (11 steps: core + admin/ui) ===${NC}"
