@@ -66,3 +66,8 @@ docker-compose.override.*.yml
 # v0.7.0+ multi-embedding config — references env names, but operators may
 # inadvertently inline secrets; the example template is the only tracked form.
 /config/profiles.yaml
+
+# E2E test results / screenshots
+test-results/
+dashboard/test-results/
+
