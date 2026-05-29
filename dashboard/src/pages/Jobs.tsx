@@ -1,67 +1,103 @@
-import { formatNumber, formatRelativeTs } from '../lib/format';
+import { useTranslation } from 'react-i18next';
 import { useJobs } from '../lib/queries';
+import { formatNumber, formatRelative } from '../lib/format';
 
 /**
- * Jobs / queue view. Single table fed by /jobs; columns are deliberately
- * narrow so a typical workload (5-30 rows) fits a single screen without
- * scrolling.
+ * Jobs / queue view. Reads the real /jobs shape (id / op / enqueued_at) — the
+ * earlier code read job_id / type / created_at, leaving the Job + Type columns
+ * blank and Created at "—". Counts come from the server's `stats` block so the
+ * totals reflect the whole queue, not just the rows on this page.
  */
+const STATUSES = ['pending', 'running', 'done', 'failed', 'cancelled'] as const;
+
+function statusBadgeClass(status: string): string {
+  switch (status) {
+    case 'done':
+      return 'badge badge-green';
+    case 'failed':
+      return 'badge badge-red';
+    case 'running':
+      return 'badge badge-cyan';
+    case 'pending':
+      return 'badge badge-yellow';
+    default:
+      return 'badge badge-dim';
+  }
+}
+
 export default function Jobs() {
+  const { t } = useTranslation();
   const { data, isLoading } = useJobs();
 
   const rows = data?.jobs ?? [];
-  const counts = rows.reduce<Record<string, number>>((acc, j) => {
-    acc[j.status] = (acc[j.status] ?? 0) + 1;
-    return acc;
-  }, {});
+  // Prefer server-wide stats; fall back to counting the visible page.
+  const counts: Record<string, number> =
+    data?.stats ??
+    rows.reduce<Record<string, number>>((acc, j) => {
+      acc[j.status] = (acc[j.status] ?? 0) + 1;
+      return acc;
+    }, {});
 
   return (
     <div className="space-y-4">
-      <h1 className="text-lg font-semibold">Jobs</h1>
+      <div className="flex items-center justify-between gap-3">
+        <h1 className="text-lg font-semibold">{t('jobs.title')}</h1>
+        <span className={data?.worker_running ? 'badge badge-green' : 'badge badge-dim'}>
+          <span className="dot" />
+          {data?.worker_running ? t('jobs.workerRunning') : t('jobs.workerStopped')}
+        </span>
+      </div>
 
-      <div className="flex flex-wrap gap-3">
-        {['pending', 'running', 'done', 'failed', 'cancelled'].map((status) => (
-          <div key={status} className="panel px-3 py-2 text-xs mono">
-            <span className="text-dim">{status}</span>
-            <span className="ml-2 font-semibold">{formatNumber(counts[status] ?? 0)}</span>
+      <div className="flex flex-wrap gap-2.5">
+        {STATUSES.map((status) => (
+          <div key={status} className="panel mono flex items-center gap-2 px-3 py-2 text-xs">
+            <span className="text-dim">{t(`jobs.${status}`)}</span>
+            <span className="font-semibold">{formatNumber(counts[status] ?? 0)}</span>
           </div>
         ))}
       </div>
 
-      <div className="panel overflow-hidden">
-        <table className="w-full text-sm">
-          <thead style={{ background: 'var(--bg)' }}>
+      <div className="panel overflow-x-auto">
+        <table className="tbl">
+          <thead>
             <tr>
-              <th className="mono text-xs text-dim uppercase tracking-wider px-3 py-2 text-left">Job</th>
-              <th className="mono text-xs text-dim uppercase tracking-wider px-3 py-2 text-left">Type</th>
-              <th className="mono text-xs text-dim uppercase tracking-wider px-3 py-2 text-left">Container</th>
-              <th className="mono text-xs text-dim uppercase tracking-wider px-3 py-2 text-left">Status</th>
-              <th className="mono text-xs text-dim uppercase tracking-wider px-3 py-2 text-right">Created</th>
+              <th>{t('jobs.colJob')}</th>
+              <th>{t('jobs.colType')}</th>
+              <th>{t('jobs.colContainer')}</th>
+              <th>{t('jobs.colStatus')}</th>
+              <th className="text-right">{t('jobs.colAttempts')}</th>
+              <th className="text-right">{t('jobs.colCreated')}</th>
             </tr>
           </thead>
           <tbody>
             {isLoading ? (
               <tr>
-                <td colSpan={5} className="px-3 py-6 text-center text-dim text-sm">
-                  loading…
+                <td colSpan={6} className="text-dim py-8 text-center text-sm">
+                  {t('common.loading')}
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-3 py-6 text-center text-dim text-sm">
-                  no jobs
+                <td colSpan={6} className="text-dim py-8 text-center text-sm">
+                  {t('jobs.noJobs')}
                 </td>
               </tr>
             ) : (
               rows.map((j) => (
-                <tr key={j.job_id} className="border-t" style={{ borderColor: 'var(--border)' }}>
-                  <td className="px-3 py-2 mono text-xs">{j.job_id}</td>
-                  <td className="px-3 py-2 mono text-xs">{j.type}</td>
-                  <td className="px-3 py-2 mono text-xs">{j.container}</td>
-                  <td className="px-3 py-2 mono text-xs">{j.status}</td>
-                  <td className="px-3 py-2 text-right mono text-xs text-dim">
-                    {formatRelativeTs(j.created_at)}
+                <tr key={j.id}>
+                  <td className="mono text-xs">{j.id}</td>
+                  <td className="mono text-xs">{j.label || j.op}</td>
+                  <td className="mono text-xs">{j.container}</td>
+                  <td>
+                    <span className={statusBadgeClass(j.status)}>
+                      <span className="dot" />
+                      {t(`jobs.${j.status}`, { defaultValue: j.status })}
+                    </span>
                   </td>
+                  <td className="mono text-dim text-right text-xs">
+                    {j.attempts ?? 0}/{j.max_attempts ?? '—'}
+                  </td>
+                  <td className="mono text-dim text-right text-xs">{formatRelative(j.enqueued_at)}</td>
                 </tr>
               ))
             )}
