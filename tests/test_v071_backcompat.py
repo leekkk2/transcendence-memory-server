@@ -100,12 +100,18 @@ def test_legacy_alt_base_url_var_recognized(monkeypatch):
 
 
 def test_legacy_uses_hardcoded_defaults_when_env_empty(monkeypatch):
-    """完全空 env：使用与旧 rag_engine.py 一致的硬编码 default（gemini-embedding-001 / 3072）。"""
+    """完全空 env：使用 hardcoded default (v0.17.2+ → text-embedding-3-small / 1024).
+
+    2026-05-29 incident: prior defaults gemini-embedding-001 / 3072 caused
+    silent dim drift when production .env got reset; new defaults align with
+    the dominant production embedding (sanva / example-org etc.). See workspace
+    docs/decisions/2026-05-29-embedding-model-drift-incident.md.
+    """
     _clear_all(monkeypatch)
     ps = load_profiles()
     p = ps.embeddings["legacy"]
-    assert p.model == "gemini-embedding-001"
-    assert p.dim == 3072
+    assert p.model == "text-embedding-3-small"
+    assert p.dim == 1024
     assert p.base_url == "https://api.openai.com/v1"
 
 
