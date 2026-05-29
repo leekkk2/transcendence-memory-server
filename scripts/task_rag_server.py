@@ -548,10 +548,79 @@ _BACKLOG_NOTE = (
 )
 
 
+def _verify_embedding_dim_consistency() -> None:
+    """Fail-fast if LanceDB chunks tables disagree with EMBEDDING_DIM.
+
+    Background: a 2026-05-29 incident silently shipped EMBEDDING_DIM=3072 against
+    1024-dim LanceDB tables, causing all /search queries to throw
+    `RuntimeError: query dim doesn't match column vector dim` for ~14h. Healthcheck
+    stayed green because /health never issues a vector query. This guard refuses
+    to enter the serving loop until the runtime dim matches stored vectors.
+
+    Override (use sparingly, e.g. a planned reindex): TM_ALLOW_DIM_DRIFT=1.
+    """
+    if os.environ.get('TM_ALLOW_DIM_DRIFT', '0') in ('1', 'true', 'True'):
+        print('[startup-check] TM_ALLOW_DIM_DRIFT=1 set — skipping dim consistency check', flush=True)
+        return
+    expected_dim_raw = os.environ.get('EMBEDDING_DIM')
+    if not expected_dim_raw:
+        # No explicit env; defer to profiles.yaml / legacy fallback inside the runtime.
+        # The check is best-effort here — we only act when EMBEDDING_DIM is set.
+        return
+    try:
+        expected_dim = int(expected_dim_raw)
+    except ValueError:
+        print(f'[startup-check] EMBEDDING_DIM={expected_dim_raw!r} not an int — skipping', flush=True)
+        return
+    try:
+        import lancedb  # type: ignore
+    except ImportError:
+        print('[startup-check] lancedb not importable — skipping dim check', flush=True)
+        return
+    containers_root = WS / 'tasks' / 'rag' / 'containers'
+    if not containers_root.is_dir():
+        return  # fresh install, nothing to verify
+    mismatches: list[tuple[str, int]] = []
+    checked = 0
+    for cdir in sorted(containers_root.iterdir()):
+        lancedb_dir = cdir / 'lancedb'
+        if not (lancedb_dir / 'chunks.lance').is_dir():
+            continue
+        try:
+            db = lancedb.connect(str(lancedb_dir))
+            tbl = db.open_table('chunks')
+            vec_field = next((f for f in tbl.schema if f.name == 'vector'), None)
+            if vec_field is None:
+                continue
+            # pyarrow fixed_size_list -> .type.list_size
+            actual_dim = getattr(vec_field.type, 'list_size', None)
+            if actual_dim is None:
+                continue
+            checked += 1
+            if actual_dim != expected_dim:
+                mismatches.append((cdir.name, actual_dim))
+        except Exception as exc:  # noqa: BLE001 — startup probe must not crash on a bad table
+            print(f'[startup-check] container={cdir.name} schema probe failed: {exc}', flush=True)
+    if mismatches:
+        print('=' * 56, flush=True)
+        print(f'[startup-check] FATAL: EMBEDDING_DIM={expected_dim} disagrees with LanceDB schemas:', flush=True)
+        for name, dim in mismatches:
+            print(f'  - container={name}: stored dim={dim}', flush=True)
+        print('  Cause: .env drift vs profiles.yaml, or accidental model swap.', flush=True)
+        print('  Action: align EMBEDDING_DIM (and EMBEDDING_MODEL) with stored dim,', flush=True)
+        print('          OR rebuild affected containers with the new model,', flush=True)
+        print('          OR set TM_ALLOW_DIM_DRIFT=1 if you are mid-reindex.', flush=True)
+        print('  Refusing to start to prevent silent /search RuntimeError storm.', flush=True)
+        print('=' * 56, flush=True)
+        sys.exit(1)
+    print(f'[startup-check] embedding dim consistency OK ({checked} container(s) @ dim={expected_dim})', flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global JOB_WORKER
     _startup_banner()
+    _verify_embedding_dim_consistency()
     queue = get_job_queue()
     if not DISABLE_WORKER:
         scripts_dir = SERVER_SCRIPTS  # task_rag_lancedb_ingest.py 等都在这里
