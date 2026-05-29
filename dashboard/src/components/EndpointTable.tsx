@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { formatMs, formatNumber } from '../lib/format';
 
 interface Row {
@@ -23,54 +24,50 @@ export function EndpointTable({
   sort: 'calls' | 'errors' | 'p95';
   onSortChange: (s: 'calls' | 'errors' | 'p95') => void;
 }) {
-  const headerCls = 'mono text-xs text-dim uppercase tracking-wider px-3 py-2 cursor-pointer select-none';
+  const { t } = useTranslation();
+  const arrow = (key: 'calls' | 'errors' | 'p95') => (sort === key ? ' ▾' : '');
+
   return (
-    <div className="panel overflow-hidden">
-      <table className="w-full text-sm">
-        <thead style={{ background: 'var(--bg)' }}>
+    <div className="panel overflow-x-auto">
+      <table className="tbl">
+        <thead>
           <tr>
-            <th className={headerCls} style={{ textAlign: 'left' }}>Path</th>
-            <th
-              className={headerCls + ' text-right'}
-              onClick={() => onSortChange('calls')}
-            >
-              Calls{sort === 'calls' ? ' ▾' : ''}
+            <th>{t('usage.colPath')}</th>
+            <th className="cursor-pointer select-none text-right" onClick={() => onSortChange('calls')}>
+              {t('usage.colCalls')}
+              {arrow('calls')}
             </th>
-            <th
-              className={headerCls + ' text-right'}
-              onClick={() => onSortChange('errors')}
-            >
-              Errors{sort === 'errors' ? ' ▾' : ''}
+            <th className="cursor-pointer select-none text-right" onClick={() => onSortChange('errors')}>
+              {t('usage.colErrors')}
+              {arrow('errors')}
             </th>
-            <th
-              className={headerCls + ' text-right'}
-              onClick={() => onSortChange('p95')}
-            >
-              p95{sort === 'p95' ? ' ▾' : ''}
+            <th className="cursor-pointer select-none text-right" onClick={() => onSortChange('p95')}>
+              {t('usage.colP95')}
+              {arrow('p95')}
             </th>
-            <th className={headerCls + ' text-right'}>Containers</th>
+            <th className="text-right">{t('usage.colContainers')}</th>
           </tr>
         </thead>
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={5} className="px-3 py-6 text-center text-dim text-sm">
-                no data
+              <td colSpan={5} className="text-dim py-8 text-center text-sm">
+                {t('usage.noData')}
               </td>
             </tr>
           ) : null}
           {rows.map((r) => (
-            <tr key={r.path} className="border-t" style={{ borderColor: 'var(--border)' }}>
-              <td className="px-3 py-2 font-mono text-xs">{r.path}</td>
-              <td className="px-3 py-2 text-right mono">{formatNumber(r.calls)}</td>
+            <tr key={r.path}>
+              <td className="mono text-xs">{r.path}</td>
+              <td className="mono text-right">{formatNumber(r.calls)}</td>
               <td
-                className="px-3 py-2 text-right mono"
+                className="mono text-right"
                 style={{ color: (r.errors ?? 0) > 0 ? 'var(--red)' : 'var(--text-dim)' }}
               >
                 {formatNumber(r.errors)}
               </td>
-              <td className="px-3 py-2 text-right mono">{formatMs(r.p95_latency_ms)}</td>
-              <td className="px-3 py-2 text-right mono">{formatNumber(r.distinct_containers)}</td>
+              <td className="mono text-right">{formatMs(r.p95_latency_ms)}</td>
+              <td className="mono text-right">{formatNumber(r.distinct_containers)}</td>
             </tr>
           ))}
         </tbody>

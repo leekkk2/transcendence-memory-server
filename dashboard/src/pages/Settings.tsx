@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { ProfileBreakerBadge, type BreakerState } from '../components/ProfileBreakerBadge';
+import { useTranslation } from 'react-i18next';
+import { ProfileList } from '../components/ProfileList';
 import { api } from '../lib/api';
 import { useMe } from '../lib/auth';
-import { useProfiles } from '../lib/queries';
+import { useHealth, useProfiles } from '../lib/queries';
 
 /**
  * Settings — read-only profile / login / about info plus a theme toggle.
@@ -11,14 +12,17 @@ import { useProfiles } from '../lib/queries';
  * only; we don't pretend a UI button can hot-swap env vars.
  */
 const THEME_KEY = 'tm-admin-theme';
+type Theme = 'dark' | 'light' | 'system';
 
 export default function Settings() {
+  const { t } = useTranslation();
   const me = useMe();
+  const health = useHealth();
   const profiles = useProfiles();
-  const [theme, setTheme] = useState<'dark' | 'light' | 'system'>('dark');
+  const [theme, setTheme] = useState<Theme>('dark');
 
   useEffect(() => {
-    const stored = (localStorage.getItem(THEME_KEY) as 'dark' | 'light' | 'system' | null) ?? 'dark';
+    const stored = (localStorage.getItem(THEME_KEY) as Theme | null) ?? 'dark';
     setTheme(stored);
     applyTheme(stored);
   }, []);
@@ -27,80 +31,75 @@ export default function Settings() {
     mutationFn: () => api.post('/admin/probe-embedding', {}),
   });
 
-  const profileList = readProfiles(profiles.data);
-
   return (
     <div className="space-y-6">
-      <h1 className="text-lg font-semibold">Settings</h1>
+      <h1 className="text-lg font-semibold">{t('settings.title')}</h1>
 
-      <Section title="Profile status">
-        <ul className="space-y-2 text-sm">
-          {profileList.length === 0 ? (
-            <li className="text-dim text-xs">no profiles configured</li>
+      <Section title={t('settings.profileStatus')}>
+        <ProfileList data={profiles.data} />
+        <div className="mt-4 flex items-center gap-3">
+          <button onClick={() => probe.mutate()} disabled={probe.isPending} className="btn btn-accent text-sm">
+            {probe.isPending ? t('settings.probing') : t('settings.probeReset')}
+          </button>
+          {probe.isSuccess ? (
+            <span className="badge badge-green">
+              <span className="dot" />
+              {t('settings.probeOk')}
+            </span>
           ) : null}
-          {profileList.map((p) => (
-            <li key={p.name}>
-              <ProfileBreakerBadge name={p.name} state={p.state} />
-            </li>
-          ))}
-        </ul>
-        <button
-          onClick={() => probe.mutate()}
-          disabled={probe.isPending}
-          className="mt-4 rounded px-3 py-1.5 text-sm disabled:opacity-50"
-          style={{ background: 'var(--accent)', color: '#000' }}
-        >
-          {probe.isPending ? 'probing…' : 'probe & reset embedding'}
-        </button>
+          {probe.isError ? (
+            <span className="badge badge-red">
+              <span className="dot" />
+              {t('settings.probeFailed')}
+            </span>
+          ) : null}
+        </div>
       </Section>
 
-      <Section title="Login security">
-        <Row label="api_key_hash" value={me.data?.api_key_hash ?? '—'} />
-        <Row label="env" value={me.data?.env ?? 'dev'} />
-        <Row label="session expires_at" value={String(me.data?.expires_at ?? '—')} />
-        <p className="text-dim mt-3 text-xs">
-          session TTL and lockout policy are set via env vars (<span className="mono">TM_UI_SESSION_TTL</span>,{' '}
-          <span className="mono">TM_UI_LOGIN_LOCKOUT_*</span>). Restart the server to change them.
-        </p>
+      <Section title={t('settings.loginSecurity')}>
+        <Row label={t('settings.apiKeyHash')} value={me.data?.api_key_hash ?? '—'} />
+        <Row label={t('settings.env')} value={me.data?.env ?? 'dev'} />
+        <Row label={t('settings.sessionExpires')} value={String(me.data?.expires_at ?? '—')} />
+        <p className="text-dim mt-3 text-xs">{t('settings.sessionHint')}</p>
       </Section>
 
-      <Section title="Theme">
+      <Section title={t('settings.theme')}>
         <div className="flex gap-2">
-          {(['dark', 'light', 'system'] as const).map((t) => (
+          {(['dark', 'light', 'system'] as const).map((tk) => (
             <button
-              key={t}
+              key={tk}
               onClick={() => {
-                setTheme(t);
-                localStorage.setItem(THEME_KEY, t);
-                applyTheme(t);
+                setTheme(tk);
+                localStorage.setItem(THEME_KEY, tk);
+                applyTheme(tk);
               }}
-              className="rounded px-3 py-1.5 text-sm"
-              style={{
-                background: theme === t ? 'var(--accent)' : 'var(--bg)',
-                color: theme === t ? '#000' : 'var(--text)',
-              }}
+              className={theme === tk ? 'btn btn-accent text-sm' : 'btn btn-ghost text-sm'}
             >
-              {t}
+              {t(`settings.theme${tk[0].toUpperCase()}${tk.slice(1)}`)}
             </button>
           ))}
         </div>
       </Section>
 
-      <Section title="About">
-        <Row label="dashboard" value="v0.17.0" />
+      <Section title={t('settings.about')}>
+        <Row label={t('settings.dashboard')} value={`v${__APP_VERSION__}`} />
         <Row
-          label="server"
-          value="see /health"
-          hint="full version surface in /health JSON response"
+          label={t('settings.server')}
+          value={
+            health.data
+              ? `${health.data.architecture ?? '—'} · ${health.data.build_flavor ?? '—'}`
+              : '—'
+          }
+          hint={t('settings.serverHint')}
         />
       </Section>
     </div>
   );
 }
 
-function applyTheme(theme: 'dark' | 'light' | 'system') {
+function applyTheme(theme: Theme) {
   const root = document.documentElement;
-  let effective = theme;
+  let effective: 'dark' | 'light' = theme === 'system' ? 'dark' : theme;
   if (theme === 'system') {
     effective = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   }
@@ -111,7 +110,7 @@ function applyTheme(theme: 'dark' | 'light' | 'system') {
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="panel p-4">
-      <div className="text-dim mb-3 text-xs uppercase tracking-wider mono">{title}</div>
+      <div className="text-dim mono mb-3 text-xs uppercase tracking-wider">{title}</div>
       {children}
     </section>
   );
@@ -119,36 +118,10 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 
 function Row({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
-    <div className="flex items-baseline justify-between text-sm">
+    <div className="flex flex-wrap items-baseline justify-between gap-x-3 py-0.5 text-sm">
       <span className="text-dim mono text-xs">{label}</span>
       <span className="mono text-xs">{value}</span>
-      {hint ? <span className="text-dim text-xs">{hint}</span> : null}
+      {hint ? <span className="text-dim w-full text-right text-[11px]">{hint}</span> : null}
     </div>
   );
-}
-
-function readProfiles(data: unknown): { name: string; state: BreakerState }[] {
-  if (!data || typeof data !== 'object') return [];
-  const buckets = data as Record<string, unknown>;
-  const out: { name: string; state: BreakerState }[] = [];
-  for (const family of ['embedding', 'reranker', 'llm', 'vlm']) {
-    const v = buckets[family];
-    if (Array.isArray(v)) {
-      for (const item of v) {
-        if (item && typeof item === 'object') {
-          const obj = item as { name?: string; breaker?: string; state?: string };
-          out.push({
-            name: `${family}/${obj.name ?? '?'}`,
-            state: normaliseState(obj.breaker ?? obj.state),
-          });
-        }
-      }
-    }
-  }
-  return out;
-}
-
-function normaliseState(s: string | undefined): BreakerState {
-  if (s === 'closed' || s === 'open' || s === 'half-open') return s;
-  return 'unknown';
 }

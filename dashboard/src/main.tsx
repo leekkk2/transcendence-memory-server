@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BrowserRouter } from 'react-router-dom';
 import App from './App';
+import './lib/i18n';
 import './styles/globals.css';
 
 // Single QueryClient instance — staleTime defaults to 30s so the dashboard

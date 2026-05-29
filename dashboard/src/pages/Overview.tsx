@@ -1,86 +1,79 @@
+import { useTranslation } from 'react-i18next';
 import { MetricCard } from '../components/MetricCard';
-import { ProfileBreakerBadge, type BreakerState } from '../components/ProfileBreakerBadge';
+import { ProfileList } from '../components/ProfileList';
 import { formatNumber, formatUptime } from '../lib/format';
 import { useContainers, useHealth, useProfiles, useUsageSummary } from '../lib/queries';
 
 /**
- * Overview — one screen showing four headline KPIs, a queue/backlog summary,
- * breaker health, and the last 24h call-count snapshot. Every metric is a
- * straight read from a Lane B / Lane A endpoint; this page does no math
- * itself beyond formatting.
+ * Overview — four headline KPIs, a top-endpoints snapshot, the model-profile
+ * panel, and any active warnings. Every metric is a straight read from a
+ * backend endpoint; this page does no math beyond formatting.
  */
 export default function Overview() {
+  const { t } = useTranslation();
   const health = useHealth();
   const summary = useUsageSummary('24h');
   const containers = useContainers();
   const profiles = useProfiles();
 
-  const profileList = readProfiles(profiles.data);
-
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard
-          title="Uptime"
+          title={t('overview.uptime')}
           value={formatUptime(health.data?.uptime_seconds ?? 0)}
-          sub={health.data?.worker_running ? 'worker online' : 'worker idle'}
+          sub={health.data?.worker_running ? t('overview.workerOnline') : t('overview.workerIdle')}
+          trend={health.data?.worker_running ? 'up' : 'flat'}
         />
         <MetricCard
-          title="Containers"
+          title={t('overview.containers')}
           value={formatNumber(containers.data?.containers?.length ?? 0)}
-          sub={`${formatNumber(summary.data?.active_containers ?? 0)} active 24h`}
+          sub={t('overview.activeContainers', { count: summary.data?.active_containers ?? 0 })}
         />
         <MetricCard
-          title="Today calls"
+          title={t('overview.todayCalls')}
           value={formatNumber(summary.data?.total_calls ?? 0)}
-          sub={`${formatNumber(summary.data?.total_errors ?? 0)} errors`}
+          sub={t('overview.errorsSub', { count: summary.data?.total_errors ?? 0 })}
           trend={(summary.data?.total_errors ?? 0) > 0 ? 'down' : 'up'}
         />
         <MetricCard
-          title="p95 latency"
+          title={t('overview.p95Latency')}
           value={`${formatNumber(summary.data?.p95_latency_ms ?? 0)} ms`}
-          sub={`p50 ${formatNumber(summary.data?.p50_latency_ms ?? 0)} ms`}
+          sub={t('overview.p50Sub', { value: formatNumber(summary.data?.p50_latency_ms ?? 0) })}
         />
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <section className="panel p-4">
-          <div className="text-dim mb-3 text-xs uppercase tracking-wider mono">
-            top endpoints (24h)
+          <div className="text-dim mono mb-3 text-xs uppercase tracking-wider">
+            {t('overview.topEndpoints')}
           </div>
           <ul className="space-y-2 text-sm">
             {(summary.data?.top_endpoints ?? []).slice(0, 6).map((e) => (
-              <li key={e.path} className="flex items-center justify-between">
-                <span className="mono text-xs">{e.path}</span>
+              <li key={e.path} className="flex items-center justify-between gap-2">
+                <span className="mono truncate text-xs">{e.path}</span>
                 <span className="mono text-dim">{formatNumber(e.calls)}</span>
               </li>
             ))}
             {(summary.data?.top_endpoints?.length ?? 0) === 0 ? (
-              <li className="text-dim text-xs">no traffic recorded</li>
+              <li className="text-dim text-xs">{t('overview.noTraffic')}</li>
             ) : null}
           </ul>
         </section>
 
         <section className="panel p-4">
-          <div className="text-dim mb-3 text-xs uppercase tracking-wider mono">
-            breaker health
+          <div className="text-dim mono mb-3 text-xs uppercase tracking-wider">
+            {t('overview.modelProfiles')}
           </div>
-          <ul className="space-y-2 text-sm">
-            {profileList.length === 0 ? (
-              <li className="text-dim text-xs">no profiles configured</li>
-            ) : null}
-            {profileList.map((p) => (
-              <li key={p.name}>
-                <ProfileBreakerBadge name={p.name} state={p.state} />
-              </li>
-            ))}
-          </ul>
+          <ProfileList data={profiles.data} />
         </section>
       </div>
 
       {(health.data?.warnings?.length ?? 0) > 0 ? (
-        <section className="panel p-4">
-          <div className="text-dim mb-2 text-xs uppercase tracking-wider mono">warnings</div>
+        <section className="panel p-4" style={{ borderColor: 'var(--yellow)' }}>
+          <div className="text-dim mono mb-2 text-xs uppercase tracking-wider">
+            {t('overview.warnings')}
+          </div>
           <ul className="text-sm" style={{ color: 'var(--yellow)' }}>
             {health.data?.warnings.map((w) => (
               <li key={w} className="mono text-xs">
@@ -92,35 +85,4 @@ export default function Overview() {
       ) : null}
     </div>
   );
-}
-
-/**
- * Extract a flat list of `{ name, state }` from /admin/profiles' shape so
- * the page renders even when the server reports a slightly different schema
- * across embedding / reranker / llm / vlm.
- */
-function readProfiles(data: unknown): { name: string; state: BreakerState }[] {
-  if (!data || typeof data !== 'object') return [];
-  const buckets = data as Record<string, unknown>;
-  const out: { name: string; state: BreakerState }[] = [];
-  for (const family of ['embedding', 'reranker', 'llm', 'vlm']) {
-    const v = buckets[family];
-    if (Array.isArray(v)) {
-      for (const item of v) {
-        if (item && typeof item === 'object') {
-          const obj = item as { name?: string; breaker?: string; state?: string };
-          out.push({
-            name: `${family}/${obj.name ?? '?'}`,
-            state: normaliseState(obj.breaker ?? obj.state),
-          });
-        }
-      }
-    }
-  }
-  return out;
-}
-
-function normaliseState(s: string | undefined): BreakerState {
-  if (s === 'closed' || s === 'open' || s === 'half-open') return s;
-  return 'unknown';
 }
