@@ -3,7 +3,9 @@
  *
  * Variables follow the design doc §"视觉系统" table; dark is default with a
  * `.light` override so the Settings page can flip themes without a router
- * round-trip.
+ * round-trip. The developer-console aesthetic (GitHub-dark surfaces + a single
+ * cyan accent + Inter / JetBrains Mono) is intentional and preserved — this
+ * file only refines rhythm, elevation, table/badge/skeleton primitives.
  */
 @import 'tailwindcss';
 @import '@fontsource-variable/inter/index.css';
@@ -39,6 +41,12 @@
   --green: #3fb950;
   --yellow: #d29922;
   --red: #f85149;
+
+  /* refined surfaces / shadows derived from the palette */
+  --border-soft: color-mix(in srgb, var(--border) 60%, transparent);
+  --row-hover: color-mix(in srgb, var(--accent) 7%, transparent);
+  --row-zebra: color-mix(in srgb, var(--text) 2.5%, transparent);
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.25);
 }
 
 :root.light {
@@ -54,6 +62,11 @@
   --green: #16a34a;
   --yellow: #ca8a04;
   --red: #dc2626;
+
+  --border-soft: color-mix(in srgb, var(--border) 70%, transparent);
+  --row-hover: color-mix(in srgb, var(--accent) 6%, transparent);
+  --row-zebra: color-mix(in srgb, var(--text) 3%, transparent);
+  --shadow-panel: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 1px rgba(15, 23, 42, 0.04);
 }
 
 @layer base {
@@ -71,9 +84,50 @@
     font-family: var(--font-mono);
   }
 
-  * {
-    transition-duration: 200ms;
+  /* Scope transitions to non-layout properties so reflows stay snappy. */
+  a,
+  button,
+  input,
+  select,
+  th,
+  tr,
+  .panel,
+  .badge,
+  .nav-item {
+    transition-property: color, background-color, border-color, box-shadow, opacity, transform;
+    transition-duration: 160ms;
     transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+    color: var(--text);
+  }
+
+  /* Themed thin scrollbars for the console feel. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--text-dim);
+    background-clip: content-box;
+  }
+
+  :focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+    outline-offset: 2px;
+    border-radius: 4px;
   }
 }
 
@@ -81,7 +135,17 @@
   .panel {
     background: var(--bg-elev);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 10px;
+    box-shadow: var(--shadow-panel);
+  }
+
+  /* Cards that respond to pointer (memory cards, clickable rows). */
+  .panel-interactive {
+    cursor: pointer;
+  }
+  .panel-interactive:hover {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    transform: translateY(-1px);
   }
 
   .text-dim {
@@ -90,5 +154,185 @@
 
   .accent {
     color: var(--accent);
+  }
+  a.accent:hover {
+    color: var(--accent-hover);
+  }
+
+  /* ---- Unified form controls ---- */
+  .input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 0.4rem 0.7rem;
+  }
+  .input::placeholder {
+    color: var(--text-dim);
+  }
+  .input:hover {
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  .btn {
+    border-radius: 8px;
+    font-weight: 500;
+    padding: 0.4rem 0.85rem;
+    border: 1px solid transparent;
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-accent {
+    background: var(--accent);
+    color: #00181c;
+    font-weight: 600;
+  }
+  .btn-accent:not(:disabled):hover {
+    background: var(--accent-hover);
+  }
+  .btn-ghost {
+    background: transparent;
+    border-color: var(--border);
+    color: var(--text-dim);
+  }
+  .btn-ghost:hover {
+    color: var(--text);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+    background: var(--row-hover);
+  }
+
+  /* ---- Status badges ---- */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1;
+    padding: 0.28em 0.6em;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .badge .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+    flex: none;
+  }
+  .badge-green {
+    color: var(--green);
+    background: color-mix(in srgb, var(--green) 14%, transparent);
+    border-color: color-mix(in srgb, var(--green) 30%, transparent);
+  }
+  .badge-red {
+    color: var(--red);
+    background: color-mix(in srgb, var(--red) 14%, transparent);
+    border-color: color-mix(in srgb, var(--red) 30%, transparent);
+  }
+  .badge-yellow {
+    color: var(--yellow);
+    background: color-mix(in srgb, var(--yellow) 16%, transparent);
+    border-color: color-mix(in srgb, var(--yellow) 32%, transparent);
+  }
+  .badge-cyan {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  }
+  .badge-dim {
+    color: var(--text-dim);
+    background: color-mix(in srgb, var(--text-dim) 12%, transparent);
+    border-color: var(--border);
+  }
+
+  /* ---- Tables ---- */
+  .tbl {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 0.875rem;
+  }
+  .tbl thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg);
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.6rem 0.8rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .tbl tbody td {
+    padding: 0.55rem 0.8rem;
+    border-top: 1px solid var(--border-soft);
+  }
+  .tbl tbody tr:nth-child(even) {
+    background: var(--row-zebra);
+  }
+  .tbl tbody tr:hover {
+    background: var(--row-hover);
+  }
+
+  /* ---- Skeleton shimmer ---- */
+  .skeleton {
+    position: relative;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--text) 6%, transparent);
+    border-radius: 6px;
+  }
+  .skeleton::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--text) 8%, transparent),
+      transparent
+    );
+    animation: tm-shimmer 1.4s infinite;
+  }
+  @keyframes tm-shimmer {
+    100% {
+      transform: translateX(100%);
+    }
+  }
+
+  /* Fade-in for content reveals. */
+  .fade-in {
+    animation: tm-fade-in 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @keyframes tm-fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

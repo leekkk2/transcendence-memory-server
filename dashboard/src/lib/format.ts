@@ -32,6 +32,24 @@ export function formatRelativeTs(ts: number | null | undefined): string {
   return `${Math.floor(delta / 86400)}d ago`;
 }
 
+/**
+ * Relative timestamp that tolerates both epoch-seconds (jobs, index-status)
+ * and ISO-8601 strings (container last_modified). Returns "—" for anything
+ * unparseable so callers don't have to normalise upstream.
+ */
+export function formatRelative(value: number | string | null | undefined): string {
+  if (value === null || value === undefined || value === '') return '—';
+  let seconds: number;
+  if (typeof value === 'number') {
+    seconds = value;
+  } else {
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms)) return '—';
+    seconds = Math.floor(ms / 1000);
+  }
+  return formatRelativeTs(seconds);
+}
+
 export function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return '—';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];

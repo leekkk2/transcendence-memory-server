@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { ContainerTable } from '../components/ContainerTable';
 import { useContainers } from '../lib/queries';
 
@@ -8,29 +9,34 @@ import { useContainers } from '../lib/queries';
  * filtering is purely client-side.
  */
 export default function Containers() {
+  const { t } = useTranslation();
   const { data, isLoading } = useContainers();
   const [filter, setFilter] = useState('');
 
   const rows = useMemo(() => {
     const list = data?.containers ?? [];
     const f = filter.trim().toLowerCase();
-    return f ? list.filter((c) => c.name.toLowerCase().includes(f)) : list;
+    const filtered = f ? list.filter((c) => c.name.toLowerCase().includes(f)) : list;
+    return [...filtered].sort((a, b) => (b.objects ?? 0) - (a.objects ?? 0));
   }, [data, filter]);
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold">Containers</h1>
+      <div className="flex items-center justify-between gap-3">
+        <h1 className="text-lg font-semibold">{t('containers.title')}</h1>
         <input
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          placeholder="filter by name…"
-          className="rounded border px-3 py-1.5 font-mono text-xs"
-          style={{ background: 'var(--bg-elev)', borderColor: 'var(--border)' }}
+          placeholder={t('containers.filterPlaceholder')}
+          className="input mono w-48 text-xs"
         />
       </div>
       {isLoading ? (
-        <div className="text-dim text-sm">loading…</div>
+        <div className="panel space-y-2 p-4">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="skeleton h-7 w-full" />
+          ))}
+        </div>
       ) : (
         <ContainerTable rows={rows} />
       )}

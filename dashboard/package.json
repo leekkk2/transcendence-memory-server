@@ -1,7 +1,7 @@
 {
   "name": "transcendence-memory-dashboard",
   "private": true,
-  "version": "0.17.0",
+  "version": "0.17.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,9 +13,12 @@
     "@fontsource-variable/jetbrains-mono": "5.1.1",
     "@tanstack/react-query": "5.59.20",
     "clsx": "2.1.1",
+    "i18next": "^24.2.3",
+    "i18next-browser-languagedetector": "^8.2.1",
     "lucide-react": "0.469.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
+    "react-i18next": "^15.7.4",
     "react-router-dom": "6.27.0",
     "recharts": "2.13.3",
     "tailwind-merge": "2.5.5"

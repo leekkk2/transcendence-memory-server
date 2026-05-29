@@ -33,21 +33,69 @@ export interface UsageSummary {
   top_endpoints: { path: string; calls: number; p95: number }[];
 }
 
+// Field names mirror the real `/containers` payload (objects / last_modified /
+// index_state) — an earlier guess at memory_count / last_active silently
+// rendered every row as "—". Keep these aligned with the server contract.
 export interface ContainerListItem {
   name: string;
-  memory_count?: number;
-  last_active?: number;
+  objects?: number;
+  indexed?: boolean;
+  last_modified?: string | null;
+  index_state?: 'fresh' | 'stale' | 'unknown' | string;
+  metadata?: Record<string, unknown> | null;
+  aliases?: string[];
+}
+
+export interface JobItem {
+  id: number;
+  op: string;
+  container: string;
+  status: string;
+  attempts?: number;
+  max_attempts?: number;
+  enqueued_at?: number;
+  started_at?: number | null;
+  finished_at?: number | null;
+  result_code?: number | null;
+  last_error?: string | null;
+  label?: string | null;
 }
 
 export interface JobsResponse {
-  jobs: Array<{
-    job_id: string;
-    type: string;
-    container: string;
-    status: string;
-    created_at: number;
-    progress?: number;
-  }>;
+  jobs: JobItem[];
+  stats?: Record<string, number>;
+  worker_running?: boolean;
+}
+
+export interface EmbeddingProfile {
+  name: string;
+  provider: string;
+  model: string;
+  dim: number;
+  api_key_configured?: boolean;
+  request_dim?: number | null;
+}
+
+export interface RerankerProfile {
+  name: string;
+  provider: string;
+  model: string;
+  api_key_configured?: boolean;
+}
+
+export interface RouteConfig {
+  embedding?: string;
+  embedding_fallbacks?: string[];
+  reranker?: string | null;
+  rerank_enabled?: boolean;
+  match?: Record<string, unknown>;
+}
+
+export interface ProfilesResponse {
+  embeddings?: EmbeddingProfile[];
+  rerankers?: RerankerProfile[];
+  routes?: RouteConfig[];
+  default_route?: RouteConfig | null;
 }
 
 export function useHealth(refetchMs = 10_000) {
@@ -119,7 +167,7 @@ export function useJobs(refetchMs = 10_000) {
 }
 
 export function useProfiles() {
-  return useQuery({
+  return useQuery<ProfilesResponse>({
     queryKey: ['profiles'],
     queryFn: () => api.get('/admin/profiles'),
     staleTime: 60_000,

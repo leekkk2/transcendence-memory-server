@@ -1,5 +1,6 @@
 import { Navigate } from 'react-router-dom';
 import type { ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useMe } from '../lib/auth';
 
 /**
@@ -8,12 +9,13 @@ import { useMe } from '../lib/auth';
  * renders a minimal skeleton so the chrome doesn't flicker on cold-loads.
  */
 export function ProtectedRoute({ children }: { children: ReactNode }) {
+  const { t } = useTranslation();
   const { data, isLoading, error } = useMe();
 
   if (isLoading) {
     return (
       <div className="flex h-screen w-screen items-center justify-center">
-        <div className="text-dim font-mono text-sm">loading…</div>
+        <div className="text-dim font-mono text-sm">{t('common.loading')}</div>
       </div>
     );
   }
