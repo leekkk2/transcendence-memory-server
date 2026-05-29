@@ -179,12 +179,17 @@ def test_load_legacy_env_when_no_yaml(monkeypatch, tmp_path):
 
 
 def test_legacy_env_falls_back_to_defaults(monkeypatch):
-    """全空 env 也能起来，使用 hardcoded defaults。"""
+    """全空 env 也能起来，使用 hardcoded defaults.
+
+    2026-05-29: defaults flipped to text-embedding-3-small / 1024 after the
+    EMBEDDING_MODEL drift incident (see workspace
+    docs/decisions/2026-05-29-embedding-model-drift-incident.md).
+    """
     _clear_legacy_env(monkeypatch)
     ps = load_profiles()
     p = ps.embeddings["legacy"]
-    assert p.model == "gemini-embedding-001"
-    assert p.dim == 3072
+    assert p.model == "text-embedding-3-small"
+    assert p.dim == 1024
 
 
 def test_yaml_path_from_env(monkeypatch, tmp_path):
