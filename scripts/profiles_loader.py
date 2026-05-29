@@ -33,8 +33,8 @@ _DEFAULT_TOP_K = 8
 # LLM / VLM 默认值 —— 生成类调用比 embedding 慢得多，timeout / retry 更宽。
 _DEFAULT_LLM_TIMEOUT_S = 180.0
 _DEFAULT_LLM_MAX_RETRIES = 4
-_LEGACY_DEFAULT_MODEL = "gemini-embedding-001"
-_LEGACY_DEFAULT_DIM = 3072
+_LEGACY_DEFAULT_MODEL = "text-embedding-3-small"
+_LEGACY_DEFAULT_DIM = 1024
 _LEGACY_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _LEGACY_DEFAULT_LLM_MODEL = "gemini-2.5-flash"
 # v1：仅 embedding + reranker；v2：新增 llms / vlms 节点与 route 的 LLM/VLM 字段。

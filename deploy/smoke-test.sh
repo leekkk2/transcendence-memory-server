@@ -184,5 +184,52 @@ ME_POST=$(curl -sS -m 10 -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' "$ENDPO
 [ "$ME_POST" = "401" ] || fail "/admin/ui/me post-logout expected 401, got $ME_POST"
 pass "/admin/ui/me post-logout -> 401"
 
+# 12. Existing-container /search dim guard — catches the 2026-05-29 class of bug
+# where EMBEDDING_DIM env drifts from a long-lived container's stored vector dim.
+# Step 6 above uses a freshly created container (smoke-test-<ts>) so its stored
+# vectors always match the current EMBEDDING_DIM by construction — it cannot
+# expose runtime/storage dim drift. Here we pick the largest pre-existing
+# production container and run a benign /search; an RuntimeError on dim mismatch
+# would surface as a 500 with `query dim ... doesn't match column vector dim`.
+info "12. /search against an existing production container (dim drift guard)"
+CONTAINERS_JSON="$(req GET /containers)"
+PROD_CONTAINER="$(echo "$CONTAINERS_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+items = d.get('containers') or d.get('data') or d if isinstance(d, list) else []
+if isinstance(d, dict) and not items:
+    items = list(d.values())[0] if d else []
+candidates = []
+for c in items:
+    name = c if isinstance(c, str) else (c.get('name') or c.get('container') or '')
+    if not name or name.startswith('smoke-test-'):
+        continue
+    candidates.append(name)
+print(candidates[0] if candidates else '')
+" 2>/dev/null)"
+if [ -z "$PROD_CONTAINER" ]; then
+    info "  no pre-existing production container found, skipping dim drift guard"
+else
+    DRIFT_RESP="$(req POST /search "{\"container\":\"$PROD_CONTAINER\",\"query\":\"smoke dim drift guard healthcheck\",\"topk\":1}")"
+    if echo "$DRIFT_RESP" | grep -qiE "query dim|doesn't match.*vector dim|RuntimeError"; then
+        fail "/search against $PROD_CONTAINER hit dim mismatch — EMBEDDING_DIM disagrees with stored vectors: $DRIFT_RESP"
+    fi
+    # Also reject any non-2xx-ish JSON ('detail' or 'error' keys signal trouble).
+    if echo "$DRIFT_RESP" | python3 -c "
+import json,sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)  # non-JSON, let curl status decide
+sys.exit(2 if (d.get('detail') or d.get('error')) else 0)
+" ; then
+        :
+    else
+        rc=$?
+        [ "$rc" = "2" ] && fail "/search against $PROD_CONTAINER returned error payload: $DRIFT_RESP"
+    fi
+    pass "/search against $PROD_CONTAINER reached LanceDB without dim mismatch"
+fi
+
 echo ""
-echo -e "${GREEN}=== all smoke checks passed (11 steps: core + admin/ui) ===${NC}"
+echo -e "${GREEN}=== all smoke checks passed (12 steps: core + admin/ui + dim-drift guard) ===${NC}"
