@@ -231,5 +231,16 @@ sys.exit(2 if (d.get('detail') or d.get('error')) else 0)
     pass "/search against $PROD_CONTAINER reached LanceDB without dim mismatch"
 fi
 
+# 13. Frontend Playwright E2E assertions
+info "13. running frontend Playwright E2E assertions"
+if [ ! -d "$PROJECT_ROOT/dashboard/node_modules/@playwright/test" ]; then
+    info "  installing E2E dependencies in dashboard..."
+    pnpm --prefix "$PROJECT_ROOT/dashboard" install --prod=false
+fi
+TM_TEST_BASE="$ENDPOINT" TM_TEST_API_KEY="$RAG_API_KEY" TM_TEST_CONTAINER="$CONTAINER" \
+  pnpm --prefix "$PROJECT_ROOT/dashboard" exec playwright test || fail "Frontend E2E test failed"
+pass "Frontend E2E assertions passed"
+
 echo ""
-echo -e "${GREEN}=== all smoke checks passed (12 steps: core + admin/ui + dim-drift guard) ===${NC}"
+echo -e "${GREEN}=== all smoke checks passed (13 steps: core + admin/ui + dim-drift guard + frontend E2E) ===${NC}"
+

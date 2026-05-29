@@ -24,6 +24,7 @@
     "tailwind-merge": "2.5.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@tailwindcss/vite": "4.0.0-beta.7",
     "@types/node": "22.9.0",
     "@types/react": "18.3.12",
