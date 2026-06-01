@@ -352,8 +352,9 @@ jobs:
           full_b=$(docker image inspect _ragb:assert  --format '{{.Size}}')
           diff_gb=$(awk -v a="$full_b" -v b="$lite_b" 'BEGIN{printf "%.2f",(a-b)/1024/1024/1024}')
           echo "rag-base-lite=$((lite_b/1024/1024))MB  rag-base=$((full_b/1024/1024))MB  multimodal_diff=${diff_gb}GB"
-          # 断言：lite ≤ 1.2GB；多模态增量 diff 在合理区间（torch+opencv+mineru ~3.5-5.5GB）。
-          # 上界用于捕获"diff 夹带 base 包 churn 导致虚胖"。阈值随依赖演进调。
+          # 断言（DR-048 CPU-torch 后）：lite ≤ 1.2GB；多模态增量 diff 预期 ~1.5GB
+          # （CPU torch ~300M + mineru/raganything/opencv/transformers + mineru cache）。
+          # 上界 3.5GB 用于捕获"CUDA torch 夹带回归"——CUDA 版会把 diff 推到 ~5GB+。
           awk -v l="$lite_b" 'BEGIN{ if (l > 1.2*1024*1024*1024){ print "FAIL: rag-base-lite >1.2GB"; exit 1 } }'
-          awk -v d="$diff_gb" 'BEGIN{ if (d+0 > 6.0){ print "FAIL: multimodal diff >6GB (churn?)"; exit 1 }
-                                       if (d+0 < 2.0){ print "WARN: multimodal diff <2GB (multimodal missing?)" } }'
+          awk -v d="$diff_gb" 'BEGIN{ if (d+0 > 3.5){ print "FAIL: multimodal diff >3.5GB (CUDA torch churn? expected CPU ~1.5GB)"; exit 1 }
+                                       if (d+0 < 0.7){ print "WARN: multimodal diff <0.7GB (multimodal missing?)" } }'
