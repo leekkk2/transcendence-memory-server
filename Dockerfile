@@ -84,15 +84,41 @@ FROM deps AS deps-full
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --constraint constraints.txt ".[multimodal]"
 
-# Always create the cache dir so the downstream COPY succeeds even when the
-# pre-warm step is a no-op (e.g. when mineru's API surface changes).
-# A populated cache makes the first /documents/file response fast; an empty
-# dir is safe — mineru will lazy-download at first use.
-RUN mkdir -p /root/.cache/mineru \
-    && (python -c "from mineru.cli.common import prepare_env; prepare_env()" 2>/dev/null \
-        || python -c "import mineru" 2>/dev/null \
-        || echo "mineru pre-warm skipped — will lazy-download at first use") \
-    && ls -la /root/.cache/mineru
+# -----------------------------------------------------------------------------
+# mineru model BAKE（真下载 + 强校验 · DR-048 离线优先）
+#   背景：mineru 3.2.1 的 `mineru-models-download` 实际把模型写进 *底层 hub 的缓存*
+#         （ModelScope → $MODELSCOPE_CACHE/hub；HF → $HF_HOME/hub），**不是** ~/.cache/mineru。
+#         旧 pre-warm 调用已不存在的 `prepare_env()` → 静默跳过 → /home/tm/.cache/mineru 永远空
+#         → 运行时懒下载（且 hybrid-auto 选 VLM 去拉不可达的 huggingface.co）→ 解析失败。
+#   方案：把两个底层 hub 的缓存根都钉进 /root/.cache/mineru 子目录（下游唯一 COPY 的产物），
+#         真跑 `mineru-models-download -m pipeline`（CPU pipeline 模型，DR-048 本地只跑 pipeline，
+#         VLM/embedding/LLM 走 newapi），优先 ModelScope（容器内国内原生可达）、不通再 hf-mirror
+#         （huggingface.co 容器内 SSL 超时，必须改道 HF_ENDPOINT=https://hf-mirror.com）。
+#   强校验：下载后 cache 必须非空，**空则 build 失败**（exit 1），杜绝静默跳过再退化成懒下载。
+#   注：强校验逻辑 —— ModelScope 与 HF 两个 hub 缓存任一非空即视为成功（whichever source
+#       succeeded）；两者皆空 → 退出码 1，build fail。（说明不可写成 RUN 内联 # 注释：行续
+#       接中夹 # 会让 shell 把后续 && 解析成空命令而语法错。）
+ENV MINERU_DEVICE_MODE=cpu \
+    MINERU_MODEL_SOURCE=modelscope \
+    MODELSCOPE_CACHE=/root/.cache/mineru/modelscope \
+    HF_HOME=/root/.cache/mineru/huggingface \
+    HF_ENDPOINT=https://hf-mirror.com
+RUN mkdir -p /root/.cache/mineru/modelscope /root/.cache/mineru/huggingface \
+    && ( \
+         echo "[mineru-bake] trying ModelScope (pipeline)..." \
+         && MINERU_MODEL_SOURCE=modelscope mineru-models-download -s modelscope -m pipeline \
+       ) \
+    || ( \
+         echo "[mineru-bake] ModelScope failed -> falling back to hf-mirror (pipeline)..." \
+         && MINERU_MODEL_SOURCE=huggingface HF_ENDPOINT=https://hf-mirror.com \
+            mineru-models-download -s huggingface -m pipeline \
+       ) \
+    && if [ -z "$(find /root/.cache/mineru -type f 2>/dev/null | head -n1)" ]; then \
+           echo "MINERU_BAKE_EMPTY: model cache /root/.cache/mineru is empty after download — failing build"; \
+           exit 1; \
+       fi \
+    && echo "[mineru-bake] cache populated ($(find /root/.cache/mineru -type f | wc -l) files, $(du -sh /root/.cache/mineru | cut -f1))" \
+    && find /root/.cache/mineru -maxdepth 3 -type d | head -n 20
 
 # =============================================================================
 # 通用基础层（无业务代码，发布到 ghcr.io/leekkk2/rag-base{,-lite}）
@@ -192,7 +218,10 @@ ARG PYTHON_VERSION
 #         --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 #   · 本仓库 CI 的 publish-rag-base 即以 CPU 变体构建发布到 GHCR 的共享 base（见 ci.yml + DR-048
 #     @ memory-app；prod-host 无 GPU，CUDA torch 在其上 cuda=False 纯浪费且撑大镜像）。
-#   · 版本默认 2.12.0（与现行兼容 mineru[core]>=3.0.9）。GPU 用户也可传 cu 专属 index。
+#   · 版本默认 2.12.0（与现行兼容 mineru[core]>=3.0.9，CPU index 有 2.12.0+cpu wheel）。
+#     GPU 用户也可传 cu 专属 index（如 .../whl/cu124）。
+#   · 指定 index 时变体强制力来自 ①②：torch+torchvision 从该 index 作 PRIMARY 装 + 读出实际
+#     本地版本（+cpu/+cuXXX）回钉约束（仅靠 PIP_EXTRA_INDEX_URL 不足以剔默认 CUDA，详见 ① 注释）。
 ARG TORCH_VERSION=2.12.0
 ARG TORCH_INDEX_URL=
 ENV PIP_NO_CACHE_DIR=1 \
@@ -204,23 +233,83 @@ COPY pyproject.toml constraints.txt ./
 RUN echo "stub for build-time metadata only" > README.md \
     && mkdir -p src/tm_server \
     && echo '__version__ = "0.0.0-build"' > src/tm_server/__init__.py
-# ① 若显式指定了 torch index（如 CPU wheel），先装好 torch 锁住变体；否则跳过，
-#    让 ② 的 .[multimodal] 走常规 PyPI 解析（默认 CUDA，OSS 直觉行为）。
+# ① 若显式指定了 torch index（CPU 或 cu* GPU wheel），先把【整个 torch 生态】
+#    (torch+torchvision) 从该 index 作为 PRIMARY (--index-url) 装好，并落一份精确
+#    本地版本约束文件 torch-pin.txt（钉到实际装上的 +cpu/+cuXXX 本地版本）。
+#    否则（默认）写空约束文件 + 跳过预装，让 ② 的 .[multimodal] 走常规 PyPI 解析（CUDA，OSS 直觉）。
+#
+#   为什么必须 --index-url(primary) + 本地版本约束、而非仅 PIP_EXTRA_INDEX_URL(extra)：
+#     · 同一版本 (torch 2.12.0 / torchvision) 在 PyPI(CUDA build) 与 pytorch 专属 index 都存在；
+#       extra-index 只是「补充候选」，pip 对同版本不保证优先选专属 index，常落到 PyPI 的 CUDA
+#       wheel → 拽入 nvidia_cudnn_cu13 等 ~4GB CUDA 库（本次 bug 根因）。
+#     · 仅在 ① 预装 torch 也不够：torchvision 在 mineru[pipeline] 里【无版本约束】，② 仍会把它
+#       新解析成 CUDA wheel。故 ① 必须连 torchvision 一起从指定 index 装。
+#     · 本地版本（+cpu / +cu124 …）是 PEP 440 local-version 标识，只在对应 pytorch index 有 wheel；
+#       从实际装上的 torch/torchvision 读出本地版本回钉 → pip 永远只能解析到该变体，二次解析无法漂移。
+#       不在此硬编码 +cpu —— 否则传 cu* GPU index 时会找不到 `+cpu` wheel 而构建失败（见 onboarding §3
+#       cu124 用例）。该约束仅写进 build-time 文件、不污染仓库 constraints.txt（后者由默认 GPU 的
+#       deps/deps-full 共用，必须保持 GPU 友好）。
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "${TORCH_INDEX_URL}" ]; then \
-        pip install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}"; \
+        pip install --index-url "${TORCH_INDEX_URL}" \
+            "torch==${TORCH_VERSION}" torchvision; \
+        T_VER="$(python -c 'import torch; print(torch.__version__)')"; \
+        TV_VER="$(python -c 'import torchvision; print(torchvision.__version__)')"; \
+        { echo "torch==${T_VER}"; echo "torchvision==${TV_VER}"; } > torch-pin.txt; \
+    else \
+        : > torch-pin.txt; \
     fi
-# ② 装多模态（raganything + mineru[core]）；若 ① 预装了 CPU torch，extra-index 保证
-#    任何 torch 二次解析仍走该变体，不夹带 CUDA churn（体积断言 §4.2 兜底）。
+# ② 装多模态（raganything + mineru[core]）。叠加 torch-pin.txt 第二份约束：指定 index 变体下
+#    钉死 torch/torchvision 为实际装上的本地版本（+cpu / +cuXXX），阻止 .[multimodal] 把它们重解析
+#    成默认 PyPI CUDA build；默认（空 index）变体下 torch-pin.txt 为空文件、无副作用。
+#    PIP_EXTRA_INDEX_URL 保留以让该变体 wheel 可达（兜底）。
 RUN --mount=type=cache,target=/root/.cache/pip \
     PIP_EXTRA_INDEX_URL="${TORCH_INDEX_URL}" \
-    pip install --constraint constraints.txt ".[multimodal]"
+    pip install --constraint constraints.txt --constraint torch-pin.txt ".[multimodal]"
 # 清掉 build stub，避免污染 base（base 必须无业务代码痕迹）。
 RUN rm -rf /build
 
 # mineru pre-warm cache —— 唯一仍从 deps-full COPY 的产物。放进 base 的 tm 用户家目录，
-# --chown 到 tm 以便非特权运行用户可读。这是 ~数百 MB 的模型缓存，属于"重底座"的一部分。
+# --chown 到 tm 以便非特权运行用户可读。这是已烤好的 pipeline 模型缓存（含 ModelScope/HF
+# 两个 hub 缓存子目录），属于"重底座"的一部分。deps-full 已强校验非空，故此处 COPY 必非空。
 COPY --from=deps-full --chown=tm:tm /root/.cache/mineru /home/tm/.cache/mineru
+
+# 生成 mineru 本地模型注册表 /home/tm/mineru.json（纯离线解析的关键一步）。
+#   背景（2026-06-02 `--network none` 实测纠正了原 modelscope 假设）：
+#   MINERU_MODEL_SOURCE=modelscope 运行时**无视已存在缓存、仍调 ms_snapshot_download 去 ping
+#   www.modelscope.cn hub API 校验** → 离线必失败（NameResolutionError）。唯一纯离线路径是
+#   MINERU_MODEL_SOURCE=local：mineru 读 MINERU_TOOLS_CONFIG_JSON 指向的 mineru.json 里
+#   models-dir.pipeline 直接取本地模型根、完全不联网
+#   （见 mineru/utils/models_download_utils.py:auto_download_and_get_model_root_path 的 'local' 分支）。
+#   官方 mineru-models-download 下载后本会调 configure_model 写 $HOME/mineru.json，但 bake 以 root 跑
+#   写到 /root/mineru.json，未被上面的 COPY（只搬 .cache/mineru）带走、且路径是 /root 而非 /home/tm，
+#   故必须在此按运行时真实路径重新生成。
+#   FINAL repo root 取 OpenDataLab/PDF-Extract-Kit*（**排除 modelscope 下载暂存空壳 ._____temp/**——
+#   实测它是 0 字节空目录，误指会让 unimernet config 缺失而解析失败）；强校验 unimernet config 存在，
+#   缺失即 build 失败（杜绝指向空目录的隐性 regression）。
+RUN PIPE_ROOT="$(find /home/tm/.cache/mineru/modelscope -type d -name 'PDF-Extract-Kit*' -not -path '*._____temp*' | head -n1)" \
+    && if [ -z "$PIPE_ROOT" ] || [ ! -f "$PIPE_ROOT/models/MFR/unimernet_hf_small_2503/config.json" ]; then \
+           echo "MINERU_LOCAL_ROOT_NOT_FOUND: pipeline 模型根或 unimernet config 缺失（PIPE_ROOT='$PIPE_ROOT'）— failing build"; \
+           exit 1; \
+       fi \
+    && printf '{\n  "models-dir": {\n    "pipeline": "%s"\n  }\n}\n' "$PIPE_ROOT" > /home/tm/mineru.json \
+    && chown tm:tm /home/tm/mineru.json \
+    && echo "[mineru-local-config] /home/tm/mineru.json -> pipeline=$PIPE_ROOT" \
+    && cat /home/tm/mineru.json
+
+# 运行时强制 CPU + pipeline 后端 + 纯离线本地模型（DR-048：本地只跑 pipeline 解析，
+# VLM/embedding/LLM 仍走 newapi，不本地化大模型）。所有 FROM rag-base 的服务（tm-full /
+# memory-app full）统一继承，无需各自重复声明：
+#   · MINERU_DEVICE_MODE=cpu        —— 关掉 cuda/mps/npu 探测，恒走 CPU pipeline。
+#   · MINERU_MODEL_SOURCE=local     —— 走本地模型注册表，运行时**不 ping 任何 hub**（纯离线，`--network none` 实测 exit 0、OCR 真出文本）。
+#   · MINERU_TOOLS_CONFIG_JSON      —— 绝对路径显式指向上面生成的 mineru.json（不依赖运行用户 $HOME）。
+#   · MODELSCOPE_CACHE / HF_HOME / HF_ENDPOINT —— 仅作万一回退到 hub 代码路径时的兜底（local 模式下不触发）。
+ENV MINERU_DEVICE_MODE=cpu \
+    MINERU_MODEL_SOURCE=local \
+    MINERU_TOOLS_CONFIG_JSON=/home/tm/mineru.json \
+    MODELSCOPE_CACHE=/home/tm/.cache/mineru/modelscope \
+    HF_HOME=/home/tm/.cache/mineru/huggingface \
+    HF_ENDPOINT=https://hf-mirror.com
 
 # =============================================================================
 # 各服务最终镜像 = base + 业务 diff（本仓库 tm-server）
