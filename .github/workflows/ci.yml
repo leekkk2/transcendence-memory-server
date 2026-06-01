@@ -28,6 +28,9 @@ jobs:
   docker-validate:
     needs: test
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: read           # ← 读 GHCR 上 publish-rag-base 烤好的 registry buildcache
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +56,16 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
       - uses: docker/setup-buildx-action@v3
+      # 登录 GHCR 以读 publish-rag-base 烤好的 registry buildcache（rag-base{,-lite}
+      # = deps-full 重活所在）。fork 上无 GITHUB_TOKEN packages 权限时该步会失败 →
+      # continue-on-error 让其降级为“只用 gha 薄缓存”，不阻断 fork CI。
+      - name: Log in to GHCR (read buildcache)
+        uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build ${{ matrix.flavor }} image (${{ matrix.platform }})
         uses: docker/build-push-action@v5
         with:
@@ -61,14 +74,24 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: false
           load: false
-          # Share cache with publish-docker so it warm-starts off this build.
-          # cache-to is mode=max so all intermediate layers (including ui-builder
-          # and deps-full) land in the gha cache — not just the final stage.
-          cache-from: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }},mode=max
+          # 多源 cache-from：先吃 publish-rag-base 在 GHCR 上烤好的 deps-full 重层
+          # （multimodal+mineru，跨 run 持久、无 10GB 上限），命中即跳过 ~70min 重活；
+          # 再叠加本服务自己的 gha 薄层缓存（代码/UI 层，易变、量小、适合 gha）。
+          # tm-full→rag-base 两个 target 都列进来，让 lite/full 各取所需。
+          cache-from: |
+            type=registry,ref=ghcr.io/leekkk2/rag-base:buildcache-rag-base
+            type=registry,ref=ghcr.io/leekkk2/rag-base:buildcache-rag-base-lite
+            type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }}
+          # 仅把易变薄层写回 gha（mode=min）；重底座层由 publish-rag-base 经 registry
+          # 持久，不再往 gha 塞 mode=max 大层（那正是撞 10GB 被驱逐、引发重烤的根因）。
+          cache-to: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }},mode=min
           build-args: |
             TM_VERSION=${{ github.sha }}
             TM_SOURCE_REV=${{ github.sha }}
+            # 必须与 publish-rag-base 同传 CPU torch index：rag-base 的多模态/torch RUN 层
+            # cache key 含 TORCH_INDEX_URL，不传则走 Dockerfile 默认空值(CUDA) → 与 GHCR 上
+            # 烤好的 CPU base 层 cache key 不一致 → 重层 cache MISS、重跑 ~40min pip install。
+            TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
   build-release-assets:
     needs: test
@@ -134,6 +157,9 @@ jobs:
     needs: [test, docker-validate]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: read           # ← 读 GHCR 上 publish-rag-base 烤好的 registry buildcache
     strategy:
       fail-fast: false
       # Per-platform matrix: each (flavor × platform) gets its own runner so
@@ -175,6 +201,14 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # 额外登录 GHCR 仅为读 publish-rag-base 的 registry buildcache（推送目标仍是
+      # Docker Hub，见下方 outputs）。tag push 场景 GITHUB_TOKEN 必有 packages:read。
+      - name: Log in to GHCR (read buildcache)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v5
@@ -190,11 +224,22 @@ jobs:
           build-args: |
             TM_VERSION=${{ github.ref_name }}
             TM_SOURCE_REV=${{ github.sha }}
-          # Same cache scope as docker-validate (which writes mode=max). This
-          # job is effectively a re-execution with push enabled — the build
-          # graph should be a near-total cache hit.
-          cache-from: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }},mode=max
+            # 必须与 publish-rag-base 同传 CPU torch index（理由同 docker-validate）：否则
+            # rag-base 多模态/torch 重层 cache key 不匹配 → MISS、重跑 5GB CUDA pip install，
+            # 既丢提速又让发布镜像偏离已发布的 CPU base。
+            TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+          # 多源 cache-from（同 docker-validate 策略）：先吃 publish-rag-base 在 GHCR 上
+          # 烤好的 deps-full 重层（跨 run 持久），再叠加本 (flavor×arch) 的 gha 薄层
+          # （docker-validate 已写过，本 job 等同带 push 的重放，应近全量命中）。
+          # publish-rag-base 与本 job 同属 tag-push 触发；同一 tag 内 base job 先跑完
+          # 把重层推上 GHCR，本 job 即命中，无需重跑 pip install / mineru download。
+          cache-from: |
+            type=registry,ref=ghcr.io/leekkk2/rag-base:buildcache-rag-base
+            type=registry,ref=ghcr.io/leekkk2/rag-base:buildcache-rag-base-lite
+            type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }}
+          # 重底座层经 registry 持久；这里只回写易变薄层到 gha（mode=min），避免大层
+          # 再次撞 10GB 上限被 LRU 驱逐。
+          cache-to: type=gha,scope=${{ matrix.flavor }}-${{ matrix.arch }},mode=min
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
@@ -296,6 +341,10 @@ jobs:
       RAG_BASE_VERSION: "1.3-py3.13"
       RAG_BASE_REPO: ghcr.io/leekkk2/rag-base
       RAG_BASE_LITE_REPO: ghcr.io/leekkk2/rag-base-lite
+      # 跨 run 持久层缓存的 GHCR 后端（registry cache）。base 是 deps-full 重活
+      # (multimodal ~5GB + mineru 2.4G) 的唯一“写”方，故由本 job 当缓存生产者。
+      # 与发布镜像 tag 分库（:buildcache-rag-base{,-lite}），互不污染。
+      RAG_BASE_CACHE_REPO: ghcr.io/leekkk2/rag-base
     strategy:
       fail-fast: false
       matrix:
@@ -333,9 +382,19 @@ jobs:
           push: true
           tags: |
             ${{ env[matrix.repo_var] }}:${{ env.RAG_BASE_VERSION }}
-          # base 层用独立 cache scope，与服务镜像 cache 隔离。
-          cache-from: type=gha,scope=ragbase-${{ matrix.target }}
-          cache-to: type=gha,scope=ragbase-${{ matrix.target }},mode=max
+          # ── 跨 run 持久层缓存（根治 deps-full 重烤）────────────────────────────
+          # Registry cache 是这里的“真后端”：GHCR blob 无 GHA 的 10GB/repo 硬限、不被
+          # LRU 驱逐、跨 job/跨 repo（含 memory-app fork）可共享。mode=max 把所有中间层
+          # （deps→deps-full 的 multimodal pip install 层 + mineru bake 2.4G 层 + rag-base
+          # 的 pip 增量层）都导出成层缓存，下游 docker-validate/publish-docker 直接命中、
+          # 无需再跑 40min pip install / 30min mineru download。
+          # gha 仅作同 repo 内的二级 best-effort 命中（薄层），大层靠 registry 兜底。
+          cache-from: |
+            type=registry,ref=${{ env.RAG_BASE_CACHE_REPO }}:buildcache-${{ matrix.target }}
+            type=gha,scope=ragbase-${{ matrix.target }}
+          cache-to: |
+            type=registry,ref=${{ env.RAG_BASE_CACHE_REPO }}:buildcache-${{ matrix.target }},mode=max,image-manifest=true,oci-mediatypes=true
+            type=gha,scope=ragbase-${{ matrix.target }},mode=max
           build-args: |
             TM_VERSION=${{ github.ref_name }}
             TM_SOURCE_REV=${{ github.sha }}
