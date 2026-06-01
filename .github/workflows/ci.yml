@@ -339,6 +339,7 @@ jobs:
           build-args: |
             TM_VERSION=${{ github.ref_name }}
             TM_SOURCE_REV=${{ github.sha }}
+            TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
       # docker-history 体积断言（Phase 1 必做门禁，见目标 spec §4.2）：确认多模态 diff
       # 纯增量、未被 numpy/pyarrow churn 打折。仅 rag-base target 跑（需对比 lite vs full）。
       - name: Assert rag-base diff stays incremental
@@ -346,8 +347,10 @@ jobs:
         run: |
           set -euo pipefail
           # 本地各建一个用于体积比对（同 job 内 buildx 本地层缓存命中，开销小）。
+          # rag-base 传与发布同款 CPU torch build-arg，确保断言测的是发布的 CPU 变体。
+          TORCH_CPU=https://download.pytorch.org/whl/cpu
           docker build --target rag-base-lite -t _ragbl:assert --load .
-          docker build --target rag-base      -t _ragb:assert  --load .
+          docker build --target rag-base --build-arg TORCH_INDEX_URL=$TORCH_CPU -t _ragb:assert --load .
           lite_b=$(docker image inspect _ragbl:assert --format '{{.Size}}')
           full_b=$(docker image inspect _ragb:assert  --format '{{.Size}}')
           diff_gb=$(awk -v a="$full_b" -v b="$lite_b" 'BEGIN{printf "%.2f",(a-b)/1024/1024/1024}')

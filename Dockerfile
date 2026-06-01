@@ -183,13 +183,18 @@ COPY --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 # -----------------------------------------------------------------------------
 FROM rag-base-lite AS rag-base
 ARG PYTHON_VERSION
-# torch 变体（DR-048 · prod-host 实测无 GPU）：默认装 CPU wheel，剔除 ~4GB CUDA 库
-# （nvidia-cuda-* + triton），mineru CPU 模式能力零损失。CUDA 版 torch 在无 GPU 主机上
-# `cuda available=False`，那 ~4GB 纯浪费且把 6.23GB 镜像撑大、加剧 prod-host 94% 盘压力。
-# GPU 部署可 build-arg 覆盖 TORCH_INDEX_URL（如 https://download.pytorch.org/whl/cu130）。
-# 版本钉到 mineru[core]>=3.0.9 兼容的 2.12.0（prod-host 现行同版本，仅变体由 cu130 → cpu）。
+# torch 变体（OSS 可配置，默认不改变常规行为）：
+#   · 默认 TORCH_INDEX_URL 为空 → 走 PyPI 常规解析（linux 即 CUDA 版），GPU 用户开箱即用，
+#     与升级前行为一致，不给开源用户意外。
+#   · 资源受限 / 无 GPU 主机可显式 opt-in CPU wheel，剔除 ~4GB CUDA 库（nvidia-*/triton），
+#     mineru CPU 模式能力零损失：
+#       docker build --target tm-full \
+#         --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+#   · 本仓库 CI 的 publish-rag-base 即以 CPU 变体构建发布到 GHCR 的共享 base（见 ci.yml + DR-048
+#     @ memory-app；prod-host 无 GPU，CUDA torch 在其上 cuda=False 纯浪费且撑大镜像）。
+#   · 版本默认 2.12.0（与现行兼容 mineru[core]>=3.0.9）。GPU 用户也可传 cu 专属 index。
 ARG TORCH_VERSION=2.12.0
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_INDEX_URL=
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
@@ -199,14 +204,16 @@ COPY pyproject.toml constraints.txt ./
 RUN echo "stub for build-time metadata only" > README.md \
     && mkdir -p src/tm_server \
     && echo '__version__ = "0.0.0-build"' > src/tm_server/__init__.py
-# ① 先从指定 index 装好 torch（默认 CPU wheel），锁住变体。这样 .[multimodal] 解析时
-#    torch 已满足，pip 不会从 PyPI 默认拉 CUDA 版（PyPI linux torch 默认带 CUDA）。
+# ① 若显式指定了 torch index（如 CPU wheel），先装好 torch 锁住变体；否则跳过，
+#    让 ② 的 .[multimodal] 走常规 PyPI 解析（默认 CUDA，OSS 直觉行为）。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --index-url ${TORCH_INDEX_URL} "torch==${TORCH_VERSION}"
-# ② 再装多模态（raganything + mineru[core]）；保留 torch index 作 extra-index，
-#    确保任何 torch 二次解析仍走 CPU 变体，不夹带 CUDA churn（体积断言 §4.2 兜底）。
+    if [ -n "${TORCH_INDEX_URL}" ]; then \
+        pip install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}"; \
+    fi
+# ② 装多模态（raganything + mineru[core]）；若 ① 预装了 CPU torch，extra-index 保证
+#    任何 torch 二次解析仍走该变体，不夹带 CUDA churn（体积断言 §4.2 兜底）。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    PIP_EXTRA_INDEX_URL=${TORCH_INDEX_URL} \
+    PIP_EXTRA_INDEX_URL="${TORCH_INDEX_URL}" \
     pip install --constraint constraints.txt ".[multimodal]"
 # 清掉 build stub，避免污染 base（base 必须无业务代码痕迹）。
 RUN rm -rf /build
