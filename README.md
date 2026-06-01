@@ -129,6 +129,16 @@ BUILD_TARGET=full docker compose up -d --build
 
 `/health` reports the active `build_flavor`, whether the runtime is `multimodal_capable`, and any `degraded_reasons`.
 
+### Shared base image (rag-base)
+
+The Docker build is layered so the heavy multimodal dependencies (`torch` /
+`mineru` / `opencv` + model cache, ~5 GB) live in a service-agnostic,
+publicly published base image — `ghcr.io/leekkk2/rag-base` — and each service
+image is just `base + a thin code diff`. If you want to build your own RAG
+service on top of the same base, tune the `torch` variant for **CPU vs GPU**
+hosts, or self-build the whole chain without pulling anything, see the
+[**rag-base onboarding guide**](docs/architecture/rag-base-onboarding.md).
+
 ## Platform Support
 
  - **Python package** — CI currently validates `Linux` and `Windows` on Python `3.11`, `3.12`, `3.13`
@@ -364,6 +374,7 @@ instead of silently re-trusting. The full design is in [`.github/workflows/deplo
 ## Documentation
 
 - [Quick Start](docs/deployment/quickstart.md)
+- [Shared base image (rag-base) onboarding](docs/architecture/rag-base-onboarding.md)
 - [Docker Deployment](docs/deployment/docker-deployment.md)
 - [Reverse Proxy](docs/deployment/reverse-proxy.md)
 - [Environment Reference](docs/deployment/environment-reference.md)
