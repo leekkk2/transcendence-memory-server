@@ -1,0 +1,121 @@
+# ============================================================================
+# 草案模板 · 套用前请按目标部署主机审阅 · 勿直接用于生产
+# ----------------------------------------------------------------------------
+# Blue/Green PARALLEL-INSTANCE 模板 —— 与线上 prod(rags.example.com) 并存，
+# 不动旧 container / 旧端口(8711) / 旧 volume(tm-data)，零中断验证新镜像。
+#
+# 设计意图（与 RUNBOOK_TM_SERVER_BLUEGREEN_CUTOVER.md 配套）：
+#   * GREEN(candidate) = 本文件起的新实例：新 project name + 新 container 名 +
+#     新端口(8788) + 新临时域名(rags-canary.example.com) + 独立 volume。
+#   * BLUE(prod)       = 现网 docker-compose.yml 起的 rag-server，原样不动。
+#   * 复用 rag-base 镜像层(GREEN 拉的 candidate tag 与 prod 共享 base 层，
+#     不额外占 ~5GB)。
+#
+# 起停方式（在部署主机的部署目录，独立 project name 隔离，绝不复用 prod project）：
+#   docker compose -p tmgreen \
+#     -f docker-compose.bluegreen.example.yml --env-file .env.green up -d
+#   docker compose -p tmgreen -f docker-compose.bluegreen.example.yml down
+# 切勿省略 `-p tmgreen` —— 省了会并入默认 project(transcendence-memory-server)
+# 触发 prod 容器/卷的 recreate，破坏「零中断」前提。
+#
+# 凭证体系：混合(工具链私用) —— LLM/embedding/VLM 一律走 newapi.example.com/v1
+# (HR-9 / DR-048)，RAG_API_KEY 等真值只放 gitignored .env.green，本文件不含真值。
+# ============================================================================
+
+services:
+  rag-server-green:
+    # GREEN 镜像 = 待验证 candidate tag（如 :0.18.0-full）。
+    # 与 prod 共享 rag-base 层 → docker pull 仅拉薄业务 diff 层。
+    image: ${TM_GREEN_IMAGE:?set TM_GREEN_IMAGE in .env.green, e.g. docker.io/<ns>/transcendence-memory-server:0.18.0-full}
+    # 远端只 pull 不 build（R1/R5）；recreate 用 --pull never，此处保持
+    # missing 以便首次 up 自动拉一次，cutover SOP 里改走显式 pull。
+    pull_policy: missing
+    container_name: tm-rag-server-green
+    ports:
+      # 新端口 8788，仍仅绑 127.0.0.1（外部经 nginx + Cloudflare Tunnel 接入）。
+      - "127.0.0.1:${TM_GREEN_PORT:-8788}:8711"
+    volumes:
+      # ── 数据隔离策略（二选一，默认 A，见 runbook §3.3）──────────────────
+      # 策略 A · 独立空 volume（默认 · 最安全）：
+      #   GREEN 用全新独立卷 tm-data-green，与 prod tm-data 物理隔离。
+      #   验证时灌入「备份恢复的只读副本」或专用 canary 容器数据，
+      #   绝不与 prod 共享可写卷 → prod 数据零风险。
+      - tm-data-green:/data
+      - mineru-models-green:/home/tm/.cache/mineru
+      #
+      # 策略 B · 只读挂 prod 同卷（仅当需对真实数据做只读回归且 founder 批准）：
+      #   - tm-data:/data:ro                     # prod 卷只读挂入，禁止任何写
+      #   - mineru-models-green:/home/tm/.cache/mineru
+      #   风险：tm-server 启动/索引路径可能尝试写 /data → read_only 卷会
+      #   报错或退化；且 LanceDB 并发读写一致性无保证。策略 B 仅做「只读
+      #   search 回归」，严禁让 GREEN 接受 ingest。生产数据零写入由 :ro 兜底。
+    env_file:
+      - path: .env.green
+        required: true
+    environment:
+      WORKSPACE: /data
+      # 临时域名对外回显（/health、signed-url 等用），指向 canary 域。
+      RAG_ADVERTISED_ENDPOINT: ${TM_GREEN_ADVERTISED:-https://rags-canary.example.com}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # 资源上限独立于 prod，避免 GREEN 抢占拖垮 BLUE。按部署主机实际余量保守取值。
+    mem_limit: ${TM_GREEN_MEM_LIMIT:-3g}
+    memswap_limit: ${TM_GREEN_MEM_LIMIT:-3g}
+    mem_reservation: ${TM_GREEN_MEM_RESERVATION:-1g}
+    cpus: ${TM_GREEN_CPUS:-1.5}
+    pids_limit: ${TM_GREEN_PIDS_LIMIT:-256}
+    oom_score_adj: ${TM_GREEN_OOM_SCORE_ADJ:-800}  # 比 prod(500) 更易被 OOM 牺牲，保 BLUE
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /home/tm/.cache:size=256m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "/app/scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── 可选 · GREEN 专属 proactive-worker（仅策略 A 独立卷下启用）─────────────
+  # prod COLD embed_job 由 BLUE 侧 worker drain；GREEN 验证异步链路时按需起
+  # 独立 worker，drain GREEN 自己卷里的 job，绝不连 prod 卷。默认注释关闭。
+  #
+  # rag-worker-green:
+  #   image: ${TM_GREEN_IMAGE}
+  #   pull_policy: missing
+  #   container_name: tm-rag-worker-green
+  #   command: ["python", "-m", "scripts.job_worker"]
+  #   env_file:
+  #     - path: .env.green
+  #       required: true
+  #   environment:
+  #     WORKSPACE: /data
+  #   volumes:
+  #     - tm-data-green:/data            # 与 rag-server-green 同卷，否则读不到入库 job
+  #     - mineru-models-green:/home/tm/.cache/mineru
+  #   restart: unless-stopped
+  #   mem_limit: ${TM_GREEN_WORKER_MEM_LIMIT:-2g}
+  #   memswap_limit: ${TM_GREEN_WORKER_MEM_LIMIT:-2g}
+  #   read_only: true
+  #   tmpfs:
+  #     - /tmp:size=128m,mode=1777
+  #     - /home/tm/.cache:size=256m
+  #   security_opt:
+  #     - no-new-privileges:true
+
+volumes:
+  # GREEN 专属卷 —— 与 prod tm-data / mineru-models 完全独立，cutover 决策前
+  # 可随时 `docker volume rm tm-data-green` 而不触碰生产数据。
+  tm-data-green:
+  mineru-models-green:
+  # 注意：本文件**不声明** prod 的 tm-data / mineru-models。若用策略 B 只读挂
+  # prod 卷，需改用 external 引用现网卷（见 runbook §3.3），切勿在此重新声明
+  # 同名卷 —— 同名重声明 + 不同 project 会创建出 <project>_tm-data 新卷，
+  # 既挂不到真实生产数据，又可能误导后续清理。
