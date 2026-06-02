@@ -13,7 +13,7 @@
 | 消费方 | tm-server（本仓库，OSS）+ memory-app-server（私有派生）+ 未来服务 |
 | 不在本次范围 | 共享代码包抽取（18 个共同 `.py` 的 DRY）——留作独立阶段 |
 
-**目标**：两个服务都要 full（各自本地 mineru 解析），那 ~5GB 多模态重依赖**在 prod-host 上只存一份**（Docker 层去重），而非每个 full 各占一份；同时 OSS 仓库保持自包含。
+**目标**：两个服务都要 full（各自本地 mineru 解析），那 ~5GB 多模态重依赖**在部署主机上只存一份**（Docker 层去重），而非每个 full 各占一份；同时 OSS 仓库保持自包含。
 
 ## 1. 现状问题（当前 `Dockerfile`）
 
@@ -89,7 +89,7 @@ tm-full        = FROM rag-base      + COPY scripts/ src/ + ui + app ENV/EXPOSE/H
 - base/diff 版本偏移：消费侧 pin 精确 tag；base 升级走 release + 通知两服务重建。
 - 多模态 diff 夹带 churn：靠 `constraints.txt` 锁版本；CI 加 `docker history` 体积断言。
 - 回滚：保留旧 `transcendence-memory-server:<ver>-full`（自包含整镜像）；切回旧 Dockerfile 即恢复原构建。
-- prod-host 实施按 `--pull never` 铁律 + 先清磁盘（见消费侧 spec §C）。
+- 生产部署主机实施按 `--pull never` 铁律 + 先清磁盘（见消费侧 spec §C）。
 
 ## 9. 与并行路线（mvp-scaffold §89 parser-as-a-service）的关系
 

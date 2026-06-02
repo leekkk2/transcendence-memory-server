@@ -28,7 +28,7 @@
 - 触发:`v*` tag push(与服务发版同批,见 §4)。
 - 产物:`ghcr.io/leekkk2/rag-base:<RAG_BASE_VERSION>` + `ghcr.io/leekkk2/rag-base-lite:<RAG_BASE_VERSION>`,多 arch(amd64+arm64)。
 - 权限:job 级 `permissions: packages: write` + `GITHUB_TOKEN`,**无需额外 secret**。
-- torch 变体:CI 构建发布的 base 用 **CPU wheel**(`--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu`),因部署主机(prod-host)无 GPU,剔除 ~4GB CUDA 库(见 DR-048 @ memory-app)。OSS 用户自建默认走常规(GPU 友好),详 onboarding §3。
+- torch 变体:CI 构建发布的 base 用 **CPU wheel**(`--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu`),适用于无 GPU 的部署主机,剔除 ~4GB CUDA 库。OSS 用户自建默认走常规(GPU 友好),详 onboarding §3。
 - 门禁:`docker history` 体积断言(多模态 diff 预期 ~1.5GB,>3.5GB = CUDA 回归 → CI 红),保证去重收益不被 churn 打折。
 
 ### 2.2 首次发布一次性手动步骤
@@ -62,9 +62,9 @@ RUN pip install --no-cache-dir .   # 只装 base 缺的本服务专属依赖 + �
 当 `tm-full` 与 `memory-app:full` 都 `FROM` 同一 `rag-base:1.3-py3.13`:
 - 两者引用**同一 base layer digest** → 本地 overlay2 只存一份那 ~2GB(CPU 变体)/~5GB(GPU 变体)。
 - 各自只新增**薄代码层**(MB 级)。
-- 无 base 时 2 服务 ≈ 2×镜像全量;有共享 base ≈ 1×base + 2×薄 diff。**prod-host 实测净省 ~4-5GB**。
+- 无 base 时 2 服务 ≈ 2×镜像全量;有共享 base ≈ 1×base + 2×薄 diff。**实测净省 ~4-5GB**。
 
-验证(prod-host):
+验证:
 ```bash
 docker system df -v | grep -E "rag-base|memory-app|transcendence"   # base 层 Shared，不翻倍
 docker image inspect memory-app-server:full --format '{{json .RootFS.Layers}}'  # 前 N 层 digest 与 rag-base 一致

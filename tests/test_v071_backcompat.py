@@ -104,7 +104,7 @@ def test_legacy_uses_hardcoded_defaults_when_env_empty(monkeypatch):
 
     2026-05-29 incident: prior defaults gemini-embedding-001 / 3072 caused
     silent dim drift when production .env got reset; new defaults align with
-    the dominant production embedding (sanva / example-org etc.). See workspace
+    the dominant production embedding (e.g. example-container etc.). See workspace
     docs/decisions/2026-05-29-embedding-model-drift-incident.md.
     """
     _clear_all(monkeypatch)

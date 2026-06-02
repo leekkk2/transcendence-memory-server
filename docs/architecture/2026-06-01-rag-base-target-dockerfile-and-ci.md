@@ -137,7 +137,7 @@ RUN mkdir -p /root/.cache/mineru \
 #             ENTRYPOINT，以及 tm-server 专属的 OCI LABEL。
 #   为何：base 必须服务无关（service-agnostic）。剥离业务代码后，memory-app-server
 #         及未来 RAG 服务都能 `FROM ghcr.io/leekkk2/rag-base` 直接复用同一份重底座，
-#         prod-host 上 Docker 层去重 → ~5GB 只存一份。app 配置全部下沉到各服务的 tm-* 阶段。
+#         部署主机上 Docker 层去重 → ~5GB 只存一份。app 配置全部下沉到各服务的 tm-* 阶段。
 # -----------------------------------------------------------------------------
 FROM ${PYTHON_IMAGE} AS rag-sys-base
 ARG PYTHON_VERSION
@@ -292,7 +292,7 @@ ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 #             ② 不再 COPY deps-full 整个 site-packages、不再 COPY mineru cache
 #             （都已在 rag-base）；③ app 配置下沉至此；④ 仅薄代码层。
 #   为何：tm-full = rag-base + 薄 diff —— 与 tm-lite 共享 rag-base-lite 底座，与 base
-#         共享多模态层，prod-host 上不再为每个 full 各存一份 ~5GB。start-period 给足 full
+#         共享多模态层，部署主机上不再为每个 full 各存一份 ~5GB。start-period 给足 full
 #         冷启动（mineru import + lightrag init）。
 # -----------------------------------------------------------------------------
 FROM rag-base AS tm-full
@@ -557,10 +557,10 @@ docker rm -f tm-full-smoke
 
 - **base/diff 版本偏移**：消费侧（memory-app）pin 精确 `rag-base:1.3-py3.13`；base 升级走 release + 通知两服务重建。本仓库自身因 `publish-docker` 自建服务镜像，不受 GHCR base tag 影响。
 - **回滚**：保留旧 `transcendence-memory-server:<ver>-full`（自包含整镜像，可直接 `docker pull` 回退）；或 `git revert` 本 Dockerfile 改动恢复旧 `runtime-base`/`lite`/`full` 结构。
-- **prod-host 实施铁律**（部署消费侧时务必守，见主 spec §8 + 消费侧 spec §C）：
-  - 拉/建多 GB 镜像前先清磁盘（`docker image prune` + 旧 image/backup 迁 rclone），prod-host 当前 ~94% 占用。
-  - env/镜像变更 recreate 一律 `docker compose up -d --force-recreate --pull never`（防 `TM_IMAGE` tag 漂移去拉 GB 镜像撑爆盘）。
-  - recreate 前 `docker inspect <c> --format '{{.Config.Image}}'` 对比 compose 声明 tag，不一致先对齐（0.17.2 vs 0.17.3 撑爆盘教训）。
-  - 重建后核 `getent hosts new-api`（app 容器须能解析 new-api；prod-host 有 `~/bin/ensure-newapi-networks.sh` + 5min cron 自愈）。
-  - 本次镜像升级**不动 newapi key**（memory-app/tm-server 已用 prod-memory-app/prod-tm token）。
+- **部署主机实施铁律**（部署消费侧时务必守，见主 spec §8 + 消费侧 spec §C）：
+  - 拉/建多 GB 镜像前先清磁盘（`docker image prune` + 旧 image/backup 归档外移），尤其磁盘高位的主机。
+  - env/镜像变更 recreate 一律 `docker compose up -d --force-recreate --pull never`（防镜像 tag 漂移去拉 GB 镜像撑爆盘）。
+  - recreate 前 `docker inspect <c> --format '{{.Config.Image}}'` 对比 compose 声明 tag，不一致先对齐（tag 漂移撑爆盘教训）。
+  - 重建后核 app 容器能否解析其依赖的上游服务（如 LLM 网关）的容器网络主机名。
+  - 升级镜像时若不涉及凭证轮换，保持现有网关 token 不动。
 ```
