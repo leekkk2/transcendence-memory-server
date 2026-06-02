@@ -408,10 +408,10 @@ jobs:
           # 本地各建一个用于体积比对（同 job 内 buildx 本地层缓存命中，开销小）。
           # rag-base 传与发布同款 CPU torch build-arg，确保断言测的是发布的 CPU 变体。
           TORCH_CPU=https://download.pytorch.org/whl/cpu
-          docker build --target rag-base-lite -t _ragbl:assert --load .
-          docker build --target rag-base --build-arg TORCH_INDEX_URL=$TORCH_CPU -t _ragb:assert --load .
-          lite_b=$(docker image inspect _ragbl:assert --format '{{.Size}}')
-          full_b=$(docker image inspect _ragb:assert  --format '{{.Size}}')
+          docker build --target rag-base-lite -t ragbl-assert:latest --load .
+          docker build --target rag-base --build-arg TORCH_INDEX_URL=$TORCH_CPU -t ragb-assert:latest --load .
+          lite_b=$(docker image inspect ragbl-assert:latest --format '{{.Size}}')
+          full_b=$(docker image inspect ragb-assert:latest  --format '{{.Size}}')
           diff_gb=$(awk -v a="$full_b" -v b="$lite_b" 'BEGIN{printf "%.2f",(a-b)/1024/1024/1024}')
           echo "rag-base-lite=$((lite_b/1024/1024))MB  rag-base=$((full_b/1024/1024))MB  multimodal_diff=${diff_gb}GB"
           # 断言（DR-048 CPU-torch 后）：lite ≤ 1.2GB；多模态增量 diff 预期 ~1.5GB
