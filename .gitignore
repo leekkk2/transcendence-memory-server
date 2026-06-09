@@ -76,3 +76,8 @@ docker-compose.override.*.yml
 test-results/
 dashboard/test-results/
 
+# uv lockfile — project deps are pinned via pyproject + pip in the Dockerfile
+# (no `uv sync --frozen` in build/CI); a uv.lock only appears when an ad-hoc
+# `uv run` test env materialises one. Untracked artifact, not a deliverable.
+uv.lock
+

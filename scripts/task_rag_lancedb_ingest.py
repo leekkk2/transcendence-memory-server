@@ -51,6 +51,13 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.embed_backlog import BacklogStore  # type: ignore[import-not-found]
     from scripts.index_state import IndexStateStore  # type: ignore[import-not-found]
 
+# P4: line-aware chunking lives in rag_citation (pure, no lancedb) so the ingest
+# window definition is unit-testable in isolation.
+try:
+    from rag_citation import chunk_lines_with_ranges  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.rag_citation import chunk_lines_with_ranges  # type: ignore[import-not-found]
+
 
 REBUILD_DOC_TYPES = {'task_card', 'memory', 'client_ingest'}
 SECTION_RE = re.compile(r'^##\s+(.+)$', re.M)
@@ -121,16 +128,10 @@ def collect_cards() -> list[dict[str, Any]]:
 
 
 def chunk_lines(text: str, size: int = 60, overlap: int = 10) -> list[str]:
-    lines = text.splitlines()
-    if not lines:
-        return []
-    step = max(1, size - overlap)
-    chunks: list[str] = []
-    for index in range(0, len(lines), step):
-        chunk = '\n'.join(lines[index:index + size]).strip()
-        if chunk:
-            chunks.append(chunk)
-    return chunks
+    # Text-only view preserved byte-for-byte (callers wanting line ranges use
+    # chunk_lines_with_ranges). P4: line spans now derived by the shared pure
+    # helper so ingest + tests share one window definition.
+    return [chunk for chunk, _start, _end in chunk_lines_with_ranges(text, size, overlap)]
 
 
 def iter_memory_files(memory_dir: Path, archive_dir: Path):
@@ -144,7 +145,10 @@ def collect_memory_docs(container: str, memory_dir: Path, archive_dir: Path) -> 
     records: list[dict[str, Any]] = []
     for path in iter_memory_files(memory_dir, archive_dir):
         text = path.read_text(encoding='utf-8', errors='ignore')
-        for index, chunk in enumerate(chunk_lines(text)):
+        # P4: keep each chunk's 1-based source line span in the metadata JSON
+        # field (no new LanceDB column — _normalize_metadata_inplace serializes
+        # metadata to a JSON string, so extra keys ride along free).
+        for index, (chunk, line_start, line_end) in enumerate(chunk_lines_with_ranges(text)):
             records.append({
                 'chunkId': f'{path.stem}#{index}',
                 'taskId': path.stem,
@@ -154,7 +158,7 @@ def collect_memory_docs(container: str, memory_dir: Path, archive_dir: Path) -> 
                 'text': chunk,
                 'container': container,
                 'tags': [],
-                'metadata': {},
+                'metadata': {'lineStart': line_start, 'lineEnd': line_end},
             })
     return records
 
