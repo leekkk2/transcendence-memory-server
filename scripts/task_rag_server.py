@@ -49,6 +49,9 @@ try:
         ContainerReq,
         DEFAULT_CONTAINER,
         DocumentTextReq,
+        DreamReport,
+        DreamStatusResponse,
+        DreamTriggerRequest,
         HealthResponse,
         IngestMemoryReq,
         BacklogItemResponse,
@@ -67,6 +70,9 @@ try:
         SearchReq,
         SearchResponse,
         StructuredIngestReq,
+        ToolInvokeRequest,
+        ToolInvokeResponse,
+        ToolsListResponse,
         UpdateMemoryReq,
         UsageCleanupRequest,
         UsageCleanupResponse,
@@ -96,6 +102,9 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         ContainerReq,
         DEFAULT_CONTAINER,
         DocumentTextReq,
+        DreamReport,
+        DreamStatusResponse,
+        DreamTriggerRequest,
         HealthResponse,
         IngestMemoryReq,
         BacklogItemResponse,
@@ -114,6 +123,9 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         SearchReq,
         SearchResponse,
         StructuredIngestReq,
+        ToolInvokeRequest,
+        ToolInvokeResponse,
+        ToolsListResponse,
         UpdateMemoryReq,
         UsageCleanupRequest,
         UsageCleanupResponse,
@@ -220,6 +232,27 @@ try:
     import token_meter
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts import token_meter
+
+# dreaming + governance_store back the P6 dreaming engine. Both import-safe (no
+# eager connect; all reads graceful). The background scheduler starts ONLY when
+# config:dreaming:scheduler_enabled is true (default false), so importing +
+# wiring them changes nothing about runtime behavior on a fresh deploy.
+try:
+    import dreaming
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import dreaming
+try:
+    import governance_store  # noqa: F401 - re-exported for status/last_report reads
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import governance_store  # noqa: F401
+
+# governance_tools backs the P6 governance toolbox (GET /admin/tools, invoke).
+# Import-safe (no eager connect; all resolution/invoke graceful). Safe tools run
+# read-only / additive-config-write; LLM/destructive tools stay report-only.
+try:
+    import governance_tools
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import governance_tools
 
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
@@ -695,6 +728,14 @@ async def lifespan(app: FastAPI):
         token_meter.init_batcher(_queue_db_path())
     except Exception as exc:  # noqa: BLE001 - metering must never block boot
         logger.warning('[token] batcher init failed, metering degraded: %s', exc)
+    # Dreaming scheduler (blueprint P6). The starter is a no-op unless
+    # config:dreaming:scheduler_enabled is true (default false) → deploying P6
+    # spawns NO background job and runtime stays byte-identical. The manual
+    # /admin/dreaming/trigger endpoint is always available regardless.
+    try:
+        await dreaming.start_scheduler()
+    except Exception as exc:  # noqa: BLE001 - dreaming must never block boot
+        logger.warning('[dreaming] scheduler start failed, disabled: %s', exc)
     queue = get_job_queue()
     if not DISABLE_WORKER:
         scripts_dir = SERVER_SCRIPTS  # task_rag_lancedb_ingest.py 等都在这里
@@ -708,6 +749,10 @@ async def lifespan(app: FastAPI):
     finally:
         if JOB_WORKER is not None:
             JOB_WORKER.stop(join_timeout=10.0)
+        try:
+            await dreaming.stop_scheduler()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.warning('[dreaming] scheduler stop failed: %s', exc)
         await token_meter.shutdown_batcher()
         await config_store.stop_config_subscriber()
         await redis_client.close_pool()
@@ -3745,6 +3790,91 @@ async def admin_config_update(req: ConfigUpdateRequest) -> ConfigUpdateResponse:
         applied=applied,
         rejected=len(results) - applied,
     )
+
+
+# ---------------------------------------------------------------------------
+# Dreaming system admin endpoints (blueprint P6 §A7). Read-only status + a
+# manual trigger (report-only by default). No config WRITE bypass — toggling
+# dreaming switches goes through PUT /admin/config. The background scheduler is
+# wired in lifespan and stays OFF unless config:dreaming:scheduler_enabled is
+# true, so these endpoints add no autonomous behavior on a fresh deploy.
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    '/admin/dreaming/status',
+    response_model=DreamStatusResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_dreaming_status() -> DreamStatusResponse:
+    """梦境子系统状态（蓝图 P6 §A7）：全局开关 / 后台调度配置与实际运行态 / cron /
+    批处理模型 / 最近一次报告 / 各已知容器的解析后梦境配置。纯读，全程降级安全，不 raise。"""
+    data = await dreaming.get_dream_status()
+    return DreamStatusResponse(**data)
+
+
+@app.post(
+    '/admin/dreaming/trigger',
+    response_model=DreamReport,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_dreaming_trigger(req: DreamTriggerRequest) -> DreamReport:
+    """手动触发一次梦境周期（蓝图 P6 §A7）。dry_run 默认 true = 仅产候选报告不删数据；
+    即便 dry_run=false，破坏性删除仍受 config:dreaming:prune_apply（默认 false）二次守护。
+    global_enabled=false 时返回 {status:'skipped_global_disabled'} 不执行。"""
+    report = await dreaming.run_dream_cycle(
+        container=req.container, dry_run=req.dry_run,
+    )
+    return DreamReport(**report)
+
+
+# ---------------------------------------------------------------------------
+# Governance toolbox admin endpoints (blueprint P6 §A8). Read-only matrix +
+# a guarded invoke. No config WRITE bypass — toggling a container's tool switch
+# goes through PUT /admin/config (config:tools:container:{c}:enabled_map). Only
+# SAFE tools (token quota read / latency read / additive routing write) execute;
+# LLM/destructive tools stay report-only (dry_run/deferred), so these endpoints
+# add no autonomous or destructive behavior on a fresh deploy.
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    '/admin/tools',
+    response_model=ToolsListResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_tools_list() -> ToolsListResponse:
+    """治理工具箱矩阵（蓝图 P6 §A8）：全局开关表 / 沙箱内存上限 / 审批有效期 / 新工具默认 +
+    6 个预设工具静态描述 + 各已知容器的 resolved_map（容器级覆盖全局）与 raw_map（容器自身配置，
+    未配为 null）。纯读，全程降级安全，不 raise。"""
+    containers = [p.name for p in _list_container_dirs()]
+    matrix = await governance_tools.resolve_matrix(containers)
+    return ToolsListResponse(
+        global_enabled_map=governance_tools._global_enabled_map(),
+        sandbox_mem_limit=str(config_store.get_cached('config:tools:sandbox_mem_limit', '512m')),
+        approval_ttl_days=int(config_store.get_cached('config:tools:approval_ttl_days', 30)),
+        new_tool_default_enabled=bool(
+            config_store.get_cached('config:tools:new_tool_default_enabled', False)
+        ),
+        tools=governance_tools.list_tools(),
+        containers=matrix,
+    )
+
+
+@app.post(
+    '/admin/tools/{tool}/invoke',
+    response_model=ToolInvokeResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_tools_invoke(tool: str, req: ToolInvokeRequest) -> ToolInvokeResponse:
+    """调用一个治理工具（蓝图 P6 §A8）。dry_run 默认 true。仅安全工具真执行
+    （manage_token_quotas / analyze_retrieval_latency 只读；update_container_routing 经
+    config_store 加性写 routing_rules）；LLM/破坏性工具返回 dry_run/deferred 不改数据；
+    工具被禁用返回 disabled。全程降级安全，不 raise。"""
+    result = await governance_tools.invoke_tool(
+        tool, container=req.container, params=req.params, dry_run=req.dry_run,
+    )
+    return ToolInvokeResponse(**result)
 
 
 # ---------------------------------------------------------------------------

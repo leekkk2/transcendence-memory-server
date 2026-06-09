@@ -32,6 +32,8 @@ dependencies = [
     "python-multipart>=0.0.6",
     "pyyaml>=6.0",  # v0.7.0: profiles.yaml 加载需要
     "redis>=5,<6",  # blueprint P0: governance state (config/token/breaker), redis.asyncio. No hiredis (pure-python, avoids native build).
+    "apscheduler>=3.10",  # blueprint P6: dreaming background scheduler (AsyncIOScheduler). Code degrades gracefully when absent (lazy import → scheduler stays disabled).
+    "cryptography>=42",  # blueprint P1: config_store Fernet at-rest encryption for sensitive config (api_keys:*). Lazy-imported → degrades to plaintext when absent.
 ]
 
 [project.urls]

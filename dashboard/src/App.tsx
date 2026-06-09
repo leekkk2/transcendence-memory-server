@@ -11,6 +11,8 @@ import Jobs from './pages/Jobs';
 import Settings from './pages/Settings';
 import ConfigSettings from './pages/ConfigSettings';
 import TokenCost from './pages/TokenCost';
+import Dreaming from './pages/Dreaming';
+import GovernanceTools from './pages/GovernanceTools';
 
 /**
  * Top-level router.
@@ -38,6 +40,8 @@ export default function App() {
         <Route path="/usage" element={<Usage />} />
         <Route path="/tokens" element={<TokenCost />} />
         <Route path="/jobs" element={<Jobs />} />
+        <Route path="/dreaming" element={<Dreaming />} />
+        <Route path="/tools" element={<GovernanceTools />} />
         <Route path="/config" element={<ConfigSettings />} />
         <Route path="/settings" element={<Settings />} />
       </Route>
