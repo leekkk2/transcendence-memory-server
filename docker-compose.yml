@@ -30,6 +30,11 @@ services:
         required: false
     environment:
       WORKSPACE: /data
+      # Wire the governance Redis layer to the compose-internal redis service by
+      # default; override via .env / shell REDIS_URL to point at an external
+      # instance. Without this, redis_client._resolve_url() returns None and the
+      # whole Redis governance layer silently no-ops (graceful degradation).
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
       # Redis backs blueprint governance state (config hot-reload, token
       # counters, circuit breakers). It is a soft dependency at the app layer
