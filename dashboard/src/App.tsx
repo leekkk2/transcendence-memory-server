@@ -9,6 +9,8 @@ import Memory from './pages/Memory';
 import Usage from './pages/Usage';
 import Jobs from './pages/Jobs';
 import Settings from './pages/Settings';
+import ConfigSettings from './pages/ConfigSettings';
+import TokenCost from './pages/TokenCost';
 
 /**
  * Top-level router.
@@ -34,7 +36,9 @@ export default function App() {
         <Route path="/containers/:name" element={<ContainerDetail />} />
         <Route path="/memory" element={<Memory />} />
         <Route path="/usage" element={<Usage />} />
+        <Route path="/tokens" element={<TokenCost />} />
         <Route path="/jobs" element={<Jobs />} />
+        <Route path="/config" element={<ConfigSettings />} />
         <Route path="/settings" element={<Settings />} />
       </Route>
       <Route path="*" element={<Navigate to="/overview" replace />} />

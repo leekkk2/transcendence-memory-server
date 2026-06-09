@@ -36,6 +36,11 @@ try:
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
+        ConfigItem,
+        ConfigListResponse,
+        ConfigUpdateRequest,
+        ConfigUpdateResponse,
+        ConfigUpdateResult,
         ConfigurationGuide,
         ConnectionTokenResponse,
         ContainerDeleteResponse,
@@ -78,6 +83,11 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
+        ConfigItem,
+        ConfigListResponse,
+        ConfigUpdateRequest,
+        ConfigUpdateResponse,
+        ConfigUpdateResult,
         ConfigurationGuide,
         ConnectionTokenResponse,
         ContainerDeleteResponse,
@@ -3519,6 +3529,73 @@ async def admin_usage_tokens(window: str = '7d') -> TokenUsageResponse:
     live = await token_meter.live_today_totals(agent_ids)
     data['totals']['live_total_tokens'] = sum(live.values())
     return TokenUsageResponse(**data)
+
+
+# ---------------------------------------------------------------------------
+# Runtime config center admin endpoints (blueprint P2 — feeds dashboard Config
+# view). GET enumerates KNOWN_CONFIG with effective value + override flag;
+# PUT routes single/batch updates straight through config_store.set (which owns
+# all validation: known-key allowlist, HR-9 base_url host-pin, type coercion,
+# sensitive-key encryption, DB persist + Redis cfg_set + config_updated publish).
+# The sensitive-masking contract (api_keys:* never echo a value) lives in
+# config_store.describe_key — this layer is a thin, validation-free wrapper.
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    '/admin/config',
+    response_model=ConfigListResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def admin_config_list() -> ConfigListResponse:
+    """枚举运行时配置中心全部已知键（KNOWN_CONFIG）+ 每键的有效值 / 是否被覆盖 / 默认值。
+
+    脱敏铁律（照搬 /admin/profiles 的 api_key_configured 纪律）：sensitive 键
+    （config:model:api_keys:*）**绝不回显值** —— value 恒为 null，仅返回
+    configured:bool 表示是否已配置；真值从不读回/解密/吐到响应。非敏感键返回当前
+    有效值（DB 持久覆盖优先，无覆盖则 default）。describe_key 全程降级安全（DB 不可达
+    时退回 default），不 raise。"""
+    items = [ConfigItem(**d) for d in config_store.describe_all()]
+    return ConfigListResponse(items=items, count=len(items))
+
+
+@app.put(
+    '/admin/config',
+    response_model=ConfigUpdateResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_config_update(req: ConfigUpdateRequest) -> ConfigUpdateResponse:
+    """批量/单条写入配置覆盖。逐键经 config_store.set —— **绝不旁路其任何校验**：
+    未知键拒绝、HR-9 base_url 主机锁（仅放行 sanctioned 网关）、类型 coerce、敏感键
+    加密 write-only、DB 持久 + Redis cfg_set + config_updated 广播热重载，全在 set 内。
+
+    set 只返回单一 bool；本层不复制其校验逻辑，仅在 ok=False 时按拒绝类别推断一个
+    rejected_reason（不回显可能敏感的 value）：未知键 / base_url 主机违规 / 取值非法 /
+    DB 持久失败。"""
+    results: list[ConfigUpdateResult] = []
+    applied = 0
+    for upd in req.updates:
+        ok = await config_store.set(upd.key, upd.value)
+        reason: str | None = None
+        if not ok:
+            # set 不区分失败原因，按 KNOWN_CONFIG / HR-9 守卫推断一个可读类别，
+            # 不暴露 value 本身（可能是 api_keys:* 敏感值）。
+            if upd.key not in config_store.KNOWN_CONFIG:
+                reason = 'unknown_key'
+            elif upd.key.startswith('config:model:base_url:'):
+                # 已知 base_url 键 set 失败：唯一附加守卫是 HR-9 主机锁。
+                reason = 'rejected_base_url_host'
+            else:
+                # 已知非 base_url 键失败 → coerce 拒绝或 DB 写失败。
+                reason = 'invalid_value_or_persist_failed'
+        else:
+            applied += 1
+        results.append(ConfigUpdateResult(key=upd.key, ok=ok, rejected_reason=reason))
+    return ConfigUpdateResponse(
+        results=results,
+        applied=applied,
+        rejected=len(results) - applied,
+    )
 
 
 # ---------------------------------------------------------------------------

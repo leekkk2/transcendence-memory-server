@@ -11,7 +11,9 @@
     "containers": "容器",
     "memory": "记忆",
     "usage": "用量",
+    "tokens": "Token 成本",
     "jobs": "任务",
+    "config": "配置",
     "settings": "设置"
   },
   "topbar": {
@@ -149,6 +151,60 @@
     "dashboard": "dashboard",
     "server": "服务端",
     "serverHint": "完整版本信息见 /health JSON 响应"
+  },
+  "config": {
+    "title": "配置",
+    "save": "保存修改",
+    "saving": "保存中…",
+    "saved": "已保存",
+    "saveError": "保存失败",
+    "dirtyCount": "{{count}} 项未保存",
+    "modified": "已覆盖",
+    "unsaved": "未保存",
+    "resetDefault": "恢复默认",
+    "defaultLabel": "默认值",
+    "baseUrlHint": "必须指向受信网关",
+    "numberPlaceholder": "留空则使用默认值",
+    "textPlaceholder": "值",
+    "secretSet": "已配置 ✓",
+    "secretNotSet": "未配置",
+    "secretPlaceholder": "输入新密钥以替换",
+    "clearInput": "清除",
+    "removeSecret": "移除",
+    "secretWillClear": "保存后将清除",
+    "footnote": "敏感密钥为只写 —— 服务端永不回显已存密钥。实时键（similarity_threshold、citation_enabled）即时生效；模型/Token 键现已持久，待 live reader 接入后生效。",
+    "module": {
+      "rag": "RAG 检索",
+      "token": "Token 额度",
+      "model": "模型矩阵"
+    },
+    "moduleHint": {
+      "rag": "检索与引用行为 —— 实时键无需重启即生效。",
+      "token": "按天 / 按小时 Token 额度与降级模型。",
+      "model": "网关 base URL 与 API key。base URL 写入由服务端校验。"
+    },
+    "reason": {
+      "unknown_key": "未知配置键",
+      "rejected_base_url_host": "base URL 主机不被允许（须为受信网关）",
+      "invalid_value_or_persist_failed": "值无效或持久化失败"
+    }
+  },
+  "tokenCost": {
+    "title": "Token 成本 (7d)",
+    "totalTokens": "总 Token",
+    "promptTokens": "Prompt Token",
+    "completionTokens": "Completion Token",
+    "liveTotal": "实时总计",
+    "byModel": "按模型",
+    "byTaskType": "按任务类型",
+    "byAgent": "按 agent",
+    "colModel": "模型",
+    "colTaskType": "任务类型",
+    "colAgent": "Agent",
+    "colPrompt": "Prompt",
+    "colCompletion": "Completion",
+    "colTotal": "总计",
+    "noData": "暂无数据"
   },
   "profile": {
     "embedding": "embedding",

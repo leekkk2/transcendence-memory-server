@@ -14,6 +14,11 @@ graph_chunk_entity_relation.graphml
 
 # Runtime data
 tasks/rag/containers/
+# Runtime config / token / queue DBs (config_kv holds Fernet-encrypted api_keys;
+# token DB holds usage). Never commit local run artifacts.
+tasks/rag/*.db
+tasks/rag/*.db-wal
+tasks/rag/*.db-shm
 memory/
 memory_archive/
 
