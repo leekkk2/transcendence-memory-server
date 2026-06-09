@@ -25,6 +25,15 @@ interface SearchResponse {
   status?: string;
   message?: string;
   results?: MemoryRow[];
+  // Graceful-degradation metadata (Phase 1 §3): a search can partially succeed —
+  // some containers return results while siblings are down/uninitialized. The
+  // server keeps HTTP 200 + body flags rather than failing the whole request.
+  degraded?: boolean;
+  is_degraded?: boolean;
+  per_container_status?: Record<string, string>;
+  containers?: string[];
+  fallback_source?: string | null;
+  blocked_low_score?: number;
 }
 
 export default function Memory() {
@@ -77,6 +86,15 @@ export default function Memory() {
   const rows = serverError ? [] : resp?.results ?? [];
   const isBrowse = submittedQuery === '';
   const noContainers = !containersQ.isLoading && containerList.length === 0;
+
+  // Partial success is NOT an error: render results as usual and surface a
+  // non-fatal hint listing only the containers that did not return cleanly.
+  const isDegraded = !serverError && !!(resp?.degraded ?? resp?.is_degraded);
+  const degradedContainers = isDegraded
+    ? Object.entries(resp?.per_container_status ?? {}).filter(([, s]) => s !== 'ok')
+    : [];
+  const containerStatusLabel = (status: string) =>
+    status === 'not_initialized' ? t('memory.notInitializedHint') : status;
 
   return (
     <div className="space-y-4">
@@ -139,6 +157,22 @@ export default function Memory() {
           style={{ borderColor: 'var(--red)', color: 'var(--red)' }}
         >
           {t('memory.searchError', { message: serverError })}
+        </div>
+      ) : null}
+
+      {isDegraded && degradedContainers.length > 0 ? (
+        <div
+          className="panel fade-in p-3 text-sm"
+          style={{ borderColor: 'var(--yellow)', color: 'var(--yellow)' }}
+        >
+          <div>{t('memory.degradedHint')}</div>
+          <ul className="mono mt-1 space-y-0.5 text-xs">
+            {degradedContainers.map(([name, status]) => (
+              <li key={name}>
+                {name} · {containerStatusLabel(status)}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 

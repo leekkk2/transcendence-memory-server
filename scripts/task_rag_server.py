@@ -2,6 +2,7 @@
 """Canonical FastAPI server for transcendence-memory-server."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import fnmatch
 import hashlib
@@ -31,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 try:
     from task_rag_server_models import (
         AgentOnboardingResponse,
+        Citation,
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
@@ -71,6 +73,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.task_rag_server_models import (
         AgentOnboardingResponse,
+        Citation,
         ClientIngestReq,
         ClientIngestResponse,
         CommandResponse,
@@ -1050,6 +1053,73 @@ def _get_union_search_default() -> bool:
         return False
 
 
+def _get_union_per_container_timeout() -> float:
+    """从 ProfileSet 拿 union 多容器子查询 per-container timeout（秒）。
+
+    Phase 1：旧 12.0 误杀冷启动主容器致整条降级失败，默认放宽到 30.0。任何加载
+    异常回退 `_DEFAULT_PER_CONTAINER_TIMEOUT_S`（与 _get_union_search_default 同风格）。
+    """
+    try:
+        try:
+            from embedding_registry import get_registry as _get_registry
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.embedding_registry import get_registry as _get_registry
+        return float(_get_registry().profiles.union_per_container_timeout_s)
+    except Exception:
+        return _DEFAULT_PER_CONTAINER_TIMEOUT_S
+
+
+def _get_score_threshold_default() -> float | None:
+    """从 ProfileSet 拿 score-gate 阈值（L2 距离上界，None=关闭）。
+
+    Phase 1：默认关闭（opt-in）。任何加载异常回退 None（关闭），不破坏旧路径。
+    """
+    try:
+        try:
+            from embedding_registry import get_registry as _get_registry
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.embedding_registry import get_registry as _get_registry
+        return _get_registry().profiles.similarity_threshold
+    except Exception:
+        return None
+
+
+def _get_citation_enabled() -> bool:
+    """是否在 /search 响应里投影 citations 数组。异常回退 True（默认开）。"""
+    try:
+        try:
+            from embedding_registry import get_registry as _get_registry
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.embedding_registry import get_registry as _get_registry
+        return bool(_get_registry().profiles.citation_enabled)
+    except Exception:
+        return True
+
+
+def _container_has_chunks_table(name: str) -> bool:
+    """探测容器是否已 embed（存在可打开的 'chunks' LanceDB 表）。只连不 embedding。
+
+    Phase 1 项2：未初始化的 sibling 镜像在 union 解析阶段就被软跳过，避免 /search
+    返回 not_initialized 噪音拖垮整条降级。任何异常（目录缺失 / connect 失败 / 表不
+    存在）吞为 False —— 不可达即视为未就绪，宁可少 union 一路也不报错。
+
+    用 ``open_table`` 直探而非解析 ``list_tables()``：本仓 lancedb 版本的
+    ``list_tables()`` 返回分页结构（``[('tables', [...]), ('page_token', None)]``），
+    不便可靠解析；``open_table`` 成功即证表就绪，是最稳的存在性判据。
+    """
+    try:
+        import lancedb
+        try:
+            from task_rag_runtime import lancedb_dir
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts.task_rag_runtime import lancedb_dir
+        db = lancedb.connect(str(lancedb_dir(name)))
+        db.open_table('chunks')
+        return True
+    except Exception:
+        return False
+
+
 _OPENAI_MIRROR_SUFFIX = '_openai'
 
 
@@ -1119,6 +1189,12 @@ def _resolve_search_targets(req: SearchReq) -> tuple[list[str], bool]:
     sibling = f'{main}{_OPENAI_MIRROR_SUFFIX}'
     existing_names = {p.name for p in _list_container_dirs()}
     if sibling not in existing_names:
+        return targets, False
+
+    # Phase 1 项2：sibling 目录存在但从未 embed（无 chunks 表）→ 软跳过。否则它会被
+    # 压进 union 子查询返回 not_initialized，污染 per_container_status 并触发降级。
+    # 日后 sibling embed 就绪 → 下次查询自动恢复双轨。
+    if not _container_has_chunks_table(sibling):
         return targets, False
 
     targets.append(sibling)
@@ -1346,6 +1422,7 @@ def _collapse_media_caption_hits(hits: list[SearchHit]) -> list[SearchHit]:
 
 
 _DEFAULT_PER_CONTAINER_TIMEOUT_S = 12.0  # subprocess cold-start (py + lancedb + lightrag import) 实测 5-10s 不稳；v0.12 in-process 化后可降回 3s
+_DEFAULT_QUERY_GATE_TIMEOUT_S = 30  # /query score-gate 的 top1 向量预检超时（仅 score-gate 启用时触发）
 
 
 @app.post('/search', response_model=SearchResponse, dependencies=[Depends(verify_auth)])
@@ -1382,8 +1459,9 @@ def search(req: SearchReq) -> SearchResponse:
 
     # v0.11.0：per-container timeout 上限仅在多容器（union）场景启用，避免破坏单容器
     # 长查询的向后兼容（旧默认 req.timeout_s=600s）。
-    # 默认 3.0s 是 reranker 端到端 P50 290-330ms × 多倍 buffer 的安全上限。
-    per_container_timeout = req.per_container_timeout_s or _DEFAULT_PER_CONTAINER_TIMEOUT_S
+    # Phase 1：默认改由 profiles.union_per_container_timeout_s 决定（默认 30.0s），
+    # 旧 12.0 会把冷启动 + 网关 embedding 超时的主容器误杀成 timeout → 整条降级失败。
+    per_container_timeout = req.per_container_timeout_s or _get_union_per_container_timeout()
     if len(targets) > 1:
         subproc_timeout = max(1, int(min(per_container_timeout, req.timeout_s)))
     else:
@@ -1503,6 +1581,19 @@ def search(req: SearchReq) -> SearchResponse:
     else:
         merged = deduped[: req.topk]
 
+    # Phase 1 项4：score-gate（**默认关闭，opt-in**）。度量是 LanceDB L2 距离（越小越
+    # 相关，非相似度）→ 丢弃 score > 上界或 None 的 hit。请求级 score_threshold 优先于
+    # profiles 默认；None 表示不启用（行为逐字节不变）；≤0 视为显式关闭。
+    eff_threshold = (
+        req.score_threshold if req.score_threshold is not None
+        else _get_score_threshold_default()
+    )
+    blocked_low_score = 0
+    if eff_threshold is not None and eff_threshold > 0:
+        kept = [h for h in merged if h.score is not None and h.score <= eff_threshold]
+        blocked_low_score = len(merged) - len(kept)
+        merged = kept
+
     has_any_ok = any(s == 'ok' for s in per_status.values())
     # response.container 客户端无感原则：单容器入参保留客户端传入的原名；多容器
     # 入参（containers / pattern）则用 canonical 的第一个（targets 已经是 canonical）。
@@ -1515,13 +1606,45 @@ def search(req: SearchReq) -> SearchResponse:
     degraded = any(
         status != 'ok' for status in per_status.values()
     )
+    degraded = degraded or rerank_warning is not None
 
     message = None
     if not has_any_ok and per_status:
         message = '; '.join(f'{name}: {status}' for name, status in per_status.items())
     elif rerank_warning:
         message = rerank_warning
+    elif has_any_ok and degraded:
+        # Phase 1 项1：部分容器成功的优雅降级 —— 仍有结果，不弹红条（前端据 status
+        # 而非 message 判 error）。降级细节客户端读 per_container_status / is_degraded。
+        message = None
 
+    # Phase 1 项1：降级元数据。is_degraded 是 degraded 的 Agent 友好别名（同值双写）；
+    # fallback_source 仅在「容器级降级」（有任一非 ok 容器）时标 partial_containers。
+    # rerank-only 失败也算 degraded（结果不完整），但容器层无 partial → fallback_source=None，
+    # 降级信息靠 is_degraded=True + message/reranker 表达，避免误标 partial_containers。
+    fallback_source = (
+        'partial_containers'
+        if (has_any_ok and any(s != 'ok' for s in per_status.values()))
+        else None
+    )
+
+    # Phase 1 项4：citation 投影（citation_enabled 默认开）。由最终 merged 派生，
+    # 沿用 L2 距离语义；关闭时为 None。
+    citations = None
+    if _get_citation_enabled():
+        citations = [
+            Citation(
+                chunkId=hit.chunkId,
+                sourcePath=hit.sourcePath,
+                section=hit.section,
+                score=hit.score,
+                container=hit.container,
+            )
+            for hit in merged
+        ]
+
+    # Phase 1：刻意保持 HTTP 200 —— 部分成功（有结果）走 200 + is_degraded body 标志；
+    # 全失败也维持现状 200 + body status='error'（转 503 触及前端 ApiError，记 Phase 2）。
     return SearchResponse(
         status='ok' if has_any_ok else 'error',
         command=last_command,
@@ -1536,7 +1659,11 @@ def search(req: SearchReq) -> SearchResponse:
         results=merged,
         stdout=last_stdout,
         stderr=last_stderr,
-        degraded=degraded or rerank_warning is not None,
+        degraded=degraded,
+        is_degraded=degraded,
+        fallback_source=fallback_source,
+        citations=citations,
+        blocked_low_score=blocked_low_score,
         union_applied=union_applied,
         rerank_applied=rerank_applied,
         reranker=reranker_name if rerank_applied else None,
@@ -3128,6 +3255,56 @@ async def embed_multimodal(
 async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
     canonical, _ = resolve_container_or_raise(req.container)
+
+    # Phase 1 项4：score-gate（**默认关闭，opt-in**）。在动用 LightRAG / LLM 前用
+    # 一次轻量 top1 向量预检（L2 距离，越小越相关）：若 top1 距离 > 上界 → 直接返回
+    # score_gated，不调 LLM（也不触发 _require_lightrag_ready 的 503）。
+    # eff_threshold 为 None 时整段跳过，行为与现状逐字节一致。
+    eff_threshold = (
+        req.score_threshold if req.score_threshold is not None
+        else _get_score_threshold_default()
+    )
+    if eff_threshold is not None and eff_threshold > 0:
+        # 阻塞型预检（embedding HTTP + LanceDB IO + 可能 subprocess）放线程池，
+        # 否则在 async 事件循环里同步调用会冻结整个 loop（阻塞其他并发请求）。
+        _, top_payload = await asyncio.to_thread(
+            _run_single_search,
+            req.query, 1, canonical, _DEFAULT_QUERY_GATE_TIMEOUT_S,
+            embedding_override=req.embedding_model,
+        )
+        # 区分三类：容器未初始化 → 诚实返回 not_initialized（让 Agent 先 /embed，
+        # 而非伪装成「分数太低」）；真后端/网关错误 → 不静默 score_gated，放行到下游
+        # _require_lightrag_ready / _admit_or_503 给真实状态/503；仅 ok 时才按距离判 gate。
+        code = top_payload.get('code')
+        if code == 'container_not_initialized':
+            return QueryResponse(
+                status='not_initialized',
+                query=req.query,
+                container=req.container,
+                answer='',
+                mode=req.mode,
+                top_score=None,
+            )
+        if code == 'ok':
+            top_hits = top_payload.get('results') or []
+            top_score = None
+            if isinstance(top_hits, list) and top_hits and isinstance(top_hits[0], dict):
+                raw = top_hits[0].get('score')
+                top_score = float(raw) if raw is not None else None
+            # top_score 非 None 且超阈值 → 真低相关，gate 拦；top_score is None（已初始化但
+            # 无任何 hit / 空容器）按可接受策略仍 score_gated（无可喂给 LLM 的上下文）。
+            if top_score is None or top_score > eff_threshold:
+                return QueryResponse(
+                    status='score_gated',
+                    query=req.query,
+                    container=req.container,
+                    answer='',
+                    mode=req.mode,
+                    top_score=top_score,
+                )
+        # code 既非 'ok' 也非 'container_not_initialized'（真后端/网关错误）→ 不拦，
+        # 继续放行到下游既有 _require_lightrag_ready / _admit_or_503 路径。
+
     _require_lightrag_ready()
     _admit_or_503(canonical, op='query')
     # Phase 2：rerank / chunk_top_k 字段透传到 LightRAG QueryParam。

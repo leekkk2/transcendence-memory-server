@@ -69,7 +69,15 @@ class SearchReq(_WithModelOverride):
         le=30.0,
         description=(
             '单容器子查询超时上限（秒）。超时容器在 per_container_status 标记 timeout，'
-            '不影响其余容器返回。None=默认 12.0s（容忍 subprocess cold-start；v0.12 in-process 化后可降回 3s）。'
+            '不影响其余容器返回。None=按 profiles.yaml 的 union_per_container_timeout_s（默认 30.0s，'
+            '容忍 subprocess cold-start；v0.12 in-process 化后可降回 3s）。'
+        ),
+    )
+    score_threshold: float | None = Field(
+        default=None,
+        description=(
+            'score-gate：丢弃 score（L2 距离，越小越相关）> 该上界或 None 的 hit。'
+            'None=用 profiles.yaml 的 similarity_threshold（默认关闭）；≤0=显式关闭。'
         ),
     )
 
@@ -143,6 +151,20 @@ class SearchHit(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
+class Citation(BaseModel):
+    """信源溯源条目 —— 由 /search 命中的 hit 投影，供 Agent 直接引用出处。
+
+    score 沿用 LanceDB L2 距离语义（越小越相关，非相似度）。section / container
+    缺失时为 None。
+    """
+
+    chunkId: str | None = None
+    sourcePath: str | None = None
+    section: str | None = None
+    score: float | None = None
+    container: str | None = None
+
+
 class SearchResponse(BaseModel):
     status: Literal['ok', 'error']
     command: list[str]
@@ -166,6 +188,22 @@ class SearchResponse(BaseModel):
     degraded: bool = Field(
         default=False,
         description='True 表示至少一个目标容器超时或失败，结果不完整但已尽力合并。',
+    )
+    is_degraded: bool = Field(
+        default=False,
+        description='degraded 的 Agent 友好别名（同值双写）。部分容器失败但仍有结果时为 True。',
+    )
+    fallback_source: str | None = Field(
+        default=None,
+        description="优雅降级来源标记：部分容器成功时为 'partial_containers'，否则 None。",
+    )
+    citations: list[Citation] | None = Field(
+        default=None,
+        description='信源溯源数组（citation_enabled 时由 results 投影；否则 None）。',
+    )
+    blocked_low_score: int = Field(
+        default=0,
+        description='被 score-gate（距离上界）拦截丢弃的 hit 数。0 表示未启用或无拦截。',
     )
     union_applied: bool = Field(
         default=False,
@@ -411,6 +449,13 @@ class QueryReq(_WithModelOverride):
             'Defaults to route.chunk_top_k when rerank enabled. Phase 2 feature.'
         ),
     )
+    score_threshold: float | None = Field(
+        default=None,
+        description=(
+            'score-gate：top1 chunk 的 score（L2 距离）> 该上界或未初始化时直接返回 '
+            "status='score_gated'，不调 LLM。None=用 profiles 默认（默认关闭）；≤0=显式关闭。"
+        ),
+    )
 
 
 class QueryResponse(BaseModel):
@@ -419,6 +464,10 @@ class QueryResponse(BaseModel):
     container: str
     answer: str
     mode: str
+    top_score: float | None = Field(
+        default=None,
+        description='score-gate 命中时透出的 top1 chunk 距离（L2，越小越相关）。',
+    )
 
 
 # ---------------------------------------------------------------------------

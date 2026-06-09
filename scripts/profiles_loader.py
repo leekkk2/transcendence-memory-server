@@ -37,6 +37,8 @@ _LEGACY_DEFAULT_MODEL = "text-embedding-3-small"
 _LEGACY_DEFAULT_DIM = 1024
 _LEGACY_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _LEGACY_DEFAULT_LLM_MODEL = "gemini-2.5-flash"
+# Phase 1：union 多容器子查询 per-container timeout 默认（秒）。旧 12.0 误杀冷启动主容器。
+_DEFAULT_UNION_PER_CONTAINER_TIMEOUT_S = 30.0
 # v1：仅 embedding + reranker；v2：新增 llms / vlms 节点与 route 的 LLM/VLM 字段。
 # 两版都接受 —— v1 文件不写新节点即解析为空 dict，向后兼容。
 _SUPPORTED_VERSIONS = frozenset({1, 2})
@@ -167,6 +169,14 @@ class ProfileSet:
     routes: list[tuple[dict[str, Any], Route]] = field(default_factory=list)
     default_route: Route | None = None
     union_search_default: bool = False
+    # Phase 1 (2026-06-09)：union 多容器子查询的 per-container timeout 上限（秒）。
+    # 旧 12.0 会把冷启动的主容器误杀成 timeout → 整条降级失败；默认放宽到 30.0。
+    union_per_container_timeout_s: float = 30.0
+    # Phase 1：score-gate 阈值（**None=关闭，opt-in**）。语义 = 原始 L2 距离上界（非
+    # 相似度，无 1-score 换算）；hit.score > 该值或 None 一律拦截。需实测标定。
+    similarity_threshold: float | None = None
+    # Phase 1：是否在 /search 响应里投影 citations 数组。默认开。
+    citation_enabled: bool = True
     # v2 新增：LLM / VLM profile 池。v1 文件 / legacy env 下为对应合成结果或空。
     llms: dict[str, LLMProfile] = field(default_factory=dict)
     vlms: dict[str, VLMProfile] = field(default_factory=dict)
@@ -389,6 +399,13 @@ def _load_yaml(path: Path) -> ProfileSet:
 
     # v0.11.0：顶层 union_search_default 字段，缺省 false 保持向后兼容
     union_default = bool(doc.get("union_search_default", False))
+    # Phase 1：顶层可调字段，全部缺省 → 与旧部署逐字节等价。
+    per_container_timeout = float(
+        doc.get("union_per_container_timeout_s", _DEFAULT_UNION_PER_CONTAINER_TIMEOUT_S)
+    )
+    raw_threshold = doc.get("similarity_threshold")
+    similarity_threshold = float(raw_threshold) if raw_threshold is not None else None
+    citation_enabled = bool(doc.get("citation_enabled", True))
 
     ps = ProfileSet(
         embeddings=embeddings,
@@ -396,6 +413,9 @@ def _load_yaml(path: Path) -> ProfileSet:
         routes=routes,
         default_route=default_route,
         union_search_default=union_default,
+        union_per_container_timeout_s=per_container_timeout,
+        similarity_threshold=similarity_threshold,
+        citation_enabled=citation_enabled,
         llms=llms,
         vlms=vlms,
     )

@@ -64,6 +64,8 @@
     "resultsCount_other": "{{count}} memories",
     "emptyContainer": "no memories in this container yet",
     "searchError": "search failed: {{message}}",
+    "degradedHint": "partial results — some containers did not respond:",
+    "notInitializedHint": "image not initialized; run embed first",
     "noContainers": "no containers available",
     "untitled": "(untitled)",
     "noText": "(no text)",
