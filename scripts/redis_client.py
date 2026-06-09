@@ -219,6 +219,49 @@ async def cfg_set(key: str, value: Any, ttl: Optional[int] = None) -> bool:
         return False
 
 
+# ── Pub/Sub primitives (blueprint P1 config hot-reload) ─────────────────────
+# These back the cross-process `config_updated` broadcast: one node writes a
+# config override, publishes the changed keys, and every other node's
+# subscriber refreshes its in-memory cache. Both helpers degrade to a no-op
+# when Redis is down — a missed broadcast only means a peer keeps its previous
+# (still-valid) cache until its next load_all/restart, never a crash.
+
+
+async def publish(channel: str, message: str) -> bool:
+    """PUBLISH `message` to `channel`. Returns whether it was delivered.
+
+    Returns False when Redis is down/disabled or any error occurs; never raises.
+    A False here is non-fatal for the writer: the DB/local cache update already
+    succeeded, only the live fan-out to peers was skipped.
+    """
+    client = await get_client()
+    if client is None:
+        return False
+    try:
+        await client.publish(channel, message)
+        return True
+    except Exception:  # noqa: BLE001 - degrade to no-op, never raise
+        return False
+
+
+async def make_pubsub(channel: str) -> Any:
+    """SUBSCRIBE to `channel` and return the live pubsub object, or None.
+
+    Returns None when Redis is down/disabled or any error occurs (the caller
+    treats None as "no live channel" and stays on cache/DB). Never raises. The
+    caller owns the returned object's lifecycle (iterate `listen()` then close).
+    """
+    client = await get_client()
+    if client is None:
+        return None
+    try:
+        pubsub = client.pubsub()
+        await pubsub.subscribe(channel)
+        return pubsub
+    except Exception:  # noqa: BLE001 - degrade to no-op, never raise
+        return None
+
+
 def reset_for_tests() -> None:
     """Drop cached singletons so a test can re-init under fresh env.
 
