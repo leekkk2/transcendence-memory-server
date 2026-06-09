@@ -112,6 +112,24 @@ def _coerce_int(raw: Any) -> int:
     return int(str(raw).strip())
 
 
+def _coerce_int_or_none(raw: Any) -> Optional[int]:
+    """Empty / 'none' / 'null' → None (the unlimited / OFF sentinel); else int.
+
+    Mirrors _coerce_float_or_none for the token budget keys: an absent or
+    explicitly-cleared budget reads back as None so over_budget() treats it as
+    "no limit configured" (quota enforcement off = pre-P3 behavior)."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):  # guard: bool is an int subclass
+        return int(raw)
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    s = str(raw).strip()
+    if s == "" or s.lower() in ("none", "null"):
+        return None
+    return int(s)
+
+
 def _coerce_str(raw: Any) -> str:
     return "" if raw is None else str(raw)
 
@@ -145,6 +163,16 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     "config:model:base_url:embedding": _ConfigKey(_coerce_str),
     "config:model:api_keys:llm": _ConfigKey(_coerce_str, sensitive=True),
     "config:model:api_keys:embedding": _ConfigKey(_coerce_str, sensitive=True),
+    # ── Token metering / quota breaker (blueprint P3, §A6) ──────────────────
+    # Opt-in: the live reader (token_meter.over_budget) passes default=None for
+    # the budgets, so with no override present quota enforcement is OFF (= pre-P3
+    # behavior, byte-identical). daily/hourly_budget coerce to int|None: empty /
+    # 'none' → None (the unlimited sentinel). fallback_model + flush_interval are
+    # read with their own caller defaults.
+    "config:token:daily_budget": _ConfigKey(_coerce_int_or_none),
+    "config:token:hourly_budget": _ConfigKey(_coerce_int_or_none),
+    "config:token:fallback_model": _ConfigKey(_coerce_str),
+    "config:token:flush_interval": _ConfigKey(_coerce_int),
 }
 
 # Prefixes used by HR-9 guards (so adding more base_url:* / api_keys:* keys

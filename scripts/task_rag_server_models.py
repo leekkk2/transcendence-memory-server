@@ -561,6 +561,34 @@ class UsageCleanupResponse(BaseModel):
     kept_rows: int = 0
 
 
+# ── Token usage / cost (blueprint P3 §7) ────────────────────────────────────
+
+
+class TokenUsageDimensionRow(BaseModel):
+    """One bucket of a single dimension (by_model / by_task_type / by_agent)."""
+
+    key: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class TokenUsageTotals(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    # Live (in-flight, not-yet-flushed) total overlaid from Redis when available.
+    live_total_tokens: int = 0
+
+
+class TokenUsageResponse(BaseModel):
+    window: str
+    by_model: list[TokenUsageDimensionRow] = Field(default_factory=list)
+    by_task_type: list[TokenUsageDimensionRow] = Field(default_factory=list)
+    by_agent: list[TokenUsageDimensionRow] = Field(default_factory=list)
+    totals: TokenUsageTotals = Field(default_factory=TokenUsageTotals)
+
+
 class ContainerMetadataPayload(BaseModel):
     """container_metadata 表的 upsert 请求体（所有字段可选 / partial update）。"""
 

@@ -219,6 +219,80 @@ async def cfg_set(key: str, value: Any, ttl: Optional[int] = None) -> bool:
         return False
 
 
+# ── Counter primitives (blueprint P3 token metering / circuit breaker) ──────
+# Token usage counts + quota breaker markers live in Redis hashes / strings.
+# Every helper degrades to a no-op (returning None / {} / False) when Redis is
+# down or disabled — the token meter treats that as "no counting this turn" and
+# the quota gate as "fail-open" (never block the request). They never raise.
+
+
+async def hincr(key: str, field: str, amount: int = 1) -> Optional[int]:
+    """HINCRBY `field` by `amount` in hash `key`; return the new value or None.
+
+    None means Redis was unavailable (or the op failed) — the caller treats a
+    None as "count not recorded" and carries on. Never raises.
+    """
+    client = await get_client()
+    if client is None:
+        return None
+    try:
+        return int(await client.hincrby(key, field, amount))
+    except Exception:  # noqa: BLE001 - degrade to no-op, never raise
+        return None
+
+
+async def expire_at(key: str, ts: int) -> bool:
+    """EXPIREAT `key` at the absolute unix timestamp `ts`. Returns success.
+
+    Used to pin a daily/hourly counter's TTL to the end of its window so stale
+    buckets self-evict. Returns False when Redis is down or the op failed (the
+    counter still exists, just without a TTL — harmless). Never raises.
+    """
+    client = await get_client()
+    if client is None:
+        return False
+    try:
+        await client.expireat(key, int(ts))
+        return True
+    except Exception:  # noqa: BLE001 - degrade to no-op, never raise
+        return False
+
+
+async def hgetall(key: str) -> dict[str, str]:
+    """HGETALL `key`; return its field→value map, or `{}` on any failure.
+
+    An empty dict is returned both for a missing key and for a Redis outage —
+    the quota gate treats either as "no live count" and fails open. Never raises.
+    """
+    client = await get_client()
+    if client is None:
+        return {}
+    try:
+        result = await client.hgetall(key)
+        return result or {}
+    except Exception:  # noqa: BLE001 - degrade to empty, never raise
+        return {}
+
+
+async def get_str(key: str, default: Any = None) -> Any:
+    """GET `key` as a string (breaker marker reads). Mirrors cfg_get semantics.
+
+    Returns `default` when Redis is down/disabled, the key is missing, or any
+    error occurs. Never raises. (cfg_get already does this; get_str is a
+    P3-named alias so the breaker code reads intent-clearly.)
+    """
+    return await cfg_get(key, default)
+
+
+async def set_str(key: str, value: Any, ttl: Optional[int] = None) -> bool:
+    """SET `key`=`value` (optional TTL seconds) for breaker markers.
+
+    Thin alias over cfg_set; returns False when Redis is down or the op failed.
+    Never raises.
+    """
+    return await cfg_set(key, value, ttl=ttl)
+
+
 # ── Pub/Sub primitives (blueprint P1 config hot-reload) ─────────────────────
 # These back the cross-process `config_updated` broadcast: one node writes a
 # config override, publishes the changed keys, and every other node's

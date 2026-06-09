@@ -68,6 +68,64 @@ _LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
 _LLM_RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "1.5"))
 
 
+# token_meter is import-safe (no eager connect; degrades to no-op when Redis is
+# down). Resolved lazily + cached so a slim test env that lacks it can't break
+# the LLM gateway import. Dual import path mirrors model_fallback above.
+_token_meter: Any = None
+_token_meter_resolved = False
+
+
+def _get_token_meter() -> Any:
+    """Lazily resolve scripts.token_meter once; None if unavailable. The LLM
+    gateway must never fail to import because metering is missing."""
+    global _token_meter, _token_meter_resolved
+    if _token_meter_resolved:
+        return _token_meter
+    _token_meter_resolved = True
+    mod = (
+        sys.modules.get('scripts.token_meter')
+        or sys.modules.get('token_meter')
+    )
+    if mod is None:
+        try:
+            import token_meter as mod  # type: ignore[no-redef]
+        except ImportError:
+            try:
+                from scripts import token_meter as mod  # type: ignore[no-redef]
+            except ImportError:  # pragma: no cover - metering absent
+                mod = None
+    _token_meter = mod
+    return _token_meter
+
+
+def _record_usage_fire_and_forget(model: str, usage: dict[str, Any]) -> None:
+    """Schedule token_meter.record_usage as a detached task. Best-effort: if the
+    meter is absent, there's no running loop, or anything raises, this is a
+    silent no-op — it MUST NOT perturb call_openai_chat's return/retry/fallback.
+
+    task_type / agent_id come from the request-scoped ContextVars (defaults
+    'rag_retrieval' / 'unknown' when unset, e.g. worker subprocess paths)."""
+    meter = _get_token_meter()
+    if meter is None:
+        return
+    try:
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        if prompt_tokens <= 0 and completion_tokens <= 0:
+            return  # upstream surfaced no usage — nothing to count
+        task_type = meter.get_task_type()
+        agent_id = meter.get_agent_id()
+        # We're inside an async LLM call → a loop is running. create_task keeps
+        # this off the response's critical path (fire-and-forget).
+        asyncio.get_running_loop().create_task(
+            meter.record_usage(
+                model, task_type, agent_id, prompt_tokens, completion_tokens,
+            )
+        )
+    except Exception:  # noqa: BLE001 - metering must never break the LLM call
+        pass
+
+
 async def call_openai_chat(
     *,
     base_url: str,
@@ -111,6 +169,11 @@ async def call_openai_chat(
                 content = data["choices"][0]["message"].get("content")
                 if not content:
                     raise ValueError(f"{label} returned empty content: {str(data)[:300]}")
+                # P3 token metering (fire-and-forget, never affects this return).
+                # Capturing usage and scheduling record_usage happens on a best-
+                # effort side path; any failure is swallowed inside the helper so
+                # the LLM contract / fallback / retry semantics stay byte-identical.
+                _record_usage_fire_and_forget(model, data.get("usage") or {})
                 return content
             except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
                 last_exc = exc
@@ -147,6 +210,14 @@ def make_llm_func(chain: list) -> Any:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
+        # P3 quota circuit breaker (opt-in, default OFF). With no token budget
+        # configured this resolves to the original chain in O(1) without a Redis
+        # touch → byte-identical to pre-P3. Only when a budget is set AND the
+        # agent is over it do we swap the primary profile's MODEL to the
+        # configured fallback (base_url/api_key unchanged → HR-9 routing through
+        # the sanctioned gateway is preserved).
+        eff_chain = await _apply_quota_breaker(chain)
+
         async def _executor(profile: Any) -> str:
             return await call_openai_chat(
                 base_url=profile.base_url,
@@ -158,10 +229,71 @@ def make_llm_func(chain: list) -> Any:
             )
 
         return await model_fallback.run_with_fallback(
-            model_fallback.CATEGORY_LLM, chain, _executor,
+            model_fallback.CATEGORY_LLM, eff_chain, _executor,
         )
 
     return _llm_func
+
+
+async def _apply_quota_breaker(chain: list) -> list:
+    """Return the LLM chain to actually run, applying the opt-in token quota
+    breaker. Default (no budget) / Redis down / meter absent → returns `chain`
+    unchanged (no Redis touch on the no-budget short-circuit inside over_budget).
+
+    When the current agent is over budget AND config:token:fallback_model is
+    set, the chain's PRIMARY profile is cloned with its `model` swapped to the
+    fallback — same base_url/api_key (HR-9: still routes via the gateway), so
+    only the model string changes. A structured `circuit_breaker` field is logged
+    (blueprint B.4) for Agent-side decisioning. Never raises — any failure falls
+    back to the original chain (fail-open)."""
+    meter = _get_token_meter()
+    if meter is None or not chain:
+        return chain
+    try:
+        primary = chain[0]
+        decision = await meter.over_budget(meter.get_agent_id(), primary.model)
+        if not decision.get("over"):
+            return chain
+        fallback_model = decision.get("fallback_model")
+        if not fallback_model:
+            # Over budget but no fallback configured → leave the chain as-is
+            # (we don't hard-reject; the marker + log already record the trip).
+            logger.warning(
+                "circuit_breaker=%s",
+                {
+                    "open": True, "reason": "token_quota",
+                    "scope": decision.get("scope"),
+                    "agent_id": meter.get_agent_id(),
+                    "original_model": primary.model,
+                    "fallback_model": None,
+                    "applied": False,
+                },
+            )
+            return chain
+        import dataclasses
+
+        downgraded = dataclasses.replace(
+            primary,
+            name=f"{primary.name}+quota-fallback",
+            model=str(fallback_model),
+        )
+        logger.warning(
+            "circuit_breaker=%s",
+            {
+                "open": True, "reason": "token_quota",
+                "scope": decision.get("scope"),
+                "agent_id": meter.get_agent_id(),
+                "original_model": primary.model,
+                "fallback_model": str(fallback_model),
+                "applied": True,
+            },
+        )
+        # Keep the original fallbacks behind the downgraded primary so the chain
+        # still degrades gracefully if even the cheap model is unavailable.
+        return [downgraded, *chain[1:]]
+    except Exception as exc:  # noqa: BLE001 - fail-open: never block on the gate
+        logger.debug("quota breaker swallowed error (fail-open): %s", exc)
+        return chain
 
 
 async def _llm_func(prompt: str, system_prompt: str | None = None, **_: Any) -> str:
