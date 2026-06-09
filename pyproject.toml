@@ -31,6 +31,7 @@ dependencies = [
     "lightrag-hku>=1.4.13",
     "python-multipart>=0.0.6",
     "pyyaml>=6.0",  # v0.7.0: profiles.yaml 加载需要
+    "redis>=5,<6",  # blueprint P0: governance state (config/token/breaker), redis.asyncio. No hiredis (pure-python, avoids native build).
 ]
 
 [project.urls]
@@ -58,3 +59,6 @@ pythonpath = ["src", "scripts"]
 # --ignore=tests/test_cli: cli tests 属于 transcendence-memory-cli 独立 wheel,
 # 不在 server test 范围内，由 .github/workflows/publish-cli.yml 单独跑
 addopts = "-q --ignore=tests/test_cli"
+markers = [
+    "integration: tests requiring a live external service (e.g. a real Redis); skipped by default unit runs, run in smoke/integration stage",
+]

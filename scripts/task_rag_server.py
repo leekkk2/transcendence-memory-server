@@ -178,6 +178,14 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts import usage_analytics
     from scripts.usage_analytics import UsageMiddleware
 
+# redis_client is import-safe (no eager connect, optional redis dependency) so a
+# plain import is fine — it never touches the network and degrades gracefully
+# when Redis / the redis package is absent.
+try:
+    import redis_client
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import redis_client
+
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 
@@ -624,6 +632,17 @@ async def lifespan(app: FastAPI):
     global JOB_WORKER
     _startup_banner()
     _verify_embedding_dim_consistency()
+    # Redis governance foundation (blueprint P0). Non-fatal: a down/disabled
+    # Redis only logs `degraded` and the main RAG path is unaffected. We do one
+    # best-effort ping so the log clearly states startup posture.
+    if await redis_client.init_pool():
+        if await redis_client.is_available():
+            logger.info('[redis] connected — governance state available')
+        else:
+            logger.warning('[redis] configured but ping failed at startup — '
+                           'running degraded (governance falls back to defaults)')
+    else:
+        logger.info('[redis] disabled — governance falls back to defaults')
     queue = get_job_queue()
     if not DISABLE_WORKER:
         scripts_dir = SERVER_SCRIPTS  # task_rag_lancedb_ingest.py 等都在这里
@@ -637,6 +656,7 @@ async def lifespan(app: FastAPI):
     finally:
         if JOB_WORKER is not None:
             JOB_WORKER.stop(join_timeout=10.0)
+        await redis_client.close_pool()
 
 
 app = FastAPI(lifespan=lifespan)

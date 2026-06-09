@@ -30,6 +30,14 @@ services:
         required: false
     environment:
       WORKSPACE: /data
+    depends_on:
+      # Redis backs blueprint governance state (config hot-reload, token
+      # counters, circuit breakers). It is a soft dependency at the app layer
+      # (redis_client degrades gracefully when Redis is down), but waiting for
+      # the ping healthcheck here means a fresh `up -d` never races the first
+      # config read against an unready Redis.
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 30s
     mem_limit: ${TM_MEM_LIMIT:-3g}
@@ -56,6 +64,44 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  redis:
+    # Upstream official image — remote hosts `docker compose pull` it directly,
+    # no local/remote build (R1/R5). Pin the 7-alpine line for a small footprint.
+    image: redis:7-alpine
+    pull_policy: always
+    # appendonly + RDB snapshots: governance counters / circuit-breaker TTLs
+    # survive a restart. `--save "900 1 300 10"` keeps RDB as a coarse backstop
+    # alongside the AOF. No host port published — only the rag-server on the
+    # default compose network reaches it (in-cluster, not externally exposed).
+    command: ["redis-server", "--appendonly", "yes", "--save", "900 1 300 10"]
+    volumes:
+      # Redis needs a WRITABLE /data for AOF + RDB. This is why the redis
+      # service is NOT read_only (unlike rag-server) — locking its rootfs would
+      # break appendonly persistence.
+      - redis-data:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: ${TM_REDIS_MEM_LIMIT:-256m}
+    memswap_limit: ${TM_REDIS_MEM_LIMIT:-256m}
+    mem_reservation: ${TM_REDIS_MEM_RESERVATION:-64m}
+    cpus: ${TM_REDIS_CPUS:-0.5}
+    pids_limit: ${TM_REDIS_PIDS_LIMIT:-128}
+    oom_score_adj: ${TM_REDIS_OOM_SCORE_ADJ:-700}
+    # NOTE: redis must write /data (AOF/RDB) — do NOT set read_only:true here.
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
 volumes:
   # Persistent application data — LanceDB tables and memory_objects.jsonl live here.
   # NEVER recreate this volume during a normal deploy — that's how memories get lost.
@@ -63,4 +109,8 @@ volumes:
   # Pre-warmed multimodal model cache (full flavor). Survives image updates so
   # mineru doesn't re-download multi-hundred-MB models on every pull.
   mineru-models:
+  # Redis AOF + RDB persistence (governance config, token counters, circuit
+  # breakers). NEVER recreate this volume during a normal deploy — that's how
+  # the governance state (quota counters, open breakers) gets wiped.
+  redis-data:
   # `rclone-archive` (opt-in) is declared in docker-compose.override.example.yml.

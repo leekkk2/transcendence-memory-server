@@ -52,10 +52,17 @@ services:
     env_file:
       - path: .env.green
         required: true
+    depends_on:
+      # GREEN 连自己的 redis-green，绝不连 prod redis（否则会污染 prod 的
+      # token 计数 / 熔断态 / 配置热重载 key）。等 ping healthy 再起。
+      redis-green:
+        condition: service_healthy
     environment:
       WORKSPACE: /data
       # 临时域名对外回显（/health、signed-url 等用），指向 canary 域。
       RAG_ADVERTISED_ENDPOINT: ${TM_GREEN_ADVERTISED:-https://rags-canary.example.com}
+      # 强制指向 GREEN 专属 redis，与 prod 的 redis(默认 host=redis) 物理隔离。
+      REDIS_URL: ${TM_GREEN_REDIS_URL:-redis://redis-green:6379/0}
     restart: unless-stopped
     stop_grace_period: 30s
     # 资源上限独立于 prod，避免 GREEN 抢占拖垮 BLUE。按部署主机实际余量保守取值。
@@ -77,6 +84,41 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── GREEN 专属 Redis（治理状态隔离）─────────────────────────────────────
+  # 独立 container + 独立 volume，绝不复用 prod redis / redis-data。
+  # 校验新镜像的治理链路（配置热重载 / token 计数 / 熔断）时，所有读写都落
+  # 在 redis-data-green，cutover 决策前可随时 `docker volume rm redis-data-green`
+  # 而不触碰 prod 治理态。
+  redis-green:
+    image: redis:7-alpine
+    pull_policy: missing
+    container_name: tm-redis-green
+    command: ["redis-server", "--appendonly", "yes", "--save", "900 1 300 10"]
+    volumes:
+      - redis-data-green:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: ${TM_GREEN_REDIS_MEM_LIMIT:-256m}
+    memswap_limit: ${TM_GREEN_REDIS_MEM_LIMIT:-256m}
+    mem_reservation: ${TM_GREEN_REDIS_MEM_RESERVATION:-64m}
+    cpus: ${TM_GREEN_REDIS_CPUS:-0.5}
+    pids_limit: ${TM_GREEN_REDIS_PIDS_LIMIT:-128}
+    oom_score_adj: ${TM_GREEN_REDIS_OOM_SCORE_ADJ:-800}  # 比 prod redis 更易被 OOM 牺牲
+    # redis 要写 /data（AOF/RDB）→ 同样不设 read_only。
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     logging:
       driver: json-file
       options:
@@ -115,6 +157,9 @@ volumes:
   # 可随时 `docker volume rm tm-data-green` 而不触碰生产数据。
   tm-data-green:
   mineru-models-green:
+  # GREEN 专属 redis 持久化卷 —— 与 prod redis-data 完全独立，绝不污染 prod
+  # 治理态（token 计数 / 熔断 / 配置 key）。同理可随时 rm 而不触碰生产。
+  redis-data-green:
   # 注意：本文件**不声明** prod 的 tm-data / mineru-models。若用策略 B 只读挂
   # prod 卷，需改用 external 引用现网卷（见 runbook §3.3），切勿在此重新声明
   # 同名卷 —— 同名重声明 + 不同 project 会创建出 <project>_tm-data 新卷，
