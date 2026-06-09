@@ -186,6 +186,14 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts import redis_client
 
+# config_store is import-safe (no eager connect, cache-only when Redis/DB down)
+# and backs the P1 runtime config plane (scalar RAG hot-reload). Reads degrade
+# to the profiles.yaml static default, so importing it never changes behavior.
+try:
+    import config_store
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import config_store
+
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
 
@@ -643,6 +651,15 @@ async def lifespan(app: FastAPI):
                            'running degraded (governance falls back to defaults)')
     else:
         logger.info('[redis] disabled — governance falls back to defaults')
+    # Config center (blueprint P1). Non-fatal: load persisted scalar overrides
+    # into the process cache, then start the live `config_updated` subscriber.
+    # A down Redis/DB only means no hot-reload — every config read falls back to
+    # the profiles.yaml static value, so the main RAG path is unaffected.
+    try:
+        await config_store.load_all()
+        await config_store.start_config_subscriber()
+    except Exception as exc:  # noqa: BLE001 - config plane must never block boot
+        logger.warning('[config] init failed, running on static defaults: %s', exc)
     queue = get_job_queue()
     if not DISABLE_WORKER:
         scripts_dir = SERVER_SCRIPTS  # task_rag_lancedb_ingest.py 等都在这里
@@ -656,6 +673,7 @@ async def lifespan(app: FastAPI):
     finally:
         if JOB_WORKER is not None:
             JOB_WORKER.stop(join_timeout=10.0)
+        await config_store.stop_config_subscriber()
         await redis_client.close_pool()
 
 
@@ -1093,27 +1111,37 @@ def _get_score_threshold_default() -> float | None:
     """从 ProfileSet 拿 score-gate 阈值（L2 距离上界，None=关闭）。
 
     Phase 1：默认关闭（opt-in）。任何加载异常回退 None（关闭），不破坏旧路径。
+
+    P1 配置中心：profiles.yaml 的静态值作为 default，仅当 Redis/DB 有热重载覆盖
+    （Dashboard 改过）时才用覆盖值。无覆盖时 get_cached 原样返回 default →
+    与 P1 前逐字节一致（similarity_threshold 仍 None）。config_store 全程降级安全。
     """
     try:
         try:
             from embedding_registry import get_registry as _get_registry
         except ModuleNotFoundError:  # pragma: no cover - package import path
             from scripts.embedding_registry import get_registry as _get_registry
-        return _get_registry().profiles.similarity_threshold
+        static_default = _get_registry().profiles.similarity_threshold
     except Exception:
-        return None
+        static_default = None
+    return config_store.get_cached('config:rag:similarity_threshold', static_default)
 
 
 def _get_citation_enabled() -> bool:
-    """是否在 /search 响应里投影 citations 数组。异常回退 True（默认开）。"""
+    """是否在 /search 响应里投影 citations 数组。异常回退 True（默认开）。
+
+    P1 配置中心：同 _get_score_threshold_default —— profiles 静态值作 default，
+    有热重载覆盖才用覆盖；无覆盖逐字节不变（仍默认 True）。
+    """
     try:
         try:
             from embedding_registry import get_registry as _get_registry
         except ModuleNotFoundError:  # pragma: no cover - package import path
             from scripts.embedding_registry import get_registry as _get_registry
-        return bool(_get_registry().profiles.citation_enabled)
+        static_default = bool(_get_registry().profiles.citation_enabled)
     except Exception:
-        return True
+        static_default = True
+    return config_store.get_cached('config:rag:citation_enabled', static_default)
 
 
 def _container_has_chunks_table(name: str) -> bool:
