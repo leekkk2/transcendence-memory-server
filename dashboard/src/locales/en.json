@@ -11,7 +11,9 @@
     "containers": "Containers",
     "memory": "Memory",
     "usage": "Usage",
+    "tokens": "Token cost",
     "jobs": "Jobs",
+    "config": "Config",
     "settings": "Settings"
   },
   "topbar": {
@@ -149,6 +151,60 @@
     "dashboard": "dashboard",
     "server": "server",
     "serverHint": "full version surface in /health JSON response"
+  },
+  "config": {
+    "title": "Configuration",
+    "save": "Save changes",
+    "saving": "saving…",
+    "saved": "saved",
+    "saveError": "save failed",
+    "dirtyCount": "{{count}} unsaved",
+    "modified": "modified",
+    "unsaved": "unsaved",
+    "resetDefault": "reset to default",
+    "defaultLabel": "default",
+    "baseUrlHint": "must point at the sanctioned gateway",
+    "numberPlaceholder": "leave blank to use default",
+    "textPlaceholder": "value",
+    "secretSet": "configured ✓",
+    "secretNotSet": "not set",
+    "secretPlaceholder": "enter new key to replace",
+    "clearInput": "clear",
+    "removeSecret": "remove",
+    "secretWillClear": "will clear on save",
+    "footnote": "Sensitive keys are write-only — the server never returns stored secrets. Live keys (similarity_threshold, citation_enabled) apply immediately; model/token keys persist now and take effect after the live reader picks them up.",
+    "module": {
+      "rag": "RAG retrieval",
+      "token": "Token budget",
+      "model": "Model matrix"
+    },
+    "moduleHint": {
+      "rag": "Retrieval & citation behavior — live keys apply without restart.",
+      "token": "Per-day / per-hour token budgets and fallback model.",
+      "model": "Gateway base URLs and API keys. Base URL writes are validated server-side."
+    },
+    "reason": {
+      "unknown_key": "unknown config key",
+      "rejected_base_url_host": "base URL host not allowed (must be a sanctioned gateway)",
+      "invalid_value_or_persist_failed": "invalid value or failed to persist"
+    }
+  },
+  "tokenCost": {
+    "title": "Token cost (7d)",
+    "totalTokens": "Total tokens",
+    "promptTokens": "Prompt tokens",
+    "completionTokens": "Completion tokens",
+    "liveTotal": "Live total",
+    "byModel": "by model",
+    "byTaskType": "by task type",
+    "byAgent": "by agent",
+    "colModel": "Model",
+    "colTaskType": "Task type",
+    "colAgent": "Agent",
+    "colPrompt": "Prompt",
+    "colCompletion": "Completion",
+    "colTotal": "Total",
+    "noData": "no data"
   },
   "profile": {
     "embedding": "embedding",

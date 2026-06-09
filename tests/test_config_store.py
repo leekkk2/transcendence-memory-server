@@ -78,6 +78,77 @@ def test_set_does_not_raise_when_redis_disabled():
     assert config_store.get_cached("config:rag:citation_enabled", True) is False
 
 
+def test_set_clear_writer_node_converges_to_caller_default():
+    """回归（reviewer P2 #1 major）：写节点 clear override 后收敛到 caller 静态默认。
+
+    set(citation_enabled, None) 清除覆盖后，写节点 get_cached 必须返回 caller 传入的
+    静态默认（True），而非 coerced-NULL（_coerce_bool(None)=False）。修复前 set 对
+    stored=None 走 _cache_put(key, None) → get_cached 找到 present NULL → coerce 成
+    False（reset-to-default 回归）。修复后写节点 _cache_evict → 退 caller 默认，
+    与对端 refresh 见 present-but-NULL 行 evict 的收敛行为完全一致。
+
+    同时验证 DB 仍保留该键的 present-but-NULL 行（供对端 refresh evict 传播，不删行）。
+    """
+    key = "config:rag:citation_enabled"
+    # 先设非默认值 False，再清除为 None。
+    assert asyncio.run(config_store.set(key, False)) is True
+    assert config_store.get_cached(key, True) is False
+    assert asyncio.run(config_store.set(key, None)) is True
+    # 写节点：清除后退 caller 静态默认 True（非 coerced-NULL False）。
+    assert config_store.get_cached(key, True) is True
+    # DB 仍存在该键的 present-but-NULL 行（found=True, value=None）—— 不删行。
+    store = config_store._get_store()
+    found, raw = store.get_row(key)
+    assert found is True
+    assert raw is None
+
+
+def test_describe_key_is_override_false_after_clear():
+    """回归（reviewer P2 #2 minor）：clear override 后 describe_key is_override=False。
+
+    set(非默认)→is_override True；set(None) clear 后 describe 该键 is_override 必须
+    False（UI 'modified' 徽章不再残留）。修复前 describe_key 用 get_row found-ness
+    推 is_override，present-but-NULL 行仍 found=True → is_override 错为 True。
+    """
+    key = "config:rag:similarity_threshold"
+    # set 非默认值 → is_override True。
+    assert asyncio.run(config_store.set(key, 0.42)) is True
+    d = config_store.describe_key(key)
+    assert d["is_override"] is True
+    assert d["value"] == pytest.approx(0.42)
+    # clear（set None）→ present-but-NULL 行 → is_override False、value 退 default。
+    assert asyncio.run(config_store.set(key, None)) is True
+    d2 = config_store.describe_key(key)
+    assert d2["is_override"] is False
+    assert d2["value"] is None  # 退 registered default
+
+
+def test_describe_key_sensitive_configured_false_after_clear():
+    """回归（reviewer P2 #3 配套）：sensitive 键 PUT value:'' 清除后 configured=False。
+
+    set(secret, 非空) → configured True；set(secret, '') 清除 → configured False
+    且 is_override False。空串对敏感键存 NULL 行（非加密空串），与非敏感 clear 一致，
+    既报 not-configured 又能经 refresh evict 传播到对端。永不回显明文/密文。
+    """
+    key = "config:model:api_keys:llm"
+    assert asyncio.run(config_store.set(key, "sk-real-secret")) is True
+    d = config_store.describe_key(key)
+    assert d["configured"] is True
+    assert d["is_override"] is True
+    assert d["value"] is None  # 敏感键永不回显
+    # PUT value:'' 清除 → configured False。
+    assert asyncio.run(config_store.set(key, "")) is True
+    d2 = config_store.describe_key(key)
+    assert d2["configured"] is False
+    assert d2["is_override"] is False
+    assert d2["value"] is None
+    # DB 行存在但 NULL（非加密空串）—— 供对端 refresh evict。
+    store = config_store._get_store()
+    found, raw = store.get_row(key)
+    assert found is True
+    assert raw is None
+
+
 # ── (b) DB 往返：set → DB 持久 → 重 load_all → get_cached 反映 ───────────────
 
 
@@ -120,8 +191,17 @@ def test_coerce_bool_truthy_and_falsy():
 
 
 def test_coerce_none_sentinel_for_float_key():
-    """float|None key：存空串 / 'none' → coerce 回 None（opt-in 关闭语义）。"""
-    asyncio.run(config_store.set("config:rag:similarity_threshold", None))
+    """float|None key：'none' / 'null' 等 OFF 哨兵串经 coerce 回 None。
+
+    验证 coercer 的 None 哨兵语义本身（存非空哨兵串 → 读回 None），与「clear
+    override」路径解耦。注意 set(key, None) 是「清除覆盖」而非「存 None 值」——
+    清除后写节点 evict、get_cached 退 caller 静态默认（见
+    test_set_clear_writer_node_converges_to_caller_default，reviewer P2 #1）。
+    本用例改测存「字面 'none' 串」这一显式 OFF 覆盖：它是一个真实覆盖行，coerce
+    回 None。
+    """
+    # 存字面 'none' 串 = 一个显式 OFF 覆盖（present 行、值非空），coerce 回 None。
+    asyncio.run(config_store.set("config:rag:similarity_threshold", "none"))
     assert config_store.get_cached("config:rag:similarity_threshold", 0.5) is None
 
 

@@ -4,9 +4,11 @@ import {
   Activity,
   Boxes,
   Brain,
+  Coins,
   LineChart,
   ListChecks,
   Settings as SettingsIcon,
+  SlidersHorizontal,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '../lib/format';
@@ -29,7 +31,9 @@ const ITEMS: NavItem[] = [
   { to: '/containers', key: 'nav.containers', icon: Boxes },
   { to: '/memory', key: 'nav.memory', icon: Brain },
   { to: '/usage', key: 'nav.usage', icon: LineChart, badge: '7d' },
+  { to: '/tokens', key: 'nav.tokens', icon: Coins, badge: '7d' },
   { to: '/jobs', key: 'nav.jobs', icon: ListChecks },
+  { to: '/config', key: 'nav.config', icon: SlidersHorizontal },
   { to: '/settings', key: 'nav.settings', icon: SettingsIcon },
 ];
 

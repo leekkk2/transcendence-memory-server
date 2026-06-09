@@ -6,7 +6,7 @@
  * (Overview 10s, Jobs 10s, Usage 5min cache) live with the hooks so it's
  * obvious which views fire requests at which cadence.
  */
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from './api';
 
 export interface HealthResponse {
@@ -171,5 +171,95 @@ export function useProfiles() {
     queryKey: ['profiles'],
     queryFn: () => api.get('/admin/profiles'),
     staleTime: 60_000,
+  });
+}
+
+// ---- Config editor (GET/PUT /admin/config) ----
+// `value` is the live coerced value (null for sensitive keys — the server never
+// echoes secrets). `configured` is only meaningful for sensitive (api_keys:*)
+// keys: true = a secret is stored (render a write-only field), false = not set.
+// Non-sensitive keys carry configured=null. See P2 backend contract.
+export type ConfigType = 'bool' | 'int' | 'float' | 'str';
+
+export interface ConfigItem {
+  key: string;
+  module: string;
+  type: ConfigType;
+  value: string | number | boolean | null;
+  is_override: boolean;
+  default: string | number | boolean | null;
+  configured: boolean | null;
+}
+
+export interface ConfigListResponse {
+  items: ConfigItem[];
+  count: number;
+}
+
+export interface ConfigUpdate {
+  key: string;
+  value: string | number | boolean | null;
+}
+
+export interface ConfigUpdateResult {
+  key: string;
+  ok: boolean;
+  rejected_reason: 'unknown_key' | 'rejected_base_url_host' | 'invalid_value_or_persist_failed' | null;
+}
+
+export interface ConfigUpdateResponse {
+  results: ConfigUpdateResult[];
+  applied: number;
+  rejected: number;
+}
+
+export function useConfig() {
+  return useQuery<ConfigListResponse>({
+    queryKey: ['config'],
+    queryFn: () => api.get('/admin/config'),
+    staleTime: 30_000,
+  });
+}
+
+export function useUpdateConfig() {
+  const qc = useQueryClient();
+  return useMutation<ConfigUpdateResponse, Error, ConfigUpdate[]>({
+    mutationFn: (updates) => api.put('/admin/config', { updates }),
+    // PUT never echoes written values (secrets stay server-side); refetch GET
+    // so value / is_override / configured reflect what actually persisted.
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['config'] });
+    },
+  });
+}
+
+// ---- Token cost dashboard (GET /admin/usage/tokens) — P3 surface ----
+export interface TokenUsageRow {
+  key: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface TokenUsageTotals {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  live_total_tokens: number;
+}
+
+export interface TokenUsageResponse {
+  window: string;
+  by_model: TokenUsageRow[];
+  by_task_type: TokenUsageRow[];
+  by_agent: TokenUsageRow[];
+  totals: TokenUsageTotals;
+}
+
+export function useTokenUsage(window: string = '7d') {
+  return useQuery<TokenUsageResponse>({
+    queryKey: ['usage', 'tokens', window],
+    queryFn: () => api.get(`/admin/usage/tokens?window=${encodeURIComponent(window)}`),
+    staleTime: 5 * 60_000,
   });
 }

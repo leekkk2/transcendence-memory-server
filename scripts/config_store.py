@@ -145,34 +145,74 @@ def _coerce_str(raw: Any) -> str:
 
 
 class _ConfigKey:
-    __slots__ = ("coerce", "sensitive")
+    __slots__ = ("coerce", "sensitive", "typename", "default")
 
-    def __init__(self, coerce: Callable[[Any], Any], sensitive: bool = False):
+    def __init__(
+        self,
+        coerce: Callable[[Any], Any],
+        sensitive: bool = False,
+        typename: str = "str",
+        default: Any = None,
+    ):
         self.coerce = coerce
         self.sensitive = sensitive
+        # typename / default are PURE METADATA for the read-only Dashboard config
+        # endpoint (P2 GET /admin/config) — they have NO effect on get_cached /
+        # set / refresh runtime behavior (the live RAG-path readers pass their own
+        # profiles.yaml-derived default to get_cached, which still wins). `default`
+        # here is the registered "no-override" sentinel the Dashboard shows when a
+        # key has never been set; for keys whose true default is the live
+        # profiles.yaml value (similarity_threshold / citation_enabled) it is the
+        # opt-in sentinel (None / True) the request path falls back to pre-P1.
+        self.typename = typename
+        self.default = default
 
 
 KNOWN_CONFIG: dict[str, _ConfigKey] = {
     # ── Live RAG knobs — actually hot-reloaded into /search & /query this round ─
-    "config:rag:similarity_threshold": _ConfigKey(_coerce_float_or_none),
-    "config:rag:citation_enabled": _ConfigKey(_coerce_bool),
+    "config:rag:similarity_threshold": _ConfigKey(
+        _coerce_float_or_none, typename="float", default=None
+    ),
+    "config:rag:citation_enabled": _ConfigKey(
+        _coerce_bool, typename="bool", default=True
+    ),
     # ── Registered + persistable, but no live reader yet (P2) ───────────────
-    "config:rag:fallback_template": _ConfigKey(_coerce_str),
-    "config:rag:degradation_timeout_ms": _ConfigKey(_coerce_int),
-    "config:model:base_url:llm": _ConfigKey(_coerce_str),
-    "config:model:base_url:embedding": _ConfigKey(_coerce_str),
-    "config:model:api_keys:llm": _ConfigKey(_coerce_str, sensitive=True),
-    "config:model:api_keys:embedding": _ConfigKey(_coerce_str, sensitive=True),
+    "config:rag:fallback_template": _ConfigKey(
+        _coerce_str, typename="str", default=""
+    ),
+    "config:rag:degradation_timeout_ms": _ConfigKey(
+        _coerce_int, typename="int", default=0
+    ),
+    "config:model:base_url:llm": _ConfigKey(
+        _coerce_str, typename="str", default=""
+    ),
+    "config:model:base_url:embedding": _ConfigKey(
+        _coerce_str, typename="str", default=""
+    ),
+    "config:model:api_keys:llm": _ConfigKey(
+        _coerce_str, sensitive=True, typename="str", default=""
+    ),
+    "config:model:api_keys:embedding": _ConfigKey(
+        _coerce_str, sensitive=True, typename="str", default=""
+    ),
     # ── Token metering / quota breaker (blueprint P3, §A6) ──────────────────
     # Opt-in: the live reader (token_meter.over_budget) passes default=None for
     # the budgets, so with no override present quota enforcement is OFF (= pre-P3
     # behavior, byte-identical). daily/hourly_budget coerce to int|None: empty /
     # 'none' → None (the unlimited sentinel). fallback_model + flush_interval are
     # read with their own caller defaults.
-    "config:token:daily_budget": _ConfigKey(_coerce_int_or_none),
-    "config:token:hourly_budget": _ConfigKey(_coerce_int_or_none),
-    "config:token:fallback_model": _ConfigKey(_coerce_str),
-    "config:token:flush_interval": _ConfigKey(_coerce_int),
+    "config:token:daily_budget": _ConfigKey(
+        _coerce_int_or_none, typename="int", default=None
+    ),
+    "config:token:hourly_budget": _ConfigKey(
+        _coerce_int_or_none, typename="int", default=None
+    ),
+    "config:token:fallback_model": _ConfigKey(
+        _coerce_str, typename="str", default=""
+    ),
+    "config:token:flush_interval": _ConfigKey(
+        _coerce_int, typename="int", default=0
+    ),
 }
 
 # Prefixes used by HR-9 guards (so adding more base_url:* / api_keys:* keys
@@ -456,7 +496,12 @@ async def set(key: str, value: Any) -> bool:
     if value is None:
         stored: Optional[str] = None
     elif spec.sensitive:
-        stored = _encrypt_sensitive(str(value))
+        # An empty (or whitespace-only) value clears the secret: store a NULL row
+        # (NOT an encrypted empty string) so describe_key reports configured=False
+        # and the present-but-NULL row still propagates the clear to peers via
+        # refresh() evict. This is the write-only "remove secret" path the
+        # Dashboard uses (PUT value:'').
+        stored = None if str(value).strip() == "" else _encrypt_sensitive(str(value))
     else:
         # Coerce first so we reject malformed values up front, then store the
         # canonical string. None coercion (float|None key) stores empty string.
@@ -484,9 +529,19 @@ async def set(key: str, value: Any) -> bool:
     await redis_client.publish(
         CONFIG_CHANNEL, json.dumps({"changed_keys": [key]})
     )
-    # Update this process's cache immediately so the writer node is consistent.
+    # Update this process's cache immediately so the writer node is consistent
+    # with what a peer converges to on refresh. A None `stored` means the
+    # override was cleared: the DB keeps its present-but-NULL row (so peers'
+    # refresh() can see it and _cache_evict), but THIS node must also evict —
+    # NOT _cache_put(key, None) — otherwise get_cached finds a present NULL and
+    # returns its coerced form (citation_enabled → False) instead of the caller's
+    # static default (True). Evicting makes the writer fall back to the default,
+    # matching the peer-refresh path exactly (set-to-default = reset regression).
     if not spec.sensitive:
-        _cache_put(key, stored)
+        if stored is None:
+            _cache_evict(key)
+        else:
+            _cache_put(key, stored)
     return True
 
 
@@ -620,6 +675,100 @@ def _base_url_allowed(value: Any) -> bool:
     except Exception:  # noqa: BLE001 - unparseable → reject
         return False
     return host == _ALLOWED_MODEL_BASE_HOST
+
+
+# ── Read-only introspection (P2 Dashboard GET /admin/config) ────────────────
+# Pure read helpers: enumerate KNOWN_CONFIG with each key's module / type /
+# effective value / override flag / default, applying the SAME sensitive-masking
+# discipline as /admin/profiles (never echo api_keys:* values — only a
+# `configured: bool`). These never write, never raise, and degrade to defaults
+# when the DB is unreachable (same graceful-degradation invariant as the rest of
+# this module).
+
+
+def module_for_key(key: str) -> str:
+    """Derive the UI grouping module from a `config:<module>:<...>` key.
+
+    The module is the segment right after the `config:` prefix (rag / model /
+    token / ingest / dreaming / tools …). Falls back to the raw key when the
+    shape is unexpected so the endpoint never crashes on a malformed registry.
+    """
+    parts = key.split(":")
+    if len(parts) >= 2 and parts[0] == "config":
+        return parts[1]
+    return parts[0] if parts else key
+
+
+def _effective_raw(key: str) -> tuple[bool, Optional[str]]:
+    """Return (found, raw_db_value) for a key, reading the persistent DB.
+
+    `found=True` iff a row exists in config_kv for this key (it has been `set()`
+    at least once and not absent). Reuses ConfigKVStore.get_row (P1) so a
+    present-but-NULL row (explicitly cleared override) reads as found=True,
+    value=None — the caller (describe_key) then decides is_override by whether
+    raw is a non-empty real value, so a cleared override is NOT shown as
+    modified. Degrades to (False, None) when the DB is unreachable — same as a
+    cold cache.
+    """
+    store = _get_store()
+    if store is None:
+        return (False, None)
+    try:
+        return store.get_row(key)
+    except Exception:  # noqa: BLE001 - never let a read break the endpoint
+        return (False, None)
+
+
+def describe_key(key: str) -> dict[str, Any]:
+    """Describe one known config key for the Dashboard config endpoint.
+
+    Returns a dict with: key, module, type, is_override, default, and either
+    `value` (non-sensitive: the current EFFECTIVE typed value — override if set,
+    else the registered default) or, for sensitive keys, `value=None` +
+    `configured: bool` (whether a non-empty override has been persisted). The
+    sensitive value itself is NEVER read back / decrypted / echoed — identical
+    discipline to /admin/profiles' `api_key_configured`.
+    """
+    spec = KNOWN_CONFIG[key]
+    found, raw = _effective_raw(key)
+    # is_override means the effective value TRULY differs from the registered
+    # default — not merely "a row exists". A cleared override leaves a
+    # present-but-NULL/'' row (kept so peers' refresh() can evict); that row must
+    # NOT light up the UI 'modified' badge. So a present row whose value is
+    # None/'' reads as is_override=False (= back to default). Only a present row
+    # with a non-empty real value is a live override.
+    is_override = found and raw not in (None, "")
+    out: dict[str, Any] = {
+        "key": key,
+        "module": module_for_key(key),
+        "type": spec.typename,
+        "is_override": is_override,
+        "default": spec.default,
+    }
+    if spec.sensitive:
+        # Write-only: never surface the value. `configured` = a non-empty
+        # override row exists (empty string / NULL = cleared = not configured) —
+        # now identical to is_override for sensitive keys.
+        out["value"] = None
+        out["configured"] = is_override
+        return out
+    # Non-sensitive: effective value = override coerced to its type, else the
+    # registered default. get_cached already coerces from the process cache, but
+    # we coerce the DB raw directly here so the endpoint reflects persistent
+    # truth even before a cache warm/refresh has run.
+    if is_override:
+        try:
+            out["value"] = spec.coerce(raw)
+        except Exception:  # noqa: BLE001 - bad stored value → show default
+            out["value"] = spec.default
+    else:
+        out["value"] = spec.default
+    return out
+
+
+def describe_all() -> list[dict[str, Any]]:
+    """Describe every known config key (stable KNOWN_CONFIG insertion order)."""
+    return [describe_key(key) for key in KNOWN_CONFIG]
 
 
 # ── Test-only reset ─────────────────────────────────────────────────────────

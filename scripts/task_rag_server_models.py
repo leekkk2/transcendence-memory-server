@@ -589,6 +589,102 @@ class TokenUsageResponse(BaseModel):
     totals: TokenUsageTotals = Field(default_factory=TokenUsageTotals)
 
 
+# ── Runtime config center (blueprint P2 · GET/PUT /admin/config) ────────────
+# Read/write models for the Dashboard "Config" view. They mirror config_store's
+# read-only describe_key() output and feed config_store.set() on write. The
+# sensitive-masking contract (api_keys:* never echo a value, only `configured`)
+# is enforced server-side in config_store — these models just carry it through.
+
+
+class ConfigItem(BaseModel):
+    """One known config key as surfaced to the Dashboard.
+
+    `value` is the current EFFECTIVE value (override if set, else `default`) for
+    non-sensitive keys. For sensitive keys (api_keys:*) `value` is always None and
+    `configured` tells the UI whether a secret has been persisted (so the input
+    can render as a write-only "•••• set" affordance) — the secret is NEVER
+    echoed, mirroring /admin/profiles' `api_key_configured`.
+    """
+
+    key: str = Field(..., description='Full config key, e.g. config:rag:similarity_threshold')
+    module: str = Field(..., description='UI grouping derived from the key prefix: rag / model / token / …')
+    type: Literal['int', 'float', 'bool', 'str'] = Field(
+        ..., description='Coerced value type — drives the right input widget client-side.'
+    )
+    value: object | None = Field(
+        default=None,
+        description='Effective typed value (override if set, else default). Always null for sensitive keys.',
+    )
+    is_override: bool = Field(
+        default=False,
+        description='True iff a persisted override row exists (value differs from the registered default).',
+    )
+    default: object | None = Field(
+        default=None,
+        description='Registered no-override default the request path falls back to (sentinel for opt-in keys).',
+    )
+    configured: bool | None = Field(
+        default=None,
+        description='Sensitive keys only: whether a non-empty secret has been persisted. Null for non-sensitive keys.',
+    )
+
+
+class ConfigListResponse(BaseModel):
+    """Body for ``GET /admin/config`` — every known key in registry order."""
+
+    items: list[ConfigItem] = Field(default_factory=list)
+    count: int = 0
+
+
+class ConfigUpdate(BaseModel):
+    """One key/value pair to persist via ``PUT /admin/config``.
+
+    `value` accepts the raw client value (str/int/float/bool/None); config_store.set
+    does all coercion + the known-key / HR-9 base_url host-pin validation. Passing
+    None (or empty string for the opt-in *_or_none keys) clears the override back to
+    the registered default.
+    """
+
+    key: str = Field(..., min_length=1, description='Full config key; must be a registered KNOWN_CONFIG key.')
+    value: object | None = Field(
+        default=None,
+        description='New value (raw; coerced + validated by config_store.set). None clears the override.',
+    )
+
+
+class ConfigUpdateRequest(BaseModel):
+    """Body for ``PUT /admin/config`` — single or batch update."""
+
+    updates: list[ConfigUpdate] = Field(
+        ..., min_length=1, description='One or more key/value updates applied in order.'
+    )
+
+
+class ConfigUpdateResult(BaseModel):
+    """Per-key outcome of a ``PUT /admin/config`` update.
+
+    `ok=False` with `rejected_reason` covers an unknown key, a malformed value, an
+    HR-9 base_url host-pin violation, or a DB write failure — config_store.set
+    returns a single bool, so the reason is inferred from the rejection class
+    without echoing the offending value (which may be sensitive).
+    """
+
+    key: str
+    ok: bool
+    rejected_reason: str | None = Field(
+        default=None,
+        description='Set only when ok=False, one of: unknown_key / rejected_base_url_host / invalid_value_or_persist_failed.',
+    )
+
+
+class ConfigUpdateResponse(BaseModel):
+    """Body for ``PUT /admin/config`` — per-key results, registry-input order."""
+
+    results: list[ConfigUpdateResult] = Field(default_factory=list)
+    applied: int = Field(default=0, description='Count of updates that succeeded (ok=True).')
+    rejected: int = Field(default=0, description='Count of updates that failed (ok=False).')
+
+
 class ContainerMetadataPayload(BaseModel):
     """container_metadata 表的 upsert 请求体（所有字段可选 / partial update）。"""
 
