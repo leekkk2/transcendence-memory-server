@@ -299,6 +299,23 @@ jobs:
             $DEPLOY_SUDO docker compose logs --tail=80 rag-server || true
             exit 1
           fi
+          # Confirm the redis governance dep is healthy too. compose
+          # `depends_on: redis {condition: service_healthy}` already gates
+          # rag-server start on redis, so by here it is almost always green —
+          # this is an explicit assertion + clear log line, not a long wait.
+          redis_status=$($DEPLOY_SUDO docker compose ps --format json 2>/dev/null \
+            | python3 -c "import sys,json; \
+                data=[json.loads(l) for l in sys.stdin if l.strip()]; \
+                print(next((d.get('Health') or d.get('State','') for d in data \
+                            if d.get('Service')=='redis'), 'missing'))" 2>/dev/null \
+            || echo "unknown")
+          echo "[wait] redis: $redis_status"
+          # Redis is a SOFT dependency (the app degrades gracefully when it is
+          # down) — a non-healthy redis warns but does NOT fail the deploy.
+          if [ "$redis_status" != "healthy" ]; then
+            echo "::warning::redis not healthy (status: $redis_status) — app runs degraded; governance falls back to defaults"
+            $DEPLOY_SUDO docker compose logs --tail=40 redis || true
+          fi
           # Post-deploy cleanup: the new image is confirmed healthy and
           # serving, so every other image of this repo is a superseded
           # release — reclaim it now. The pre-pull prune keeps rolling

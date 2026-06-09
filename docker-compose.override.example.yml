@@ -68,6 +68,22 @@ services:
     # environment:
     #   OTEL_EXPORTER_OTLP_ENDPOINT: http://prometheus.internal:4317
 
+  # ─────────────────────────────────────────────────────────────────────
+  # OPT-IN: per-host Redis resource tuning
+  # ─────────────────────────────────────────────────────────────────────
+  # Defaults in docker-compose.yml (256m / 0.5 cpu) suit governance state on
+  # small VPSes. Uncomment + raise only if you store large token-counter
+  # histories or run high-frequency config Pub/Sub. Redis is a soft dependency
+  # (app degrades gracefully when it's down), so it's safe to keep it small.
+  # redis:
+  #   mem_limit: 512m
+  #   memswap_limit: 512m
+  #   cpus: 1.0
+  #   # Cap memory so a runaway counter can't OOM the box; allkeys-lru evicts
+  #   # the coldest governance keys first instead of crashing.
+  #   command: ["redis-server", "--appendonly", "yes", "--save", "900 1 300 10",
+  #             "--maxmemory", "400mb", "--maxmemory-policy", "allkeys-lru"]
+
 # Required when Option A above is used:
 # volumes:
 #   rclone-archive:

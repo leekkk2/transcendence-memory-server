@@ -241,6 +241,22 @@ TM_TEST_BASE="$ENDPOINT" TM_TEST_API_KEY="$RAG_API_KEY" TM_TEST_CONTAINER="$CONT
   pnpm --prefix "$PROJECT_ROOT/dashboard" exec playwright test || fail "Frontend E2E test failed"
 pass "Frontend E2E assertions passed"
 
+# 14. Redis governance dep connectivity (blueprint P0). Redis is a SOFT
+# dependency — the app degrades gracefully when it's down — so a failed ping
+# WARNS but does NOT fail the smoke test. This only runs when a redis compose
+# service is present (skipped on hosts that haven't adopted the redis service).
+info "14. redis governance connectivity probe (soft)"
+if command -v docker >/dev/null 2>&1 \
+   && (cd "$PROJECT_ROOT" && docker compose ps --services 2>/dev/null | grep -qx redis); then
+    if (cd "$PROJECT_ROOT" && docker compose exec -T redis redis-cli ping 2>/dev/null | grep -qi PONG); then
+        pass "redis ping -> PONG"
+    else
+        info "  redis ping failed — app runs degraded (governance falls back to defaults); not failing smoke"
+    fi
+else
+    info "  no redis compose service present — skipping (governance runs in default/degraded mode)"
+fi
+
 echo ""
-echo -e "${GREEN}=== all smoke checks passed (13 steps: core + admin/ui + dim-drift guard + frontend E2E) ===${NC}"
+echo -e "${GREEN}=== all smoke checks passed (14 steps: core + admin/ui + dim-drift guard + frontend E2E + redis probe) ===${NC}"
 
