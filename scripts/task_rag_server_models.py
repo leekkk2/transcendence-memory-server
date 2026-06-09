@@ -149,13 +149,16 @@ class SearchHit(BaseModel):
     text: str | None = None
     tags: list[str] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
+    # P4: 行号（lineStart/lineEnd）存于 metadata JSON（无新 LanceDB 列），由 server 的
+    # _meta_line 从 metadata 投影到 Citation.lineStart/lineEnd —— 故 SearchHit 不设顶层行号字段。
 
 
 class Citation(BaseModel):
     """信源溯源条目 —— 由 /search 命中的 hit 投影，供 Agent 直接引用出处。
 
     score 沿用 LanceDB L2 距离语义（越小越相关，非相似度）。section / container
-    缺失时为 None。
+    缺失时为 None。lineStart/lineEnd（P4）指向 sourcePath 中的 1-based 行范围，
+    老 chunk（未记录行号）为 None。
     """
 
     chunkId: str | None = None
@@ -163,6 +166,8 @@ class Citation(BaseModel):
     section: str | None = None
     score: float | None = None
     container: str | None = None
+    lineStart: int | None = None
+    lineEnd: int | None = None
 
 
 class SearchResponse(BaseModel):
@@ -216,6 +221,14 @@ class SearchResponse(BaseModel):
     reranker: str | None = Field(
         default=None,
         description='实际用于 /search 重排的 reranker profile 名称。',
+    )
+    fallback_rendered: str | None = Field(
+        default=None,
+        description=(
+            'P4: 当 score-gate 全拦（merged 清空）或全容器降级且配置了'
+            ' config:rag:fallback_template 时渲染的结构化拦截体；未配置模板时为 None'
+            '（行为与 P4 前逐字节一致）。'
+        ),
     )
 
 
@@ -467,6 +480,21 @@ class QueryResponse(BaseModel):
     top_score: float | None = Field(
         default=None,
         description='score-gate 命中时透出的 top1 chunk 距离（L2，越小越相关）。',
+    )
+    citations: list[Citation] = Field(
+        default_factory=list,
+        description=(
+            'P4: LLM 答案溯源数组。仅在 query_citation_enabled 且 answer 含可解析的引用'
+            ' marker 并能映射到本次检索 chunk 时回填；否则为空（不改 answer 文本）。'
+            ' 老客户端忽略未知字段。'
+        ),
+    )
+    fallback_rendered: str | None = Field(
+        default=None,
+        description=(
+            'P4: 当 score_gated / not_initialized 且配置了 config:rag:fallback_template 时'
+            ' 渲染的结构化拦截体；未配置模板时为 None（行为与 P4 前逐字节一致）。'
+        ),
     )
 
 

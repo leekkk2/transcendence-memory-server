@@ -176,7 +176,17 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     "config:rag:citation_enabled": _ConfigKey(
         _coerce_bool, typename="bool", default=True
     ),
-    # ── Registered + persistable, but no live reader yet (P2) ───────────────
+    # P4: /query answer source-tracing ([Chunk_ID] / References backfill). Opt-in,
+    # default False — the live reader (_get_query_citation_enabled) passes
+    # default=False so an absent override keeps /query byte-identical to pre-P4
+    # (no extra retrieval, citations=[]).
+    "config:rag:query_citation_enabled": _ConfigKey(
+        _coerce_bool, typename="bool", default=False
+    ),
+    # ── Registered + persistable; live reader added in blueprint P4 ─────────
+    # fallback_template: opt-in structured interception body for score_gated /
+    # not_initialized /query (and full-degrade /search). Empty = unconfigured =
+    # current behavior preserved byte-for-byte.
     "config:rag:fallback_template": _ConfigKey(
         _coerce_str, typename="str", default=""
     ),

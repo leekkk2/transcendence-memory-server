@@ -206,6 +206,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts import config_store
 
+# rag_citation: pure helpers (no lancedb/fastapi) for P4 answer source-tracing +
+# fallback template. Import-safe; never changes behavior unless opt-in config set.
+try:
+    from rag_citation import extract_answer_citations, render_fallback_template
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts.rag_citation import extract_answer_citations, render_fallback_template
+
 # token_meter is import-safe (no eager connect; record_usage fire-and-forget,
 # over_budget fail-open + default-OFF when no budget configured). Backs the P3
 # token metering + quota breaker. Importing never changes behavior.
@@ -1203,6 +1210,45 @@ def _get_citation_enabled() -> bool:
     return config_store.get_cached('config:rag:citation_enabled', static_default)
 
 
+def _meta_line(hit: SearchHit, key: str) -> int | None:
+    """P4: 从 SearchHit.metadata（已反序列化的 dict）安全取整型行号。
+
+    行号在 ingest 端写进 chunk metadata JSON（无新 LanceDB 列）；老 chunk 无该键
+    或值非整型 → None。从不抛异常，保证 citation 投影对历史数据稳健。
+    """
+    meta = getattr(hit, 'metadata', None)
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get(key)
+    if isinstance(raw, bool):  # bool 是 int 子类，行号不应是布尔
+        return None
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(raw) if raw is not None and str(raw).strip() != '' else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_query_citation_enabled() -> bool:
+    """P4: /query 是否在 answer 后做 [Chunk_ID] / References 溯源回填（**默认关闭，opt-in**）。
+
+    默认 False → /query 行为与 P4 前逐字节一致（无额外检索、citations=[]）。仅当
+    Dashboard/运维写入 config:rag:query_citation_enabled=true 才启用。降级安全：
+    config_store 任何异常回退 default。
+    """
+    return bool(config_store.get_cached('config:rag:query_citation_enabled', False))
+
+
+def _get_fallback_template() -> str | None:
+    """P4: 读取 opt-in fallback 模板（None/空 → 未配置，维持现状）。"""
+    raw = config_store.get_cached('config:rag:fallback_template', None)
+    if raw is None:
+        return None
+    raw = str(raw)
+    return raw if raw.strip() else None
+
+
 def _container_has_chunks_table(name: str) -> bool:
     """探测容器是否已 embed（存在可打开的 'chunks' LanceDB 表）。只连不 embedding。
 
@@ -1746,9 +1792,31 @@ def search(req: SearchReq) -> SearchResponse:
                 section=hit.section,
                 score=hit.score,
                 container=hit.container,
+                # P4: 行号存于 chunk metadata JSON（无新 LanceDB 列）。老 chunk 无该键 → None。
+                lineStart=_meta_line(hit, 'lineStart'),
+                lineEnd=_meta_line(hit, 'lineEnd'),
             )
             for hit in merged
         ]
+
+    # P4: opt-in fallback 拦截体。仅在「score-gate 全拦（merged 清空且确有拦截）」或
+    # 「全容器降级（无任一 ok）」且配置了模板时渲染；未配模板 → None（逐字节不变）。
+    fallback_rendered = None
+    template = _get_fallback_template()
+    if template is not None:
+        gate_blocked_all = blocked_low_score > 0 and not merged
+        full_degrade = bool(per_status) and not has_any_ok
+        if gate_blocked_all or full_degrade:
+            fallback_rendered = render_fallback_template(
+                template,
+                {
+                    'query': req.query,
+                    'container': primary_container,
+                    'status': 'score_gated' if gate_blocked_all else 'degraded',
+                    'threshold': '' if eff_threshold is None else eff_threshold,
+                    'blocked_low_score': blocked_low_score,
+                },
+            )
 
     # Phase 1：刻意保持 HTTP 200 —— 部分成功（有结果）走 200 + is_degraded body 标志；
     # 全失败也维持现状 200 + body status='error'（转 503 触及前端 ApiError，记 Phase 2）。
@@ -1774,6 +1842,7 @@ def search(req: SearchReq) -> SearchResponse:
         union_applied=union_applied,
         rerank_applied=rerank_applied,
         reranker=reranker_name if rerank_applied else None,
+        fallback_rendered=fallback_rendered,
     )
 
 
@@ -3358,6 +3427,71 @@ async def embed_multimodal(
 
 
 
+def _render_query_fallback(
+    req: QueryReq, *, status: str, top_score: float | None, threshold: float | None
+) -> str | None:
+    """P4: 渲染 /query 拦截分支的 opt-in fallback 模板。
+
+    未配 config:rag:fallback_template → None（调用方 model 字段默认 None → 响应逐字节
+    不变）。配了模板 → 用 {query}/{container}/{status}/{top_score}/{threshold} 占位符
+    渲染结构化体。从不抛异常。
+    """
+    template = _get_fallback_template()
+    if template is None:
+        return None
+    return render_fallback_template(
+        template,
+        {
+            'query': req.query,
+            'container': req.container,
+            'status': status,
+            'top_score': '' if top_score is None else top_score,
+            'threshold': '' if threshold is None else threshold,
+        },
+    )
+
+
+async def _backfill_query_citations(
+    req: QueryReq, canonical: str, answer: str | None
+) -> list[Citation]:
+    """P4: opt-in 把 LightRAG answer 里的引用 marker 映射回检索 chunk → Citation 列表。
+
+    默认关闭（query_citation_enabled=False）→ 返回 []，不触发任何额外检索，/query
+    成本与 P4 前一致。启用时做一次轻量 in-process 检索（线程池，不阻塞事件循环）取
+    候选 chunk，再交给纯函数 extract_answer_citations 解析。任何异常 → []，绝不影响
+    answer 文本。
+
+    诚实标注：当前 LightRAG 不吐 [Chunk_ID]，其 answer 用 ### References + [n] Title
+    形式（n→file_path）。extract_answer_citations 同时支持 [Chunk_ID] 与 References
+    两种 marker，并按 chunkId→sourcePath basename→title 三级映射；vanilla LightRAG
+    仅当 References 标题能匹配上检索 chunk 的 title/path 时才出 citation，否则 graceful []。
+    """
+    if not answer or not _get_query_citation_enabled():
+        return []
+    try:
+        _, payload = await asyncio.to_thread(
+            _run_single_search,
+            req.query, req.top_k, canonical, _DEFAULT_QUERY_GATE_TIMEOUT_S,
+            embedding_override=req.embedding_model,
+        )
+        if payload.get('code') != 'ok':
+            return []
+        chunk_map = payload.get('results') or []
+        if not isinstance(chunk_map, list):
+            return []
+        raw_citations = extract_answer_citations(answer, chunk_map)
+        out: list[Citation] = []
+        for rc in raw_citations:
+            try:
+                out.append(Citation(**rc))
+            except Exception:  # pragma: no cover - defensive
+                continue
+        return out
+    except Exception:  # pragma: no cover - citations must never break /query
+        logger.debug('query citation backfill failed (graceful no-op)', exc_info=True)
+        return []
+
+
 @app.post('/query', response_model=QueryResponse, dependencies=[Depends(verify_auth)])
 async def query_rag(req: QueryReq) -> QueryResponse:
     validate_container_name(req.container)
@@ -3391,6 +3525,10 @@ async def query_rag(req: QueryReq) -> QueryResponse:
                 answer='',
                 mode=req.mode,
                 top_score=None,
+                # P4: opt-in 拦截体（未配模板 → None，逐字节不变）。
+                fallback_rendered=_render_query_fallback(
+                    req, status='not_initialized', top_score=None, threshold=eff_threshold,
+                ),
             )
         if code == 'ok':
             top_hits = top_payload.get('results') or []
@@ -3408,6 +3546,10 @@ async def query_rag(req: QueryReq) -> QueryResponse:
                     answer='',
                     mode=req.mode,
                     top_score=top_score,
+                    # P4: opt-in 拦截体（未配模板 → None，逐字节不变）。
+                    fallback_rendered=_render_query_fallback(
+                        req, status='score_gated', top_score=top_score, threshold=eff_threshold,
+                    ),
                 )
         # code 既非 'ok' 也非 'container_not_initialized'（真后端/网关错误）→ 不拦，
         # 继续放行到下游既有 _require_lightrag_ready / _admit_or_503 路径。
@@ -3436,12 +3578,19 @@ async def query_rag(req: QueryReq) -> QueryResponse:
         if req.chunk_top_k is not None:
             qp_kwargs['chunk_top_k'] = int(req.chunk_top_k)
         answer = await lightrag.aquery(req.query, param=QueryParam(**qp_kwargs))
+
+    # P4: opt-in 答案溯源回填（默认关闭 → 与 P4 前逐字节一致：无额外检索、citations=[]）。
+    # 仅当 query_citation_enabled 时才做一次轻量 in-process 检索取候选 chunk，再把
+    # answer 里的 [Chunk_ID] / References marker 映射回 chunkId/sourcePath/行号。
+    # 全程 best-effort：任何异常 → citations=[]，绝不改 answer 文本、绝不抛错。
+    citations = await _backfill_query_citations(req, canonical, answer)
     return QueryResponse(
         status='ok',
         query=req.query,
         container=req.container,
         answer=answer or '(no answer generated)',
         mode=req.mode,
+        citations=citations,
     )
 
 
