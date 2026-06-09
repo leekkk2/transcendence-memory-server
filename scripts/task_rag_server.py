@@ -69,6 +69,7 @@ try:
         UsageEndpointsResponse,
         UsageSummaryResponse,
         UsageTimeseriesResponse,
+        TokenUsageResponse,
     )
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.task_rag_server_models import (
@@ -110,6 +111,7 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         UsageEndpointsResponse,
         UsageSummaryResponse,
         UsageTimeseriesResponse,
+        TokenUsageResponse,
     )
 
 try:
@@ -193,6 +195,14 @@ try:
     import config_store
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts import config_store
+
+# token_meter is import-safe (no eager connect; record_usage fire-and-forget,
+# over_budget fail-open + default-OFF when no budget configured). Backs the P3
+# token metering + quota breaker. Importing never changes behavior.
+try:
+    import token_meter
+except ModuleNotFoundError:  # pragma: no cover - package import path
+    from scripts import token_meter
 
 
 WS = Path(os.environ.get('WORKSPACE', Path(__file__).resolve().parents[1]))
@@ -660,6 +670,14 @@ async def lifespan(app: FastAPI):
         await config_store.start_config_subscriber()
     except Exception as exc:  # noqa: BLE001 - config plane must never block boot
         logger.warning('[config] init failed, running on static defaults: %s', exc)
+    # Token metering batcher (blueprint P3). Non-fatal: it self-disables on
+    # repeated write failure and record_usage is fire-and-forget, so a missing
+    # batcher only loses the SQLite rollup (Redis live counts still work). The
+    # quota gate is OFF by default (no budget) so this never changes behavior.
+    try:
+        token_meter.init_batcher(_queue_db_path())
+    except Exception as exc:  # noqa: BLE001 - metering must never block boot
+        logger.warning('[token] batcher init failed, metering degraded: %s', exc)
     queue = get_job_queue()
     if not DISABLE_WORKER:
         scripts_dir = SERVER_SCRIPTS  # task_rag_lancedb_ingest.py 等都在这里
@@ -673,6 +691,7 @@ async def lifespan(app: FastAPI):
     finally:
         if JOB_WORKER is not None:
             JOB_WORKER.stop(join_timeout=10.0)
+        await token_meter.shutdown_batcher()
         await config_store.stop_config_subscriber()
         await redis_client.close_pool()
 
@@ -699,6 +718,36 @@ async def _enforce_upload_limit(request, call_next):
                     status_code=413,
                     content={'detail': f'file exceeds max upload size {_MAX_UPLOAD_BYTES_ENV} bytes'},
                 )
+    return await call_next(request)
+
+
+@app.middleware('http')
+async def _bind_token_context(request, call_next):
+    """Bind the P3 token-metering ContextVars (task_type / agent_id) for the
+    duration of this request so call_openai_chat — buried inside LightRAG's
+    llm_model_func — records usage under the right identity.
+
+    agent_id: X-Agent-ID header → hashed api key → 'unknown'. task_type:
+    X-Task-Type header → 'rag_retrieval'. Pure side-effect on ContextVars;
+    fully wrapped so a metering hiccup never affects request handling
+    (behavior-preserving). The set values live in this request's context copy
+    and don't leak across requests.
+    """
+    try:
+        header_agent = request.headers.get('x-agent-id')
+        api_key = request.headers.get('x-api-key')
+        if not api_key:
+            authz = request.headers.get('authorization') or ''
+            if authz.lower().startswith('bearer '):
+                api_key = authz.split(' ', 1)[1]
+        from auth_session import hash_api_key as _hash_api_key
+        api_key_hash = _hash_api_key(api_key) if api_key else None
+        token_meter.set_agent_id(
+            token_meter.resolve_agent_id(header_agent, api_key_hash)
+        )
+        token_meter.set_task_type(request.headers.get('x-task-type'))
+    except Exception:  # noqa: BLE001 - metering context bind must never block
+        pass
     return await call_next(request)
 
 
@@ -3453,6 +3502,23 @@ def admin_usage_timeseries(
 def admin_usage_cleanup(req: UsageCleanupRequest) -> UsageCleanupResponse:
     data = usage_analytics.cleanup(_queue_db_path(), retention_days=req.retention_days)
     return UsageCleanupResponse(**data)
+
+
+@app.get(
+    '/admin/usage/tokens',
+    response_model=TokenUsageResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_usage_tokens(window: str = '7d') -> TokenUsageResponse:
+    """Token cost data (blueprint P3 §7): SQLite rollup aggregated by model /
+    task_type / agent, overlaid with today's live Redis counts when available.
+    Front-end cost dashboard rendering is deferred to P2."""
+    data = token_meter.usage_summary(_queue_db_path(), window=window)
+    agent_ids = data.pop('_agent_ids', [])
+    # Overlay today's in-flight (not-yet-flushed) totals from Redis.
+    live = await token_meter.live_today_totals(agent_ids)
+    data['totals']['live_total_tokens'] = sum(live.values())
+    return TokenUsageResponse(**data)
 
 
 # ---------------------------------------------------------------------------
