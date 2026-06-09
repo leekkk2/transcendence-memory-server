@@ -636,7 +636,7 @@ class ConfigItem(BaseModel):
 
     key: str = Field(..., description='Full config key, e.g. config:rag:similarity_threshold')
     module: str = Field(..., description='UI grouping derived from the key prefix: rag / model / token / …')
-    type: Literal['int', 'float', 'bool', 'str'] = Field(
+    type: Literal['int', 'float', 'bool', 'str', 'json'] = Field(
         ..., description='Coerced value type — drives the right input widget client-side.'
     )
     value: object | None = Field(
@@ -654,6 +654,14 @@ class ConfigItem(BaseModel):
     configured: bool | None = Field(
         default=None,
         description='Sensitive keys only: whether a non-empty secret has been persisted. Null for non-sensitive keys.',
+    )
+    group: str | None = Field(
+        default=None,
+        description='Dashboard ConfigField grouping label (P6); falls back to module when unset.',
+    )
+    label: str | None = Field(
+        default=None,
+        description='Human-readable field label (P6); falls back to the key tail when unset.',
     )
 
 
@@ -769,3 +777,142 @@ class SessionInfoResponse(BaseModel):
     api_key_hash: str = Field(..., description='First 12 chars of sha256(api_key) — display only')
     expires_at: int = Field(..., description='Unix timestamp at which this session lapses')
     env: str = Field(default='dev', description='TM_ENV — drives the topbar badge colour (prod/staging/dev)')
+
+
+# ---------------------------------------------------------------------------
+# Dreaming system (blueprint P6, §A7) — GET /admin/dreaming/status,
+# POST /admin/dreaming/trigger. All fields default / optional so the models
+# stay additive and never reject a partially-populated graceful report.
+# ---------------------------------------------------------------------------
+
+
+class DreamAction(BaseModel):
+    """One action a dream cycle took / proposed.
+
+    `applied=False` + `candidates>0` means a report-only proposal (P6 default for
+    destructive actions). Safe additive actions report what they consolidated.
+    """
+
+    tool: str = ''
+    container: str | None = None
+    summary: str = ''
+    candidates: int = 0
+    applied: bool = False
+
+
+class DreamReport(BaseModel):
+    """Result of a dreaming cycle (manual trigger or scheduled).
+
+    `excluded_from_rag` is always True — the report lives in the isolated
+    governance store, structurally separate from user RAG corpora. `status` is
+    'ok' or 'skipped_global_disabled' (global gate off).
+    """
+
+    status: str = 'ok'
+    started_at: str = ''
+    finished_at: str = ''
+    container_scope: str = 'all'
+    dry_run: bool = True
+    excluded_from_rag: bool = True
+    actions: list[DreamAction] = Field(default_factory=list)
+    notes: str = ''
+
+
+class DreamContainerStatus(BaseModel):
+    """Per-container resolved dreaming config for the status endpoint."""
+
+    container: str
+    enabled: bool = True
+    cron: str | None = None
+    model: str | None = None
+
+
+class DreamStatusResponse(BaseModel):
+    """Body for ``GET /admin/dreaming/status``."""
+
+    global_enabled: bool = True
+    scheduler_enabled: bool = False
+    scheduler_running: bool = False
+    trigger_cron: str = '0 2 * * *'
+    batch_model: str = ''
+    last_report: DreamReport | None = None
+    containers: list[DreamContainerStatus] = Field(default_factory=list)
+
+
+class DreamTriggerRequest(BaseModel):
+    """Body for ``POST /admin/dreaming/trigger`` — manual dreaming kick.
+
+    `dry_run` defaults True (report-only); a real destructive run additionally
+    requires config:dreaming:prune_apply true (P6 default false), so this body
+    alone can never delete data.
+    """
+
+    container: str | None = Field(
+        default=None, description='Scope to one container; None = all enabled containers.'
+    )
+    dry_run: bool = Field(
+        default=True, description='True (default) = report-only; never deletes regardless when true.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Governance toolbox (blueprint P6, §A8) — GET /admin/tools,
+# POST /admin/tools/{tool}/invoke. The tool registry / execution is implemented
+# by the governance toolbox module (Agent B); these models are the read + invoke
+# contract the endpoints serialise.
+# ---------------------------------------------------------------------------
+
+
+class ToolInfo(BaseModel):
+    """One preset governance tool's static descriptor."""
+
+    name: str
+    scope: Literal['global', 'container'] = 'container'
+    description: str = ''
+
+
+class ToolContainerStatus(BaseModel):
+    """Resolved + raw enable map for one container.
+
+    `resolved_map` = the container's effective tool switches (container override
+    layered over the global map). `raw_map` = the container's own override blob,
+    or null when it has none configured (so it fully inherits the global).
+    """
+
+    container: str
+    resolved_map: dict[str, bool] = Field(default_factory=dict)
+    raw_map: dict[str, bool] | None = None
+
+
+class ToolsListResponse(BaseModel):
+    """Body for ``GET /admin/tools``."""
+
+    global_enabled_map: dict[str, bool] = Field(default_factory=dict)
+    sandbox_mem_limit: str = '512m'
+    approval_ttl_days: int = 30
+    new_tool_default_enabled: bool = False
+    tools: list[ToolInfo] = Field(default_factory=list)
+    containers: list[ToolContainerStatus] = Field(default_factory=list)
+
+
+class ToolInvokeRequest(BaseModel):
+    """Body for ``POST /admin/tools/{tool}/invoke``.
+
+    `dry_run` defaults True. Destructive / LLM tools never mutate unless dry_run
+    is False AND their guarding config switch is on (P6 ships those off).
+    """
+
+    container: str | None = Field(default=None, description='Target container, or null for global-scope tools.')
+    params: dict = Field(default_factory=dict, description='Tool-specific parameters.')
+    dry_run: bool = Field(default=True, description='True (default) = plan/preview only, no mutation.')
+
+
+class ToolInvokeResponse(BaseModel):
+    """Body for ``POST /admin/tools/{tool}/invoke``."""
+
+    tool: str
+    status: Literal['ok', 'disabled', 'dry_run', 'error', 'deferred'] = 'dry_run'
+    container: str | None = None
+    result: dict = Field(default_factory=dict)
+    applied: bool = False
+    notes: str = ''

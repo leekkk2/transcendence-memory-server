@@ -179,7 +179,7 @@ export function useProfiles() {
 // echoes secrets). `configured` is only meaningful for sensitive (api_keys:*)
 // keys: true = a secret is stored (render a write-only field), false = not set.
 // Non-sensitive keys carry configured=null. See P2 backend contract.
-export type ConfigType = 'bool' | 'int' | 'float' | 'str';
+export type ConfigType = 'bool' | 'int' | 'float' | 'str' | 'json';
 
 export interface ConfigItem {
   key: string;
@@ -189,6 +189,11 @@ export interface ConfigItem {
   is_override: boolean;
   default: string | number | boolean | null;
   configured: boolean | null;
+  // P6: ConfigField grouping/labelling metadata. The server falls back group→
+  // module and label→key tail, so both are always populated; older callers that
+  // ignore them keep working.
+  group?: string | null;
+  label?: string | null;
 }
 
 export interface ConfigListResponse {
@@ -261,5 +266,133 @@ export function useTokenUsage(window: string = '7d') {
     queryKey: ['usage', 'tokens', window],
     queryFn: () => api.get(`/admin/usage/tokens?window=${encodeURIComponent(window)}`),
     staleTime: 5 * 60_000,
+  });
+}
+
+// ---- Dreaming system (GET /admin/dreaming/status, POST /admin/dreaming/trigger) ----
+// P6 surface. Status is read-only & graceful (server never raises); the trigger
+// is report-only by default (dry_run=true) so a manual kick can never delete
+// data — destructive deletes additionally require config:dreaming:prune_apply.
+export interface DreamAction {
+  tool: string;
+  container: string | null;
+  summary: string;
+  candidates: number;
+  applied: boolean;
+}
+
+export interface DreamReport {
+  status: string;
+  started_at: string;
+  finished_at: string;
+  container_scope: string;
+  dry_run: boolean;
+  excluded_from_rag: boolean;
+  actions: DreamAction[];
+  notes: string;
+}
+
+export interface DreamContainerStatus {
+  container: string;
+  enabled: boolean;
+  cron: string | null;
+  model: string | null;
+}
+
+export interface DreamStatusResponse {
+  global_enabled: boolean;
+  scheduler_enabled: boolean;
+  scheduler_running: boolean;
+  trigger_cron: string;
+  batch_model: string;
+  last_report: DreamReport | null;
+  containers: DreamContainerStatus[];
+}
+
+export interface DreamTriggerRequest {
+  container?: string | null;
+  dry_run?: boolean;
+}
+
+export function useDreamingStatus(refetchMs = 30_000) {
+  return useQuery<DreamStatusResponse>({
+    queryKey: ['dreaming', 'status'],
+    queryFn: () => api.get('/admin/dreaming/status'),
+    refetchInterval: refetchMs,
+    staleTime: refetchMs / 2,
+  });
+}
+
+export function useTriggerDream() {
+  const qc = useQueryClient();
+  return useMutation<DreamReport, Error, DreamTriggerRequest>({
+    mutationFn: (body) => api.post('/admin/dreaming/trigger', body),
+    // A trigger may have refreshed last_report — re-pull status so the page's
+    // "latest report" card reflects what just ran.
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['dreaming', 'status'] });
+    },
+  });
+}
+
+// ---- Governance toolbox (GET /admin/tools, POST /admin/tools/{tool}/invoke) ----
+// P6 surface. The matrix is read-only; toggling a container's tool switch is a
+// PUT /admin/config write (no write bypass). Invoke is report-only by default —
+// only the safe tools (token quota read / latency read / additive routing) ever
+// execute; LLM/destructive tools return dry_run/deferred.
+export interface ToolInfo {
+  name: string;
+  scope: 'global' | 'container';
+  description: string;
+}
+
+export interface ToolContainerStatus {
+  container: string;
+  resolved_map: Record<string, boolean>;
+  raw_map: Record<string, boolean> | null;
+}
+
+export interface ToolsListResponse {
+  global_enabled_map: Record<string, boolean>;
+  sandbox_mem_limit: string;
+  approval_ttl_days: number;
+  new_tool_default_enabled: boolean;
+  tools: ToolInfo[];
+  containers: ToolContainerStatus[];
+}
+
+export interface ToolInvokeRequest {
+  tool: string;
+  container?: string | null;
+  params?: Record<string, unknown>;
+  dry_run?: boolean;
+}
+
+export interface ToolInvokeResponse {
+  tool: string;
+  status: 'ok' | 'disabled' | 'dry_run' | 'error' | 'deferred';
+  container: string | null;
+  result: Record<string, unknown>;
+  applied: boolean;
+  notes: string;
+}
+
+export function useToolMatrix(refetchMs = 30_000) {
+  return useQuery<ToolsListResponse>({
+    queryKey: ['tools', 'matrix'],
+    queryFn: () => api.get('/admin/tools'),
+    refetchInterval: refetchMs,
+    staleTime: refetchMs / 2,
+  });
+}
+
+export function useInvokeTool() {
+  return useMutation<ToolInvokeResponse, Error, ToolInvokeRequest>({
+    mutationFn: ({ tool, container, params, dry_run }) =>
+      api.post(`/admin/tools/${encodeURIComponent(tool)}/invoke`, {
+        container: container ?? null,
+        params: params ?? {},
+        dry_run: dry_run ?? true,
+      }),
   });
 }

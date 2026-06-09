@@ -13,6 +13,8 @@
     "usage": "Usage",
     "tokens": "Token cost",
     "jobs": "Jobs",
+    "dreaming": "Dreaming",
+    "tools": "Governance tools",
     "config": "Config",
     "settings": "Settings"
   },
@@ -176,12 +178,20 @@
     "module": {
       "rag": "RAG retrieval",
       "token": "Token budget",
-      "model": "Model matrix"
+      "model": "Model matrix",
+      "dreaming": "Dreaming system",
+      "tools": "Governance toolbox",
+      "index_card": "Index cards",
+      "container": "Container lifecycle"
     },
     "moduleHint": {
       "rag": "Retrieval & citation behavior — live keys apply without restart.",
       "token": "Per-day / per-hour token budgets and fallback model.",
-      "model": "Gateway base URLs and API keys. Base URL writes are validated server-side."
+      "model": "Gateway base URLs and API keys. Base URL writes are validated server-side.",
+      "dreaming": "Background consolidation. The scheduler stays off until you enable it — fresh deploys add no autonomous work.",
+      "tools": "Maintenance tool switches and sandbox limits. Destructive tools stay preview-only by default.",
+      "index_card": "High-density index-card clustering knobs (placeholders until the tool consults them).",
+      "container": "Container TTL, issue half-life and routing rules."
     },
     "reason": {
       "unknown_key": "unknown config key",
@@ -218,5 +228,57 @@
     "fresh": "fresh",
     "stale": "stale",
     "unknown": "unknown"
+  },
+  "dreaming": {
+    "title": "Dreaming",
+    "intro": "Off-hours consolidation that compacts and prunes memories. It writes only to the isolated governance store, never into your searchable containers.",
+    "globalSection": "global switches",
+    "globalHint": "The master switch and the background scheduler. The scheduler is off by default — turning it on is the only thing that adds autonomous work.",
+    "perContainer": "per-container overrides",
+    "colContainer": "Container",
+    "colEnabled": "Enabled",
+    "colCron": "Cron",
+    "colModel": "Model",
+    "noContainers": "no containers",
+    "schedulerRunning": "scheduler running",
+    "schedulerEnabledIdle": "scheduler on (idle)",
+    "schedulerOff": "scheduler off",
+    "triggerTitle": "manual run",
+    "triggerHint": "Run one cycle now. Dry run only proposes candidates — it never deletes. A real run still needs the destructive-apply switch on.",
+    "scopePlaceholder": "container (blank = all)",
+    "dryRun": "dry run (preview only)",
+    "triggerBtn": "run now",
+    "triggering": "running…",
+    "triggerError": "run failed",
+    "runResult": "run result",
+    "lastReport": "latest report",
+    "dryRunTag": "dry run",
+    "excludedFromRag": "excluded from RAG",
+    "colTool": "Action",
+    "colSummary": "Summary",
+    "colCandidates": "Candidates",
+    "colApplied": "Applied",
+    "noActions": "no actions proposed",
+    "reportOnly": "preview"
+  },
+  "tools": {
+    "title": "Governance tools",
+    "intro": "Per-container activation for maintenance tools. Safe tools (quota / latency reads, routing updates) run for real; LLM and destructive tools stay preview-only.",
+    "matrixTitle": "container × tool matrix",
+    "matrixHint": "Each cell is the resolved switch (container override layered over the global map). Toggling a cell stages a container override saved via the config write path.",
+    "colContainer": "Container",
+    "noContainers": "no containers",
+    "override": "override",
+    "globalToolsTitle": "global-scope tools",
+    "globalTag": "global",
+    "toolsTitle": "container tools",
+    "globalConfig": "global settings",
+    "globalConfigHint": "Master switch map, sandbox memory cap, approval window and the default for newly added tools.",
+    "scopePlaceholder": "container",
+    "tryRun": "try (dry run)",
+    "trying": "trying…",
+    "tryError": "try failed",
+    "applied": "applied",
+    "reportOnly": "preview"
   }
 }

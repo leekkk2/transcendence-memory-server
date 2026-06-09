@@ -13,6 +13,8 @@
     "usage": "用量",
     "tokens": "Token 成本",
     "jobs": "任务",
+    "dreaming": "梦境",
+    "tools": "治理工具",
     "config": "配置",
     "settings": "设置"
   },
@@ -176,12 +178,20 @@
     "module": {
       "rag": "RAG 检索",
       "token": "Token 额度",
-      "model": "模型矩阵"
+      "model": "模型矩阵",
+      "dreaming": "梦境系统",
+      "tools": "治理工具箱",
+      "index_card": "索引卡",
+      "container": "容器生命周期"
     },
     "moduleHint": {
       "rag": "检索与引用行为 —— 实时键无需重启即生效。",
       "token": "按天 / 按小时 Token 额度与降级模型。",
-      "model": "网关 base URL 与 API key。base URL 写入由服务端校验。"
+      "model": "网关 base URL 与 API key。base URL 写入由服务端校验。",
+      "dreaming": "后台整理。调度器默认关闭 —— 全新部署不会新增任何自动任务，只有你手动开启才会跑。",
+      "tools": "维护工具开关与沙箱上限。破坏性工具默认仅预览不执行。",
+      "index_card": "高密度索引卡聚类参数（占位，待工具读取后才生效）。",
+      "container": "容器存活期、议题半衰期与路由规则。"
     },
     "reason": {
       "unknown_key": "未知配置键",
@@ -218,5 +228,57 @@
     "fresh": "最新",
     "stale": "过期",
     "unknown": "未知"
+  },
+  "dreaming": {
+    "title": "梦境",
+    "intro": "在闲时整理记忆：压缩、剪枝。产出只写入隔离的治理库，绝不进入你可检索的容器。",
+    "globalSection": "全局开关",
+    "globalHint": "总开关与后台调度器。调度器默认关闭 —— 只有打开它才会新增自动任务。",
+    "perContainer": "按容器覆盖",
+    "colContainer": "容器",
+    "colEnabled": "启用",
+    "colCron": "Cron",
+    "colModel": "模型",
+    "noContainers": "暂无容器",
+    "schedulerRunning": "调度器运行中",
+    "schedulerEnabledIdle": "调度器已开启（空闲）",
+    "schedulerOff": "调度器关闭",
+    "triggerTitle": "手动运行",
+    "triggerHint": "立即跑一次。试运行只产出候选、绝不删除；真删除还需另开破坏性生效开关。",
+    "scopePlaceholder": "容器（留空 = 全部）",
+    "dryRun": "试运行（仅预览）",
+    "triggerBtn": "立即运行",
+    "triggering": "运行中…",
+    "triggerError": "运行失败",
+    "runResult": "运行结果",
+    "lastReport": "最近报告",
+    "dryRunTag": "试运行",
+    "excludedFromRag": "已排除出 RAG",
+    "colTool": "动作",
+    "colSummary": "摘要",
+    "colCandidates": "候选数",
+    "colApplied": "已生效",
+    "noActions": "没有候选动作",
+    "reportOnly": "仅预览"
+  },
+  "tools": {
+    "title": "治理工具",
+    "intro": "按容器激活维护工具。安全工具（额度 / 时延只读、路由更新）会真执行；LLM 与破坏性工具默认仅预览。",
+    "matrixTitle": "容器 × 工具矩阵",
+    "matrixHint": "每格为解析后的开关（容器覆盖叠加在全局表之上）。切换某格会暂存一个容器级覆盖，经配置写入路径保存。",
+    "colContainer": "容器",
+    "noContainers": "暂无容器",
+    "override": "已覆盖",
+    "globalToolsTitle": "全局作用域工具",
+    "globalTag": "全局",
+    "toolsTitle": "容器工具",
+    "globalConfig": "全局设置",
+    "globalConfigHint": "工具总开关表、沙箱内存上限、审批有效期，以及新增工具的默认状态。",
+    "scopePlaceholder": "容器",
+    "tryRun": "试运行（dry run）",
+    "trying": "试运行中…",
+    "tryError": "试运行失败",
+    "applied": "已生效",
+    "reportOnly": "仅预览"
   }
 }

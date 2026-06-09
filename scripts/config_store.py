@@ -112,6 +112,15 @@ def _coerce_int(raw: Any) -> int:
     return int(str(raw).strip())
 
 
+def _coerce_float(raw: Any) -> float:
+    """Plain float coercer (non-nullable knobs: compression_ratio / temperature /
+    prune_threshold). Unlike _coerce_float_or_none, an empty value is invalid →
+    raises so the caller falls back to default (graceful)."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    return float(str(raw).strip())
+
+
 def _coerce_int_or_none(raw: Any) -> Optional[int]:
     """Empty / 'none' / 'null' → None (the unlimited / OFF sentinel); else int.
 
@@ -134,6 +143,39 @@ def _coerce_str(raw: Any) -> str:
     return "" if raw is None else str(raw)
 
 
+def _coerce_json(raw: Any) -> Any:
+    """Parse a JSON config blob (routing_rules / enabled_map) → Python object.
+
+    Stored form is a JSON string; a dict/list passed straight through (set path
+    serializes it). Empty / 'none' / 'null' → {} (the empty-object sentinel that
+    means "inherit / no overrides"). Malformed JSON raises so get_cached falls
+    back to the caller default (graceful) and set() rejects it up front.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, (dict, list)):
+        return raw
+    s = str(raw).strip()
+    if s == "" or s.lower() in ("none", "null"):
+        return {}
+    return json.loads(s)
+
+
+# Preset governance tools (blueprint §9.A) — global_enabled_map default = all on.
+# manage_token_quotas is scope=global (not per-container); the rest are
+# per-container. Tool registry/execution lives in governance_tools (Agent B);
+# here we only carry the names so the global enable map has a stable default.
+_PRESET_TOOL_NAMES: tuple[str, ...] = (
+    "compress_knowledge_cluster",
+    "update_container_routing",
+    "snapshot_and_quarantine",
+    "tune_model_parameters",
+    "analyze_retrieval_latency",
+    "manage_token_quotas",
+)
+_DEFAULT_TOOLS_ENABLED_MAP: dict[str, bool] = {n: True for n in _PRESET_TOOL_NAMES}
+
+
 # ── Known config registry ───────────────────────────────────────────────────
 # Only keys registered here are accepted by set(). Each entry: the coercer to
 # apply on read, and whether the value is sensitive (encrypted write-only).
@@ -145,7 +187,7 @@ def _coerce_str(raw: Any) -> str:
 
 
 class _ConfigKey:
-    __slots__ = ("coerce", "sensitive", "typename", "default")
+    __slots__ = ("coerce", "sensitive", "typename", "default", "group", "label")
 
     def __init__(
         self,
@@ -153,19 +195,25 @@ class _ConfigKey:
         sensitive: bool = False,
         typename: str = "str",
         default: Any = None,
+        group: Optional[str] = None,
+        label: Optional[str] = None,
     ):
         self.coerce = coerce
         self.sensitive = sensitive
-        # typename / default are PURE METADATA for the read-only Dashboard config
-        # endpoint (P2 GET /admin/config) — they have NO effect on get_cached /
-        # set / refresh runtime behavior (the live RAG-path readers pass their own
-        # profiles.yaml-derived default to get_cached, which still wins). `default`
-        # here is the registered "no-override" sentinel the Dashboard shows when a
-        # key has never been set; for keys whose true default is the live
-        # profiles.yaml value (similarity_threshold / citation_enabled) it is the
-        # opt-in sentinel (None / True) the request path falls back to pre-P1.
+        # typename / default / group / label are PURE METADATA for the read-only
+        # Dashboard config endpoint (P2 GET /admin/config) — they have NO effect on
+        # get_cached / set / refresh runtime behavior (the live RAG-path readers
+        # pass their own profiles.yaml-derived default to get_cached, which still
+        # wins). `default` here is the registered "no-override" sentinel the
+        # Dashboard shows when a key has never been set; for keys whose true
+        # default is the live profiles.yaml value (similarity_threshold /
+        # citation_enabled) it is the opt-in sentinel (None / True) the request
+        # path falls back to pre-P1. `group`/`label` (P6) drive the Dashboard's
+        # ConfigField grouping/labelling; absent group falls back to module_for_key.
         self.typename = typename
         self.default = default
+        self.group = group
+        self.label = label
 
 
 KNOWN_CONFIG: dict[str, _ConfigKey] = {
@@ -222,6 +270,98 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     ),
     "config:token:flush_interval": _ConfigKey(
         _coerce_int, typename="int", default=0
+    ),
+    # ── High-density index cards (blueprint P6, §A3) ────────────────────────
+    # Placeholders: the index-card clustering/compression tool is implemented by
+    # the governance toolbox (Agent B) — these only persist its knobs so the
+    # Dashboard can render them. No live reader in the request path → behavior
+    # preserved (registering a key changes nothing until a reader consults it).
+    "config:index_card:cluster_cron": _ConfigKey(
+        _coerce_str, typename="str", default="0 3 * * 0", group="索引卡",
+        label="索引卡聚类 cron",
+    ),
+    "config:index_card:compression_ratio": _ConfigKey(
+        _coerce_float, typename="float", default=0.3, group="索引卡",
+        label="索引卡压缩比",
+    ),
+    "config:index_card:llm_temperature": _ConfigKey(
+        _coerce_float, typename="float", default=0.2, group="索引卡",
+        label="索引卡 LLM 温度",
+    ),
+    # ── Container lifecycle (blueprint P6, §A4) ─────────────────────────────
+    # Placeholders for the container TTL / issue-halflife / routing governance.
+    # routing_rules is a json blob keyed by container name; the safe tool
+    # update_container_routing writes it via PUT /admin/config (no write bypass).
+    "config:container:cicd_ttl_days": _ConfigKey(
+        _coerce_int, typename="int", default=14, group="容器生命周期",
+        label="CICD 容器存活天数",
+    ),
+    "config:container:issue_halflife_days": _ConfigKey(
+        _coerce_int, typename="int", default=180, group="容器生命周期",
+        label="议题半衰期(天)",
+    ),
+    "config:container:routing_rules": _ConfigKey(
+        _coerce_json, typename="json", default={}, group="容器生命周期",
+        label="容器路由规则",
+    ),
+    # ── Dreaming system · global (blueprint P6, §A7) ────────────────────────
+    # global_enabled = the "dreaming may run at all" gate (default true = the
+    # manual trigger endpoint is usable). scheduler_enabled = whether the
+    # BACKGROUND auto-scheduler starts at boot; default FALSE so deploying P6
+    # spawns NO background job → byte-identical runtime behavior. prune_apply =
+    # whether destructive deletes actually execute; default FALSE = report-only.
+    "config:dreaming:global_enabled": _ConfigKey(
+        _coerce_bool, typename="bool", default=True, group="梦境系统",
+        label="梦境系统总开关",
+    ),
+    "config:dreaming:scheduler_enabled": _ConfigKey(
+        _coerce_bool, typename="bool", default=False, group="梦境系统",
+        label="梦境后台自动调度",
+    ),
+    "config:dreaming:trigger_cron": _ConfigKey(
+        _coerce_str, typename="str", default="0 2 * * *", group="梦境系统",
+        label="梦境调度 cron",
+    ),
+    "config:dreaming:batch_model": _ConfigKey(
+        _coerce_str, typename="str", default="gpt-4o-mini", group="梦境系统",
+        label="梦境批处理模型",
+    ),
+    "config:dreaming:cache_threshold": _ConfigKey(
+        _coerce_int, typename="int", default=10, group="梦境系统",
+        label="高频缓存阈值",
+    ),
+    "config:dreaming:prune_threshold": _ConfigKey(
+        _coerce_float, typename="float", default=0.3, group="梦境系统",
+        label="低价值剪枝阈值",
+    ),
+    "config:dreaming:graph_prune_enabled": _ConfigKey(
+        _coerce_bool, typename="bool", default=True, group="梦境系统",
+        label="图谱孤点候选纳入",
+    ),
+    "config:dreaming:prune_apply": _ConfigKey(
+        _coerce_bool, typename="bool", default=False, group="梦境系统",
+        label="梦境破坏性删除生效",
+    ),
+    # ── Governance toolbox · global (blueprint P6, §A8) ─────────────────────
+    # global_enabled_map: per-tool master switch (default all 6 preset tools on).
+    # Container-level overrides use the dynamic template key
+    # config:tools:container:{container}:enabled_map (NOT registered statically —
+    # containers are dynamic; the tools module reads/writes it at runtime).
+    "config:tools:global_enabled_map": _ConfigKey(
+        _coerce_json, typename="json", default=_DEFAULT_TOOLS_ENABLED_MAP,
+        group="治理工具箱", label="工具全局开关表",
+    ),
+    "config:tools:sandbox_mem_limit": _ConfigKey(
+        _coerce_str, typename="str", default="512m", group="治理工具箱",
+        label="工具沙箱内存上限",
+    ),
+    "config:tools:approval_ttl_days": _ConfigKey(
+        _coerce_int, typename="int", default=30, group="治理工具箱",
+        label="审批有效期(天)",
+    ),
+    "config:tools:new_tool_default_enabled": _ConfigKey(
+        _coerce_bool, typename="bool", default=False, group="治理工具箱",
+        label="新工具默认启用",
     ),
 }
 
@@ -520,7 +660,14 @@ async def set(key: str, value: Any) -> bool:
         except Exception:  # noqa: BLE001 - reject bad value, don't persist
             logger.warning("[config] rejected set of %s — bad value", key)
             return False
-        stored = "" if coerced is None else str(coerced)
+        if coerced is None:
+            stored = ""
+        elif spec.typename == "json":
+            # json blobs must round-trip via json.dumps (str() would emit Python
+            # repr with single quotes, which _coerce_json's json.loads rejects).
+            stored = json.dumps(coerced, ensure_ascii=False, sort_keys=True)
+        else:
+            stored = str(coerced)
 
     store = _get_store()
     if store is None:
@@ -754,6 +901,10 @@ def describe_key(key: str) -> dict[str, Any]:
         "type": spec.typename,
         "is_override": is_override,
         "default": spec.default,
+        # P6 Dashboard ConfigField metadata: group falls back to module, label to
+        # the key tail so older keys (no explicit group/label) still render.
+        "group": spec.group or module_for_key(key),
+        "label": spec.label or key.split(":")[-1],
     }
     if spec.sensitive:
         # Write-only: never surface the value. `configured` = a non-empty

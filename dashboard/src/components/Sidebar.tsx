@@ -7,8 +7,10 @@ import {
   Coins,
   LineChart,
   ListChecks,
+  Moon,
   Settings as SettingsIcon,
   SlidersHorizontal,
+  Wrench,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '../lib/format';
@@ -33,6 +35,8 @@ const ITEMS: NavItem[] = [
   { to: '/usage', key: 'nav.usage', icon: LineChart, badge: '7d' },
   { to: '/tokens', key: 'nav.tokens', icon: Coins, badge: '7d' },
   { to: '/jobs', key: 'nav.jobs', icon: ListChecks },
+  { to: '/dreaming', key: 'nav.dreaming', icon: Moon },
+  { to: '/tools', key: 'nav.tools', icon: Wrench },
   { to: '/config', key: 'nav.config', icon: SlidersHorizontal },
   { to: '/settings', key: 'nav.settings', icon: SettingsIcon },
 ];
