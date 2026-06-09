@@ -64,6 +64,8 @@
     "resultsCount_other": "{{count}} 条记忆",
     "emptyContainer": "该容器暂无记忆",
     "searchError": "搜索失败：{{message}}",
+    "degradedHint": "部分结果 — 以下容器未正常响应：",
+    "notInitializedHint": "该镜像未初始化，请先 embed",
     "noContainers": "没有可用的容器",
     "untitled": "(无标题)",
     "noText": "(无内容)",
