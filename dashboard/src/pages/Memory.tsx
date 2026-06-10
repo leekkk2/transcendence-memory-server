@@ -4,22 +4,26 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { MemoryCard, memoryRowKey, type MemoryRow } from '../components/MemoryCard';
 import { api } from '../lib/api';
-import { useContainers } from '../lib/queries';
+import { useContainers, useMemoriesInfinite, type MemoryListItem } from '../lib/queries';
 import { formatNumber } from '../lib/format';
 
 /**
  * Memory browser.
  *
- * Two behaviours that the original page got wrong and which made memories look
- * "missing": (1) it defaulted the container to the literal string 'default',
- * which does not exist in any real deployment, and (2) it never browsed — the
- * page sat on "no results yet" until you typed something. Here the container
- * is a dropdown sourced from /containers (defaulting to the largest one and
- * persisted), and an empty query auto-browses the latest memories. A blank
- * query is sent to the server as a single space because the search endpoint
- * 422s on an empty string but treats " " as "return the top-k".
+ * Two data paths that must not fight each other:
+ *   - Browse (empty query): paginated GET /containers/{name}/memories via
+ *     useInfiniteQuery — first page only on mount, "load more" appends. This
+ *     replaced the old "POST /search with a blank query" trick, which ran a
+ *     query-embedding round-trip for every page view: it loaded the whole
+ *     container slowly and hard-failed ("error: exit 1") whenever the
+ *     embedding backend was unreachable, even though browsing needs no
+ *     embedding at all.
+ *   - Search (non-empty query): POST /search as before, only enabled once a
+ *     query is submitted. Failures render a friendly message + retry button;
+ *     the server now sends reasoned statuses instead of bare exit codes.
  */
 const CONTAINER_KEY = 'tm-admin-memory-container';
+const PAGE_SIZE = 50;
 
 interface SearchResponse {
   status?: string;
@@ -34,6 +38,31 @@ interface SearchResponse {
   containers?: string[];
   fallback_source?: string | null;
   blocked_low_score?: number;
+}
+
+function listItemToRow(item: MemoryListItem): MemoryRow {
+  return {
+    taskId: item.id ?? undefined,
+    title: item.title ?? undefined,
+    text: item.text ?? undefined,
+    source: item.source ?? undefined,
+    tags: item.tags,
+  };
+}
+
+function SkeletonGrid() {
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} className="panel space-y-2 p-3.5">
+          <div className="skeleton h-4 w-3/4" />
+          <div className="skeleton h-3 w-full" />
+          <div className="skeleton h-3 w-5/6" />
+          <div className="skeleton h-3 w-2/3" />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export default function Memory() {
@@ -73,37 +102,56 @@ export default function Memory() {
   };
 
   const runSearch = () => setSubmittedQuery(queryInput.trim());
+  const isBrowse = submittedQuery === '';
 
+  // Browse path: async pagination, no embedding involved.
+  const browse = useMemoriesInfinite(isBrowse ? container : '', PAGE_SIZE);
+  const browseRows: MemoryRow[] = useMemo(
+    () => (browse.data?.pages ?? []).flatMap((p) => p.items).map(listItemToRow),
+    [browse.data],
+  );
+  const browseTotal = browse.data?.pages.length
+    ? browse.data.pages[browse.data.pages.length - 1].total
+    : 0;
+
+  // Search path: only fires once a non-empty query is submitted.
   const search = useQuery<SearchResponse>({
     queryKey: ['memory-search', container, submittedQuery, topk],
-    queryFn: () => api.post<SearchResponse>('/search', { query: submittedQuery || ' ', topk, container }),
-    enabled: !!container,
+    queryFn: () => api.post<SearchResponse>('/search', { query: submittedQuery, topk, container }),
+    enabled: !!container && !isBrowse,
     staleTime: 10_000,
   });
 
   const resp = search.data;
-  const serverError = resp?.status === 'error' ? resp?.message || t('common.error') : null;
-  const rows = serverError ? [] : resp?.results ?? [];
-  const isBrowse = submittedQuery === '';
+  const searchServerError = !isBrowse && resp?.status === 'error' ? resp?.message || t('common.error') : null;
+  const searchNetworkError = !isBrowse && search.isError;
+  const searchError = searchServerError || (searchNetworkError ? t('common.error') : null);
+  const browseError = isBrowse && browse.isError ? (browse.error as Error)?.message || t('common.error') : null;
+
+  const searchRows = searchError ? [] : resp?.results ?? [];
+  const rows = isBrowse ? browseRows : searchRows;
   const noContainers = !containersQ.isLoading && containerList.length === 0;
 
   // Partial success is NOT an error: render results as usual and surface a
   // non-fatal hint listing only the containers that did not return cleanly.
-  const isDegraded = !serverError && !!(resp?.degraded ?? resp?.is_degraded);
+  const isDegraded = !isBrowse && !searchError && !!(resp?.degraded ?? resp?.is_degraded);
   const degradedContainers = isDegraded
     ? Object.entries(resp?.per_container_status ?? {}).filter(([, s]) => s !== 'ok')
     : [];
   const containerStatusLabel = (status: string) =>
     status === 'not_initialized' ? t('memory.notInitializedHint') : status;
 
+  const isInitialLoading = isBrowse ? browse.isLoading : search.isLoading;
+  const activeError = isBrowse ? browseError : searchError;
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-lg font-semibold">{t('memory.title')}</h1>
-        {!search.isLoading && !serverError && container ? (
+        {!isInitialLoading && !activeError && container ? (
           <span className="text-dim mono text-xs">
             {isBrowse
-              ? t('memory.browsingHint', { container })
+              ? t('memory.loadedCount', { loaded: formatNumber(browseRows.length), total: formatNumber(browseTotal) })
               : t('memory.resultsCount', { count: rows.length })}
           </span>
         ) : null}
@@ -151,12 +199,22 @@ export default function Memory() {
         </div>
       </div>
 
-      {serverError ? (
+      {activeError ? (
         <div
-          className="panel fade-in p-3 text-sm"
+          className="panel fade-in flex items-center justify-between gap-3 p-3 text-sm"
           style={{ borderColor: 'var(--red)', color: 'var(--red)' }}
         >
-          {t('memory.searchError', { message: serverError })}
+          <span>
+            {isBrowse
+              ? t('memory.listError', { message: activeError })
+              : t('memory.searchError', { message: activeError })}
+          </span>
+          <button
+            onClick={() => (isBrowse ? browse.refetch() : search.refetch())}
+            className="btn shrink-0 text-xs"
+          >
+            {t('memory.retry')}
+          </button>
         </div>
       ) : null}
 
@@ -176,17 +234,8 @@ export default function Memory() {
         </div>
       ) : null}
 
-      {search.isLoading ? (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="panel space-y-2 p-3.5">
-              <div className="skeleton h-4 w-3/4" />
-              <div className="skeleton h-3 w-full" />
-              <div className="skeleton h-3 w-5/6" />
-              <div className="skeleton h-3 w-2/3" />
-            </div>
-          ))}
-        </div>
+      {isInitialLoading ? (
+        <SkeletonGrid />
       ) : (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
           {rows.map((r, i) => (
@@ -195,8 +244,27 @@ export default function Memory() {
         </div>
       )}
 
-      {!search.isLoading && !serverError && rows.length === 0 && container ? (
-        <div className="panel text-dim p-8 text-center text-sm">{t('memory.emptyContainer')}</div>
+      {isBrowse && !isInitialLoading && !browseError && browse.hasNextPage ? (
+        <div className="flex justify-center">
+          <button
+            onClick={() => browse.fetchNextPage()}
+            disabled={browse.isFetchingNextPage}
+            className="btn text-sm"
+          >
+            {browse.isFetchingNextPage
+              ? t('memory.loadingMore')
+              : t('memory.loadMore', { remaining: formatNumber(Math.max(0, browseTotal - browseRows.length)) })}
+          </button>
+        </div>
+      ) : null}
+      {isBrowse && !isInitialLoading && !browseError && browseRows.length > 0 && !browse.hasNextPage ? (
+        <div className="text-dim mono text-center text-xs">{t('memory.allLoaded')}</div>
+      ) : null}
+
+      {!isInitialLoading && !activeError && rows.length === 0 && container ? (
+        <div className="panel text-dim p-8 text-center text-sm">
+          {isBrowse ? t('memory.emptyContainer') : t('memory.noSearchResults')}
+        </div>
       ) : null}
       {noContainers ? (
         <div className="panel text-dim p-8 text-center text-sm">{t('memory.noContainers')}</div>

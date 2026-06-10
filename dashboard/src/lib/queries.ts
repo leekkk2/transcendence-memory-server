@@ -6,7 +6,7 @@
  * (Overview 10s, Jobs 10s, Usage 5min cache) live with the hooks so it's
  * obvious which views fire requests at which cadence.
  */
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from './api';
 
 export interface HealthResponse {
@@ -155,6 +155,48 @@ export function useContainers() {
     queryKey: ['containers'],
     queryFn: () => api.get('/containers'),
     staleTime: 30_000,
+  });
+}
+
+// ---- Memory browser pagination (GET /containers/{name}/memories) ----
+// Browse mode used to abuse POST /search with a blank query, which ran a full
+// query-embedding round-trip per page view (slow, and hard-failed whenever the
+// embedding backend was down). The list endpoint is a plain JSONL read with
+// limit/offset + total, so browsing is fast and embedding-independent.
+export interface MemoryListItem {
+  id?: string | null;
+  title?: string | null;
+  text?: string | null;
+  source?: string | null;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  createdAt?: number | null;
+  updatedAt?: number | null;
+  storedAt?: number | null;
+}
+
+export interface MemoryListResponse {
+  container: string;
+  total: number;
+  limit?: number | null;
+  offset: number;
+  items: MemoryListItem[];
+}
+
+export function useMemoriesInfinite(container: string, pageSize = 50) {
+  return useInfiniteQuery({
+    queryKey: ['memories', container, pageSize],
+    queryFn: ({ pageParam }): Promise<MemoryListResponse> =>
+      api.get(
+        `/containers/${encodeURIComponent(container)}/memories?limit=${pageSize}&offset=${pageParam}`,
+      ),
+    initialPageParam: 0,
+    getNextPageParam: (last) => {
+      const next = last.offset + last.items.length;
+      return next < last.total ? next : undefined;
+    },
+    enabled: !!container,
+    staleTime: 10_000,
   });
 }
 
