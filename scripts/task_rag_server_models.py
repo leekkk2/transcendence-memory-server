@@ -336,6 +336,34 @@ class MemoryUpdateResponse(BaseModel):
     index_hint: str
 
 
+class MemoryListItem(BaseModel):
+    """memory_objects.jsonl 单行的列表投影（dashboard 浏览用，不含向量）。"""
+
+    id: str | None = None
+    title: str | None = None
+    text: str | None = None
+    source: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
+    createdAt: int | None = None
+    updatedAt: int | None = None
+    storedAt: int | None = None
+
+
+class MemoryListResponse(BaseModel):
+    """GET /containers/{container}/memories 分页响应。
+
+    limit 为 None 表示调用方未要求分页（全量返回，向后兼容语义）；total 恒为
+    容器内对象总数，供客户端渲染「已加载 N / 共 M」。
+    """
+
+    container: str
+    total: int
+    limit: int | None = None
+    offset: int = 0
+    items: list[MemoryListItem] = Field(default_factory=list)
+
+
 class ContainerListResponse(BaseModel):
     containers: list[str]
     count: int

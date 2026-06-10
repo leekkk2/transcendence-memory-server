@@ -60,6 +60,8 @@ try:
         IndexStatusResponse,
         JobStatusResponse,
         MemoryDeleteResponse,
+        MemoryListItem,
+        MemoryListResponse,
         MemoryUpdateResponse,
         ModuleStatusResponse,
         OnboardingPromptResponse,
@@ -113,6 +115,8 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         IndexStatusResponse,
         JobStatusResponse,
         MemoryDeleteResponse,
+        MemoryListItem,
+        MemoryListResponse,
         MemoryUpdateResponse,
         ModuleStatusResponse,
         OnboardingPromptResponse,
@@ -1399,6 +1403,57 @@ def _resolve_search_targets(req: SearchReq) -> tuple[list[str], bool]:
     return targets, True
 
 
+# 子进程检索失败时从 stderr/stdout 提炼人类可读原因。裸 "error: exit 1" 曾被
+# dashboard Memory 页原样透传成用户文案（"搜索失败：demo-project: error: exit 1"），
+# 运维无从判断是 embedding 网关不可达还是别的故障 —— 这里按已知模式分类，
+# 未命中模式时附带 stderr 末行（截断），保留 "error:" 前缀以兼容老客户端判定。
+_SEARCH_FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        (
+            'connection refused', 'connecterror', 'connectionerror',
+            'failed to establish', 'max retries exceeded',
+            'name or service not known', 'nodename nor servname',
+            'network is unreachable', 'connection reset', 'remote end closed',
+        ),
+        'embedding backend unreachable',
+    ),
+    (('timed out', 'timeout'), 'embedding backend timed out'),
+    (
+        (
+            'unauthorized', 'invalid api key', 'authenticationerror',
+            'error code: 401', '401 client error', 'invalid_api_key',
+        ),
+        'embedding auth failed (check API key)',
+    ),
+    (
+        ('rate limit', 'error code: 429', '429 client error', 'quota'),
+        'embedding backend rate-limited',
+    ),
+    # model_fallback 把底层 ConnectError 包装成 NoUpstreamAvailable /
+    # "embedding upstream 5xx"，上面的具体分类全 miss 时由本条兜住（真实栈实测：
+    # 网关不可达 → "all embed profiles failed (... embedding upstream 502 ...)"）。
+    (
+        (
+            'all embed profiles failed', 'noupstreamavailable',
+            'embedding upstream 5', 'embedding request failed',
+        ),
+        'embedding backend unavailable (all profiles failed)',
+    ),
+)
+
+
+def _humanize_search_failure(code: int, stderr: str, stdout: str) -> str:
+    """把单容器检索子进程的非零退出翻译成带原因的状态文案。"""
+    blob = f'{stderr}\n{stdout}'.lower()
+    for needles, reason in _SEARCH_FAILURE_HINTS:
+        if any(needle in blob for needle in needles):
+            return f'error: {reason} (exit {code})'
+    tail = next((ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), '')
+    if tail:
+        return f'error: exit {code} — {tail[:160]}'
+    return f'error: exit {code}'
+
+
 def _run_single_search(
     query: str,
     topk: int,
@@ -1710,7 +1765,9 @@ def search(req: SearchReq) -> SearchResponse:
             per_status[name] = 'timeout'
             continue
         if cmd_result.code != 0:
-            per_status[name] = f'error: exit {cmd_result.code}'
+            per_status[name] = _humanize_search_failure(
+                cmd_result.code, cmd_result.stderr, cmd_result.stdout,
+            )
             continue
         code = payload.get('code')
         if code == 'container_not_initialized':
@@ -2824,6 +2881,82 @@ def delete_memory(container: str, memory_id: str) -> MemoryDeleteResponse:
         id=memory_id,
         deleted=True,
         message='Memory object deleted.',
+    )
+
+
+def _memory_row_to_list_item(row: dict) -> MemoryListItem:
+    """memory_objects.jsonl 行 → 列表投影。字段类型宽容（脏行不致 500）。"""
+
+    def _ts(key: str) -> int | None:
+        value = row.get(key)
+        return int(value) if isinstance(value, (int, float)) else None
+
+    tags = row.get('tags')
+    metadata = row.get('metadata')
+    return MemoryListItem(
+        id=str(row['id']) if row.get('id') is not None else None,
+        title=row.get('title') if isinstance(row.get('title'), str) else None,
+        text=row.get('text') if isinstance(row.get('text'), str) else None,
+        source=row.get('source') if isinstance(row.get('source'), str) else None,
+        tags=[str(t) for t in tags] if isinstance(tags, list) else [],
+        metadata=metadata if isinstance(metadata, dict) else {},
+        createdAt=_ts('createdAt'),
+        updatedAt=_ts('updatedAt'),
+        storedAt=_ts('storedAt'),
+    )
+
+
+@app.get(
+    '/containers/{container}/memories',
+    response_model=MemoryListResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def list_memories(
+    container: str,
+    limit: int | None = None,
+    offset: int = 0,
+) -> MemoryListResponse:
+    """分页列出容器内的记忆对象 —— 纯 JSONL 读取，不触发 embedding / 向量检索。
+
+    dashboard Memory 页此前用 POST /search + 空查询做「浏览」，每次都要跑一遍
+    query embedding（慢，且 embedding 网关不可用时浏览直接报错）。本端点为
+    additive 新增：
+      - limit 缺省 None = 全量返回（与历史「浏览即全量」语义兼容，老客户端
+        不传参数行为不变）；传入时 clamp 到 1..500。
+      - offset clamp ≥ 0；total 恒为容器内对象总数，供客户端渲染「已加载 N / 共 M」。
+      - 排序：updatedAt > createdAt > storedAt 降序（最新在前）；无时间戳的行
+        按文件序稳定排在其后。
+      - 入参若是 alias → 解析到 canonical 后读取；removed 抛 410。
+    """
+    validate_container_name(container)
+    canonical, _ = resolve_container_or_raise(container)
+    rows = read_memory_objects(canonical)
+    total = len(rows)
+
+    def _row_ts(row: dict) -> int:
+        for key in ('updatedAt', 'createdAt', 'storedAt'):
+            value = row.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+        return -1
+
+    # Python sort 稳定：时间戳相同 / 均缺失的行保持原文件序。
+    rows.sort(key=_row_ts, reverse=True)
+
+    offset = max(0, int(offset))
+    if limit is not None:
+        limit = max(1, min(500, int(limit)))
+        window = rows[offset:offset + limit]
+    else:
+        window = rows[offset:] if offset else rows
+
+    # response.container 保留客户端入参（无感原则，与其余 memories 端点一致）。
+    return MemoryListResponse(
+        container=container,
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=[_memory_row_to_list_item(row) for row in window],
     )
 
 
