@@ -156,6 +156,11 @@
   },
   "config": {
     "title": "配置",
+    "subtitle": "调整记忆服务的运行参数。所有修改先在本页暂存，点击「保存修改」后才会生效。",
+    "searchPlaceholder": "搜索设置项（名称 / 说明）",
+    "clearSearch": "清除搜索",
+    "noMatches": "没有找到匹配的设置项",
+    "overrideCount": "{{count}} 项已自定义",
     "save": "保存修改",
     "saving": "保存中…",
     "saved": "已保存",
@@ -174,6 +179,13 @@
     "clearInput": "清除",
     "removeSecret": "移除",
     "secretWillClear": "保存后将清除",
+    "editJson": "编辑",
+    "doneEditing": "完成",
+    "invalidJson": "JSON 格式不合法，修正后才会暂存",
+    "keyHint": {
+      "routing_rules": "容器名 → 路由规则覆盖的 JSON 映射；{} 表示继承默认。",
+      "global_enabled_map": "治理工具名 → 开关状态的 JSON 映射。"
+    },
     "footnote": "敏感密钥为只写 —— 服务端永不回显已存密钥。实时键（similarity_threshold、citation_enabled）即时生效；模型/Token 键现已持久，待 live reader 接入后生效。",
     "module": {
       "rag": "RAG 检索",
@@ -279,6 +291,32 @@
     "trying": "试运行中…",
     "tryError": "试运行失败",
     "applied": "已生效",
-    "reportOnly": "仅预览"
+    "reportOnly": "仅预览",
+    "searchContainers": "搜索容器…",
+    "noMatch": "无匹配容器",
+    "legendOverride": "实心 = 容器覆盖",
+    "legendInherited": "半透明 = 继承全局",
+    "legendStaged": "高亮描边 = 待保存",
+    "on": "开",
+    "off": "关",
+    "badgeDanger": "破坏性 · 默认仅预览",
+    "badgeLlm": "需 LLM · 默认仅预览",
+    "badgeSafe": "安全工具",
+    "resultJson": "结果 JSON",
+    "name": {
+      "compress_knowledge_cluster": "知识聚类压缩",
+      "update_container_routing": "路由规则更新",
+      "snapshot_and_quarantine": "快照隔离",
+      "tune_model_parameters": "模型调参",
+      "analyze_retrieval_latency": "检索时延分析",
+      "manage_token_quotas": "Token 额度管理"
+    },
+    "status": {
+      "ok": "成功",
+      "error": "失败",
+      "disabled": "已禁用",
+      "dry_run": "试运行",
+      "deferred": "已延期"
+    }
   }
 }

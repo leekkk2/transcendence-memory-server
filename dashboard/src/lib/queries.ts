@@ -191,9 +191,11 @@ export interface ConfigItem {
   configured: boolean | null;
   // P6: ConfigField grouping/labelling metadata. The server falls back group→
   // module and label→key tail, so both are always populated; older callers that
-  // ignore them keep working.
+  // ignore them keep working. `description` is the upcoming per-key human hint
+  // — optional so older server payloads stay compatible.
   group?: string | null;
   label?: string | null;
+  description?: string | null;
 }
 
 export interface ConfigListResponse {

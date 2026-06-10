@@ -77,7 +77,7 @@ CONFIG_CHANNEL = "config_updated"
 # is a placeholder so the host-pin guard still functions out of the box. No
 # scheme/port — host-pinned only. A set with any other host is rejected.
 _ALLOWED_MODEL_BASE_HOST = (
-    os.environ.get("TM_ALLOWED_MODEL_HOST") or "newapi.example"
+    os.environ.get("TM_ALLOWED_MODEL_HOST") or "llm-gateway.example"
 ).strip().lower()
 
 
@@ -187,7 +187,10 @@ _DEFAULT_TOOLS_ENABLED_MAP: dict[str, bool] = {n: True for n in _PRESET_TOOL_NAM
 
 
 class _ConfigKey:
-    __slots__ = ("coerce", "sensitive", "typename", "default", "group", "label")
+    __slots__ = (
+        "coerce", "sensitive", "typename", "default", "group", "label",
+        "description",
+    )
 
     def __init__(
         self,
@@ -197,6 +200,7 @@ class _ConfigKey:
         default: Any = None,
         group: Optional[str] = None,
         label: Optional[str] = None,
+        description: Optional[str] = None,
     ):
         self.coerce = coerce
         self.sensitive = sensitive
@@ -210,48 +214,69 @@ class _ConfigKey:
         # citation_enabled) it is the opt-in sentinel (None / True) the request
         # path falls back to pre-P1. `group`/`label` (P6) drive the Dashboard's
         # ConfigField grouping/labelling; absent group falls back to module_for_key.
+        # `description` is a one-line, user-facing explanation of what the knob
+        # does (shown as helper text in the Dashboard).
         self.typename = typename
         self.default = default
         self.group = group
         self.label = label
+        self.description = description
 
 
 KNOWN_CONFIG: dict[str, _ConfigKey] = {
     # ── Live RAG knobs — actually hot-reloaded into /search & /query this round ─
     "config:rag:similarity_threshold": _ConfigKey(
-        _coerce_float_or_none, typename="float", default=None
+        _coerce_float_or_none, typename="float", default=None, group="检索与引用",
+        label="检索相关性门槛",
+        description="检索相关性门槛：设置后低于该相关度的结果会被过滤，留空表示不过滤（返回全部匹配）",
     ),
     "config:rag:citation_enabled": _ConfigKey(
-        _coerce_bool, typename="bool", default=True
+        _coerce_bool, typename="bool", default=True, group="检索与引用",
+        label="搜索结果附带出处",
+        description="在搜索结果中附带来源出处（文件与行号），便于追溯记忆来自哪里",
     ),
     # P4: /query answer source-tracing ([Chunk_ID] / References backfill). Opt-in,
     # default False — the live reader (_get_query_citation_enabled) passes
     # default=False so an absent override keeps /query byte-identical to pre-P4
     # (no extra retrieval, citations=[]).
     "config:rag:query_citation_enabled": _ConfigKey(
-        _coerce_bool, typename="bool", default=False
+        _coerce_bool, typename="bool", default=False, group="检索与引用",
+        label="问答回答附带引用",
+        description="在问答回答末尾附上引用的记忆来源，便于核对答案依据；默认关闭，开启后回答会多一步溯源处理",
     ),
     # ── Registered + persistable; live reader added in blueprint P4 ─────────
     # fallback_template: opt-in structured interception body for score_gated /
     # not_initialized /query (and full-degrade /search). Empty = unconfigured =
     # current behavior preserved byte-for-byte.
     "config:rag:fallback_template": _ConfigKey(
-        _coerce_str, typename="str", default=""
+        _coerce_str, typename="str", default="", group="检索与引用",
+        label="降级提示文案模板",
+        description="当检索结果质量不足或服务暂不可用时，返回给用户的提示文案；留空表示使用系统默认提示",
     ),
     "config:rag:degradation_timeout_ms": _ConfigKey(
-        _coerce_int, typename="int", default=0
+        _coerce_int, typename="int", default=0, group="检索与引用",
+        label="降级超时(毫秒)",
+        description="检索超过该毫秒数仍未完成时转入降级处理（先返回简化结果）；0 或留空表示不限时",
     ),
     "config:model:base_url:llm": _ConfigKey(
-        _coerce_str, typename="str", default=""
+        _coerce_str, typename="str", default="", group="模型接入",
+        label="对话模型服务地址",
+        description="对话（生成回答）模型的服务地址：留空使用系统默认；仅允许填写经过许可的网关地址",
     ),
     "config:model:base_url:embedding": _ConfigKey(
-        _coerce_str, typename="str", default=""
+        _coerce_str, typename="str", default="", group="模型接入",
+        label="向量模型服务地址",
+        description="向量化（语义索引）模型的服务地址：留空使用系统默认；仅允许填写经过许可的网关地址",
     ),
     "config:model:api_keys:llm": _ConfigKey(
-        _coerce_str, sensitive=True, typename="str", default=""
+        _coerce_str, sensitive=True, typename="str", default="", group="模型接入",
+        label="对话模型 API 密钥",
+        description="访问对话模型所需的密钥：保存后只显示「已配置」，不会回显内容；填空白可清除",
     ),
     "config:model:api_keys:embedding": _ConfigKey(
-        _coerce_str, sensitive=True, typename="str", default=""
+        _coerce_str, sensitive=True, typename="str", default="", group="模型接入",
+        label="向量模型 API 密钥",
+        description="访问向量化模型所需的密钥：保存后只显示「已配置」，不会回显内容；填空白可清除",
     ),
     # ── Token metering / quota breaker (blueprint P3, §A6) ──────────────────
     # Opt-in: the live reader (token_meter.over_budget) passes default=None for
@@ -260,16 +285,24 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     # 'none' → None (the unlimited sentinel). fallback_model + flush_interval are
     # read with their own caller defaults.
     "config:token:daily_budget": _ConfigKey(
-        _coerce_int_or_none, typename="int", default=None
+        _coerce_int_or_none, typename="int", default=None, group="用量与预算",
+        label="每日 Token 预算",
+        description="每日 Token 用量上限，超出后暂停 LLM 调用直到次日；0 或留空表示不限制",
     ),
     "config:token:hourly_budget": _ConfigKey(
-        _coerce_int_or_none, typename="int", default=None
+        _coerce_int_or_none, typename="int", default=None, group="用量与预算",
+        label="每小时 Token 预算",
+        description="每小时 Token 用量上限，超出后暂停 LLM 调用直到下一小时；0 或留空表示不限制",
     ),
     "config:token:fallback_model": _ConfigKey(
-        _coerce_str, typename="str", default=""
+        _coerce_str, typename="str", default="", group="用量与预算",
+        label="超额降级模型",
+        description="用量接近上限时自动改用的更经济模型；留空表示不切换、超限后直接暂停调用",
     ),
     "config:token:flush_interval": _ConfigKey(
-        _coerce_int, typename="int", default=0
+        _coerce_int, typename="int", default=0, group="用量与预算",
+        label="用量统计写入间隔(秒)",
+        description="用量计数写入存储的间隔秒数：越小统计越实时但写入越频繁；0 表示使用系统默认间隔",
     ),
     # ── High-density index cards (blueprint P6, §A3) ────────────────────────
     # Placeholders: the index-card clustering/compression tool is implemented by
@@ -279,14 +312,17 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     "config:index_card:cluster_cron": _ConfigKey(
         _coerce_str, typename="str", default="0 3 * * 0", group="索引卡",
         label="索引卡聚类 cron",
+        description="自动归并整理索引卡的周期计划（cron 格式）；默认每周日凌晨 3 点执行一次",
     ),
     "config:index_card:compression_ratio": _ConfigKey(
         _coerce_float, typename="float", default=0.3, group="索引卡",
         label="索引卡压缩比",
+        description="索引卡的压缩程度：数值越小压得越精简、细节越少；默认 0.3 即压缩到原文约三成篇幅",
     ),
     "config:index_card:llm_temperature": _ConfigKey(
         _coerce_float, typename="float", default=0.2, group="索引卡",
         label="索引卡 LLM 温度",
+        description="生成索引卡时模型的发挥程度：调低更严谨稳定，调高更灵活发散；默认 0.2 偏严谨",
     ),
     # ── Container lifecycle (blueprint P6, §A4) ─────────────────────────────
     # Placeholders for the container TTL / issue-halflife / routing governance.
@@ -295,14 +331,17 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     "config:container:cicd_ttl_days": _ConfigKey(
         _coerce_int, typename="int", default=14, group="容器生命周期",
         label="CICD 容器存活天数",
+        description="CICD 类临时记忆容器的保留天数，到期后自动清理；默认 14 天",
     ),
     "config:container:issue_halflife_days": _ConfigKey(
         _coerce_int, typename="int", default=180, group="容器生命周期",
         label="议题半衰期(天)",
+        description="议题类记忆的热度半衰期：随时间推移，越旧的议题在检索排序中的权重越低；默认 180 天",
     ),
     "config:container:routing_rules": _ConfigKey(
         _coerce_json, typename="json", default={}, group="容器生命周期",
         label="容器路由规则",
+        description="按容器名定义记忆写入与检索的分流规则（JSON）；留空表示使用默认路由，不做特殊分流",
     ),
     # ── Dreaming system · global (blueprint P6, §A7) ────────────────────────
     # global_enabled = the "dreaming may run at all" gate (default true = the
@@ -313,34 +352,42 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     "config:dreaming:global_enabled": _ConfigKey(
         _coerce_bool, typename="bool", default=True, group="梦境系统",
         label="梦境系统总开关",
+        description="后台记忆整理（梦境系统）的总开关：关闭后所有整理任务（含手动触发）都不会运行",
     ),
     "config:dreaming:scheduler_enabled": _ConfigKey(
         _coerce_bool, typename="bool", default=False, group="梦境系统",
         label="梦境后台自动调度",
+        description="是否按计划在后台自动运行记忆整理：默认关闭（更安全），关闭时仍可手动触发整理",
     ),
     "config:dreaming:trigger_cron": _ConfigKey(
         _coerce_str, typename="str", default="0 2 * * *", group="梦境系统",
         label="梦境调度 cron",
+        description="自动整理的运行计划（cron 格式）；默认每天凌晨 2 点执行一次",
     ),
     "config:dreaming:batch_model": _ConfigKey(
         _coerce_str, typename="str", default="gpt-4o-mini", group="梦境系统",
         label="梦境批处理模型",
+        description="批量整理记忆时使用的模型：默认选用轻量经济的模型以控制成本，可按需换更强的模型",
     ),
     "config:dreaming:cache_threshold": _ConfigKey(
         _coerce_int, typename="int", default=10, group="梦境系统",
         label="高频缓存阈值",
+        description="一条记忆被访问多少次后视为高频、加入快速缓存：调小缓存更积极、调大更保守；默认 10 次",
     ),
     "config:dreaming:prune_threshold": _ConfigKey(
         _coerce_float, typename="float", default=0.3, group="梦境系统",
         label="低价值剪枝阈值",
+        description="价值评分低于该值的记忆会被列入清理候选：调高清理更激进，调低更保守；默认 0.3",
     ),
     "config:dreaming:graph_prune_enabled": _ConfigKey(
         _coerce_bool, typename="bool", default=True, group="梦境系统",
         label="图谱孤点候选纳入",
+        description="是否把知识图谱中孤立、无关联的节点也纳入清理候选；默认开启",
     ),
     "config:dreaming:prune_apply": _ConfigKey(
         _coerce_bool, typename="bool", default=False, group="梦境系统",
         label="梦境破坏性删除生效",
+        description="清理候选是否真正执行删除：默认关闭（只出报告、不删除任何记忆），开启前请谨慎确认",
     ),
     # ── Governance toolbox · global (blueprint P6, §A8) ─────────────────────
     # global_enabled_map: per-tool master switch (default all 6 preset tools on).
@@ -350,18 +397,22 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     "config:tools:global_enabled_map": _ConfigKey(
         _coerce_json, typename="json", default=_DEFAULT_TOOLS_ENABLED_MAP,
         group="治理工具箱", label="工具全局开关表",
+        description="各治理工具的全局开关表：可单独关闭某个工具使其全局不可用；默认全部开启",
     ),
     "config:tools:sandbox_mem_limit": _ConfigKey(
         _coerce_str, typename="str", default="512m", group="治理工具箱",
         label="工具沙箱内存上限",
+        description="治理工具运行沙箱的内存上限（如 512m）：防止单个工具占用过多资源；默认 512m",
     ),
     "config:tools:approval_ttl_days": _ConfigKey(
         _coerce_int, typename="int", default=30, group="治理工具箱",
         label="审批有效期(天)",
+        description="一次工具操作审批的有效天数，过期后需重新审批才能执行；默认 30 天",
     ),
     "config:tools:new_tool_default_enabled": _ConfigKey(
         _coerce_bool, typename="bool", default=False, group="治理工具箱",
         label="新工具默认启用",
+        description="新注册的治理工具是否默认开启：默认关闭（需手动逐个开启），更安全",
     ),
 }
 
@@ -905,6 +956,9 @@ def describe_key(key: str) -> dict[str, Any]:
         # the key tail so older keys (no explicit group/label) still render.
         "group": spec.group or module_for_key(key),
         "label": spec.label or key.split(":")[-1],
+        # User-facing one-liner helper text; None when unregistered (Dashboard
+        # simply hides the hint).
+        "description": spec.description,
     }
     if spec.sensitive:
         # Write-only: never surface the value. `configured` = a non-empty

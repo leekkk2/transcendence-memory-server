@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ConfigItem } from '../lib/queries';
 import { cn } from '../lib/format';
@@ -48,12 +49,22 @@ export function ConfigField({ item, draft, dirty, onChange, onReset }: ConfigFie
   const { t } = useTranslation();
   const sensitive = isSensitive(item.key);
   const baseUrl = item.key.startsWith(BASE_URL_PREFIX);
-  const label = leafLabel(item.key);
+  // Friendly label first (server-provided), raw key only as hover tooltip —
+  // the bare key tail is a fallback, never the preferred display.
+  const label = item.label ?? leafLabel(item.key);
+  // Per-key hint: server `description` wins; otherwise an optional locale
+  // entry (config.keyHint.<leaf>, ':' → '_' to dodge the i18next nsSeparator),
+  // silently empty when neither exists.
+  const hint =
+    item.description ??
+    t(`config.keyHint.${leafLabel(item.key).replace(/:/g, '_')}`, { defaultValue: '' });
 
   return (
     <div className="flex flex-col gap-1.5 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="mono text-xs">{label}</span>
+        <span className="text-xs" title={item.key}>
+          {label}
+        </span>
         <span className="text-dim mono text-[10px] uppercase">{item.type}</span>
         {item.is_override ? (
           <span className="badge badge-cyan">{t('config.modified')}</span>
@@ -86,6 +97,8 @@ export function ConfigField({ item, draft, dirty, onChange, onReset }: ConfigFie
           </button>
         ) : null}
       </div>
+
+      {hint ? <p className="text-dim text-[11px]">{hint}</p> : null}
 
       <ControlFor item={item} draft={draft} onChange={onChange} />
 
@@ -230,6 +243,10 @@ function ControlFor({
     );
   }
 
+  if (item.type === 'json') {
+    return <JsonControl item={item} draft={draft} onChange={onChange} />;
+  }
+
   // str
   const current = draft !== undefined ? draft : item.value;
   return (
@@ -243,6 +260,104 @@ function ControlFor({
   );
 }
 
+/**
+ * `json`-typed key (routing_rules / global_enabled_map blobs). Two states:
+ *   - view: pretty-printed JSON in a mono <pre> panel
+ *   - edit: multi-line textarea with live JSON.parse validation
+ * The staged draft is the raw JSON *text* (the server's json coercion parses
+ * string payloads), so ConfigDraft stays scalar-only. Invalid text is never
+ * staged — the last valid draft (or the live value) survives a bad edit.
+ */
+function JsonControl({
+  item,
+  draft,
+  onChange,
+}: {
+  item: ConfigItem;
+  draft: ConfigDraft | undefined;
+  onChange: (value: ConfigDraft) => void;
+}) {
+  const { t } = useTranslation();
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState('');
+  const [invalid, setInvalid] = useState(false);
+
+  const current = draft !== undefined ? draft : item.value;
+  const pretty = prettyJson(current);
+
+  if (!editing) {
+    return (
+      <div className="flex flex-col items-start gap-1.5">
+        <pre
+          className="mono w-full max-w-md overflow-x-auto rounded border px-2.5 py-2 text-xs"
+          style={{ background: 'var(--bg)', borderColor: 'var(--border)' }}
+        >
+          {pretty}
+        </pre>
+        <button
+          type="button"
+          onClick={() => {
+            setText(pretty);
+            setInvalid(false);
+            setEditing(true);
+          }}
+          className="btn btn-ghost px-2 py-0.5 text-[11px]"
+        >
+          {t('config.editJson')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-start gap-1.5">
+      <textarea
+        value={text}
+        rows={Math.min(12, Math.max(4, text.split('\n').length + 1))}
+        spellCheck={false}
+        onChange={(e) => {
+          const v = e.target.value;
+          setText(v);
+          try {
+            JSON.parse(v);
+            setInvalid(false);
+            onChange(v);
+          } catch {
+            setInvalid(true);
+          }
+        }}
+        className="input mono w-full max-w-md text-xs"
+      />
+      {invalid ? (
+        <span className="text-[11px]" style={{ color: 'var(--red)' }}>
+          {t('config.invalidJson')}
+        </span>
+      ) : null}
+      <button
+        type="button"
+        disabled={invalid}
+        onClick={() => setEditing(false)}
+        className="btn btn-ghost px-2 py-0.5 text-[11px]"
+      >
+        {t('config.doneEditing')}
+      </button>
+    </div>
+  );
+}
+
+function prettyJson(v: unknown): string {
+  if (v === null || v === undefined) return '{}';
+  if (typeof v === 'string') {
+    // staged drafts are raw JSON text — re-pretty them; non-JSON shows as-is
+    try {
+      return JSON.stringify(JSON.parse(v), null, 2);
+    } catch {
+      return v;
+    }
+  }
+  return JSON.stringify(v, null, 2);
+}
+
 function leafLabel(key: string): string {
   // config:rag:similarity_threshold → similarity_threshold
   // config:model:api_keys:llm → api_keys:llm
@@ -250,9 +365,11 @@ function leafLabel(key: string): string {
   return parts.slice(2).join(':') || key;
 }
 
-function renderScalar(v: ConfigDraft): string {
+function renderScalar(v: unknown): string {
   if (v === null || v === undefined) return '—';
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (typeof v === 'string') return v === '' ? '""' : v;
+  // json defaults arrive as objects — compact stringify, never "[object Object]"
+  if (typeof v === 'object') return JSON.stringify(v);
   return String(v);
 }
