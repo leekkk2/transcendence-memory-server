@@ -6,7 +6,7 @@ P1 配置中心三层（SQLite config_kv → Redis cache → 进程内存缓存�
   * (a) 无 Redis/DB 时 get_cached 全退 default、set 不抛纯降级。
   * (b) DB 往返：set → DB 持久 → 重 load_all → get_cached 反映。
   * (c) 类型 coerce：int / float / bool / None。
-  * (d) HR-9 守卫：set config:model:base_url 非 newapi 被拒。
+  * (d) HR-9 守卫：set config:model:base_url 非许可网关 host 被拒。
   * (e) 行为保持：未 set similarity_threshold 时 get_cached 返回传入的 None default。
 
 真 Redis 的 pub/sub 刷新用 @pytest.mark.integration（冒烟阶段单独跑）。
@@ -121,6 +121,39 @@ def test_describe_key_is_override_false_after_clear():
     d2 = config_store.describe_key(key)
     assert d2["is_override"] is False
     assert d2["value"] is None  # 退 registered default
+
+
+def test_describe_all_user_friendly_metadata_complete():
+    """Dashboard 元数据补全：全部 known key 都下发中文 group / label / description。
+
+    防回归「dashboard 暴露裸 key」：describe_all（= GET /admin/config 数据源）的
+    每一项都必须带非空 label 与 description（一句话用户向说明），group 不退
+    module 裸名。老键（rag/model/token）与 P6 新键一视同仁。
+    """
+    items = config_store.describe_all()
+    assert len(items) == len(config_store.KNOWN_CONFIG)
+    for d in items:
+        assert d["label"], f"{d['key']} missing label"
+        assert d["description"], f"{d['key']} missing description"
+        assert d["group"], f"{d['key']} missing group"
+        # label/description 必须是人话，不是裸 key 尾巴照搬技术名以外的空值。
+        assert isinstance(d["description"], str)
+    # 抽样：老键（P6 前无 label/group）现在也有用户友好元数据。
+    d = config_store.describe_key("config:rag:similarity_threshold")
+    assert d["label"] == "检索相关性门槛"
+    assert d["group"] == "检索与引用"
+    assert "门槛" in d["description"]
+    d = config_store.describe_key("config:token:daily_budget")
+    assert d["group"] == "用量与预算"
+    assert "上限" in d["description"]
+    # 抽样：P6 新键 description 补齐（label/group 原有保持不动）。
+    d = config_store.describe_key("config:dreaming:prune_apply")
+    assert d["label"] == "梦境破坏性删除生效"
+    assert d["description"]
+    # 敏感键同样下发 description（但 value 仍恒 None，铁律不变）。
+    d = config_store.describe_key("config:model:api_keys:llm")
+    assert d["description"]
+    assert d["value"] is None
 
 
 def test_describe_key_sensitive_configured_false_after_clear():

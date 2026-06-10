@@ -156,6 +156,11 @@
   },
   "config": {
     "title": "Configuration",
+    "subtitle": "Tune how the memory service runs. Edits are staged on this page and only take effect after you press Save.",
+    "searchPlaceholder": "Search settings (name / description)",
+    "clearSearch": "clear search",
+    "noMatches": "No settings match your search",
+    "overrideCount": "{{count}} customized",
     "save": "Save changes",
     "saving": "saving…",
     "saved": "saved",
@@ -174,6 +179,13 @@
     "clearInput": "clear",
     "removeSecret": "remove",
     "secretWillClear": "will clear on save",
+    "editJson": "edit",
+    "doneEditing": "done",
+    "invalidJson": "invalid JSON — fix it before it can be staged",
+    "keyHint": {
+      "routing_rules": "JSON map of container name → routing rule overrides; {} inherits the defaults.",
+      "global_enabled_map": "JSON map of governance tool name → enabled flag."
+    },
     "footnote": "Sensitive keys are write-only — the server never returns stored secrets. Live keys (similarity_threshold, citation_enabled) apply immediately; model/token keys persist now and take effect after the live reader picks them up.",
     "module": {
       "rag": "RAG retrieval",
@@ -279,6 +291,32 @@
     "trying": "trying…",
     "tryError": "try failed",
     "applied": "applied",
-    "reportOnly": "preview"
+    "reportOnly": "preview",
+    "searchContainers": "Search containers…",
+    "noMatch": "no matching containers",
+    "legendOverride": "solid = container override",
+    "legendInherited": "faded = inherits global",
+    "legendStaged": "ring = unsaved",
+    "on": "on",
+    "off": "off",
+    "badgeDanger": "destructive · preview-only by default",
+    "badgeLlm": "needs LLM · preview-only by default",
+    "badgeSafe": "safe tool",
+    "resultJson": "result JSON",
+    "name": {
+      "compress_knowledge_cluster": "Cluster compression",
+      "update_container_routing": "Routing update",
+      "snapshot_and_quarantine": "Snapshot & quarantine",
+      "tune_model_parameters": "Model tuning",
+      "analyze_retrieval_latency": "Latency analysis",
+      "manage_token_quotas": "Token quotas"
+    },
+    "status": {
+      "ok": "ok",
+      "error": "error",
+      "disabled": "disabled",
+      "dry_run": "dry run",
+      "deferred": "deferred"
+    }
   }
 }

@@ -663,6 +663,10 @@ class ConfigItem(BaseModel):
         default=None,
         description='Human-readable field label (P6); falls back to the key tail when unset.',
     )
+    description: str | None = Field(
+        default=None,
+        description='User-facing one-line helper text explaining what the knob does; null when unregistered.',
+    )
 
 
 class ConfigListResponse(BaseModel):
