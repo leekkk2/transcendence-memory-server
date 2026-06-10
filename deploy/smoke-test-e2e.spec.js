@@ -42,7 +42,9 @@ test.describe('Dashboard E2E Smoke Test', () => {
     // 5. Navigate to Memory Page using sidebar navigation (SPA)
     console.log('Navigating to Memory page via sidebar...');
     await page.click('a[href$="/memory"]');
-    await page.waitForURL('**/memory');
+    // Memory auto-appends ?container=<largest> on mount (replace navigation,
+    // predates a11cf73), so a bare `**/memory` glob races — accept the query.
+    await page.waitForURL(/\/memory(\?|$)/);
     
     // Select the correct container if passed
     if (CONTAINER) {
