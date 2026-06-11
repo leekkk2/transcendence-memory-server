@@ -294,6 +294,7 @@
     "globalConfig": "全局设置",
     "globalConfigHint": "工具总开关表、沙箱内存上限、审批有效期，以及新增工具的默认状态。",
     "scopePlaceholder": "容器",
+    "containerRequired": "请先在右上输入框填写目标容器名，再试运行 / 执行",
     "tryRun": "试运行（dry run）",
     "trying": "试运行中…",
     "tryError": "试运行失败",

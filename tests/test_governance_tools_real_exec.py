@@ -306,5 +306,42 @@ def test_dry_run_true_three_tools_do_not_touch_data(tmp_path, monkeypatch):
     assert config_store.get_cached("config:rag:similarity_threshold", None) is None
 
 
+def test_dry_run_previews_carry_real_scan(tmp_path, monkeypatch):
+    """dry_run 预览须是真实只读扫描而非空回声：compress 给目标簇、tune 给信号。
+
+    回归 2026-06-11 用户实测「试运行返回 container=null/params_echo={} 空 plan」
+    —— 修复后即便填了容器，compress/tune 的 dry_run 也带可执行预览（不调 LLM）。"""
+    now = int(time.time())
+    _write_rows(tmp_path, "box-a", _cluster_rows(now))
+    monkeypatch.setattr(governance_tools, "_llm_oneshot", _llm_must_not_be_called)
+
+    comp = _run(governance_tools.invoke_tool(
+        "compress_knowledge_cluster", container="box-a", dry_run=True))
+    cplan = comp["result"]["plan"]
+    assert comp["status"] == "dry_run"
+    assert cplan["container"] == "box-a"
+    assert cplan["would_compress"] is True
+    assert cplan["cluster_size"] == 2
+    assert set(cplan["source_ids"]) == {"a1", "a2"}
+
+    tune = _run(governance_tools.invoke_tool(
+        "tune_model_parameters", container="box-a", dry_run=True))
+    tplan = tune["result"]["plan"]
+    assert tune["status"] == "dry_run"
+    assert tplan["signals"]["object_count"] == 3
+    assert "current_config" in tplan["signals"]
+    assert "similarity_threshold" in tplan["tunable_keys"]
+
+
+def test_dry_run_preview_no_container_is_graceful(monkeypatch):
+    """无容器时预览不抛、给出 container required 提示（前端已拦截，后端兜底）。"""
+    monkeypatch.setattr(governance_tools, "_llm_oneshot", _llm_must_not_be_called)
+    comp = _run(governance_tools.invoke_tool(
+        "compress_knowledge_cluster", container=None, dry_run=True))
+    assert comp["status"] == "dry_run"
+    assert comp["result"]["plan"]["would_compress"] is False
+    assert comp["result"]["plan"]["cluster_size"] == 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

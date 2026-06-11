@@ -459,6 +459,9 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
   const [lastMode, setLastMode] = useState<'dry' | 'exec'>('dry');
   const [confirming, setConfirming] = useState(false);
   const kind: ToolKind = TOOL_META[tool.name]?.kind ?? 'safe';
+  // Container-scope tools need a target container; an empty input would post
+  // container:null and yield an empty preview — block the request, prompt instead.
+  const containerMissing = !globalScope && scope.trim() === '';
 
   async function run(dryRun: boolean) {
     setPendingMode(dryRun ? 'dry' : 'exec');
@@ -505,7 +508,7 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         <button
           type="button"
           onClick={() => void run(true)}
-          disabled={invoke.isPending}
+          disabled={invoke.isPending || containerMissing}
           className={`btn btn-ghost inline-flex items-center gap-1.5 text-xs ${
             globalScope ? 'ml-auto' : ''
           }`}
@@ -520,7 +523,7 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         <button
           type="button"
           onClick={onExecuteClick}
-          disabled={invoke.isPending}
+          disabled={invoke.isPending || containerMissing}
           className="btn btn-accent inline-flex items-center gap-1.5 text-xs"
         >
           {pendingMode === 'exec' ? (
@@ -534,6 +537,13 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         </button>
       </div>
       <p className="text-dim mt-1 text-[11px]">{tool.description}</p>
+      {containerMissing ? (
+        <p className="mt-1 text-[11px] italic" style={{ color: 'var(--red)' }}>
+          {t('tools.containerRequired', {
+            defaultValue: '请先在右上输入框填写目标容器名，再试运行 / 执行',
+          })}
+        </p>
+      ) : null}
       {invoke.isError ? (
         <div className="mt-1 text-[11px]" style={{ color: 'var(--red)' }} role="alert">
           {lastMode === 'exec' ? t('tools.execError') : t('tools.tryError')}

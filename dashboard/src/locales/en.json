@@ -294,6 +294,7 @@
     "globalConfig": "global settings",
     "globalConfigHint": "Master switch map, sandbox memory cap, approval window and the default for newly added tools.",
     "scopePlaceholder": "container",
+    "containerRequired": "Enter a target container in the box above first, then try / execute",
     "tryRun": "try (dry run)",
     "trying": "trying…",
     "tryError": "try failed",
