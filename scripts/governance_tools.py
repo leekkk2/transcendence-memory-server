@@ -4,19 +4,26 @@
 This module is the **safe, opt-in governance action layer** that sits beside the
 dreaming engine. It exposes six preset governance tools (§9.A), resolves whether
 each is enabled for a given container (container-level override layered over the
-global enable map), and invokes the *safe* ones for real while leaving the
-LLM / destructive ones report-only (``dry_run`` / ``deferred``) until an explicit
-config switch is flipped — which P6 ships OFF.
+global enable map), and invokes them. SAFE tools always run for real; the
+LLM / destructive tools stay preview-only (plan) under the endpoint default
+``dry_run=True`` and execute for real only on an explicit ``dry_run=false``:
+
+  * snapshot_and_quarantine — reversible: full snapshot + move candidates to a
+    sidecar quarantine file, never a hard delete;
+  * compress_knowledge_cluster — additive: appends one LLM index card, sources
+    are never deleted;
+  * tune_model_parameters — guard-railed: allow-list + range-checked config
+    writes through config_store (revert by clearing the override).
 
 Why this is behavior-preserving on a fresh deploy:
 
-  * **Read-only resolution + safe actions only.** ``resolve_*`` are pure config
-    reads. ``invoke_tool`` only mutates state for the three SAFE tools
+  * **Read-only resolution + dry_run-by-default actions.** ``resolve_*`` are
+    pure config reads. With the endpoint default ``dry_run=True``,
+    ``invoke_tool`` only mutates state for the three SAFE tools
     (manage_token_quotas = read-only; analyze_retrieval_latency = read-only;
     update_container_routing = an additive config write through the SAME
     ``config_store.set`` the PUT /admin/config endpoint uses — no write bypass).
-    The LLM / destructive tools never touch data in P6 (status='dry_run' /
-    'deferred', applied=False).
+    The LLM / destructive tools touch data only on explicit dry_run=false.
   * **No RAG-path readers.** Nothing here is consulted by ``/search`` / ``/query``;
     registering / invoking a tool cannot change retrieval output.
   * **Structural RAG immunity.** Any governance artifact this layer would persist
@@ -28,15 +35,16 @@ Invariants (mirror redis_client.py P0 / config_store.py P1 / dreaming.py P6):
   * **Import-safe** — importing opens no connection, touches no network.
   * **Graceful** — every Redis/config/DB read degrades to the conservative
     default (global map → preset defaults); nothing here raises into a caller.
-  * **No direct LLM** (HR-9) — compress_knowledge_cluster's real clustering, if
-    ever enabled, MUST route through rag_engine's gateway; P6 leaves it deferred
-    and calls no model.
+  * **No direct LLM** (HR-9) — every LLM call here goes through
+    ``_llm_oneshot`` → ``rag_engine._llm_func``, the env-driven (`LLM_*`)
+    sanctioned-gateway entry; no provider endpoint is ever dialed directly.
 
 R8: pure generic code — no private endpoint / hostname / credential / private
 container name.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -63,10 +71,10 @@ logger = logging.getLogger("transcendence-memory-server.governance_tools")
 
 
 # ── Tool registry (blueprint §9.A) ──────────────────────────────────────────
-# Each tool's static descriptor. `destructive` / `needs_llm` decide whether
-# invoke_tool may execute it for real in P6 (only safe = non-destructive,
-# non-LLM tools run; the rest are dry_run / deferred). `scope='global'` tools
-# ignore the container dimension (manage_token_quotas).
+# Each tool's static descriptor. `destructive` / `needs_llm` mark the tools
+# that stay plan-only under the endpoint default dry_run=True and execute for
+# real only on explicit dry_run=false (safe tools always run). `scope='global'`
+# tools ignore the container dimension (manage_token_quotas).
 
 
 class _Tool:
@@ -95,7 +103,8 @@ class _Tool:
 TOOLS: dict[str, _Tool] = {
     "compress_knowledge_cluster": _Tool(
         "compress_knowledge_cluster", "container",
-        "聚类压缩同主题记忆为高密度索引卡（需 LLM，经 rag_engine 网关）。",
+        "聚类压缩同主题记忆为高密度索引卡（需 LLM，经 rag_engine 网关；"
+        "dry_run=false 真执行，附加式不删源）。",
         needs_llm=True,
     ),
     "update_container_routing": _Tool(
@@ -104,12 +113,14 @@ TOOLS: dict[str, _Tool] = {
     ),
     "snapshot_and_quarantine": _Tool(
         "snapshot_and_quarantine", "container",
-        "快照并隔离低价值/异常记忆（破坏性，默认仅产计划不执行）。",
+        "快照并隔离低价值/异常记忆（破坏性可逆：默认 dry_run 仅产计划，"
+        "dry_run=false 真执行——全量快照+隔离文件留存，零硬删）。",
         destructive=True,
     ),
     "tune_model_parameters": _Tool(
         "tune_model_parameters", "container",
-        "依检索质量调参（需 LLM 评估，默认仅产计划）。",
+        "依检索质量调参（需 LLM 评估；dry_run=false 真执行，"
+        "allow-list+范围护栏，经 config_store 加性写）。",
         needs_llm=True,
     ),
     "analyze_retrieval_latency": _Tool(
@@ -293,9 +304,10 @@ async def invoke_tool(
       * SAFE tool (manage_token_quotas / analyze_retrieval_latency /
         update_container_routing) → run for real (the first two read-only, the
         third an additive config write).
-      * LLM / destructive tool → status='dry_run' (preview + plan) when dry_run,
-        else 'deferred' (P6 never executes these; the guarding config switch is
-        off) — applied=False either way.
+      * LLM / destructive tool → status='dry_run' (preview + plan) when dry_run
+        (the endpoint default), else the real handler executes: quarantine
+        (reversible snapshot+move) / compress (additive index card) / tune
+        (guard-railed config write) — status='applied' on success.
 
     Never raises — any handler error degrades to status='error' in the result.
     """
@@ -314,7 +326,17 @@ async def invoke_tool(
             return _invoke_analyze_retrieval_latency(container, params)
         if tool == "update_container_routing":
             return await _invoke_update_container_routing(container, params, dry_run)
-        # LLM / destructive tools — report-only in P6 (see module docstring).
+        # LLM / destructive 工具：dry_run（端点默认）仍只产 plan 预览；显式
+        # dry_run=false 才真执行（可逆/附加/护栏语义见各 handler docstring）。
+        if dry_run:
+            return _invoke_deferred_or_dry_run(spec, container, params, dry_run)
+        if tool == "snapshot_and_quarantine":
+            return _invoke_snapshot_and_quarantine(container, params)
+        if tool == "compress_knowledge_cluster":
+            return await _invoke_compress_knowledge_cluster(container, params)
+        if tool == "tune_model_parameters":
+            return await _invoke_tune_model_parameters(container, params)
+        # 注册表里没接真执行 handler 的兜底（当前不可达，防未来新工具漏接线）。
         return _invoke_deferred_or_dry_run(spec, container, params, dry_run)
     except Exception as exc:  # noqa: BLE001 - an invoke must never raise into the endpoint
         logger.warning("[governance_tools] invoke %s degraded: %s", tool, exc)
@@ -585,29 +607,316 @@ def _parse_memory_line(line: str) -> Optional[dict]:
 def _invoke_deferred_or_dry_run(
     spec: _Tool, container: Optional[str], params: dict, dry_run: bool
 ) -> dict[str, Any]:
-    """LLM / destructive tool handler — report-only in P6.
+    """LLM / destructive 工具的 plan 预览（不动数据）。
 
-    Returns a plan/preview (status='dry_run') when dry_run is True, else
-    'deferred' (the real execution is gated behind a config switch P6 ships off,
-    so it is intentionally NOT performed here). applied is always False; no data
-    is touched. snapshot_and_quarantine's plan additionally carries a read-only
-    candidate scan of the target container's real store so the plan is
-    actionable, not a parameter echo. The plan names the guarding switch and the
-    HR-9 / governance constraints so a future phase can wire the real action
-    safely."""
-    reason = "needs LLM (route via rag_engine gateway, HR-9)" if spec.needs_llm \
-        else "destructive (gated behind an explicit apply switch)"
+    dry_run=True（端点默认）→ status='dry_run'，产真实预览 plan（would_execute
+    恒 False = 「本次不执行」），notes 指引传 dry_run=false 真执行。
+    snapshot_and_quarantine 的 plan 额外携带目标容器真实存储的只读候选扫描，
+    让预览可执行而非参数回声。dry_run=False 仅作未接线工具的兜底（当前注册表
+    三个工具都已有真执行 handler，正常不可达）→ status='deferred'。"""
+    kind = "needs LLM (routes via rag_engine gateway, HR-9)" if spec.needs_llm \
+        else "destructive (reversible snapshot + quarantine)"
     plan = {
         "tool": spec.name,
         "container": container,
         "would_execute": False,
-        "reason_not_executed": reason,
+        "reason_not_executed": "dry_run preview; pass dry_run=false to execute",
         "params_echo": params,
     }
     if spec.name == "snapshot_and_quarantine":
         plan.update(_scan_quarantine_candidates(container, params))
     if dry_run:
         return _result(spec.name, "dry_run", container, {"plan": plan}, False,
-                       f"dry_run plan only — {reason}; P6 does not execute")
+                       f"dry_run preview ({kind}) — pass dry_run=false to execute")
     return _result(spec.name, "deferred", container, {"plan": plan}, False,
-                   f"deferred — {reason}; P6 ships the apply switch OFF (followup)")
+                   f"deferred — no real-execution handler wired for {spec.name}")
+
+
+# ── Real execution (dry_run=false) — shared plumbing ─────────────────────────
+
+
+# 索引卡压缩的 system prompt：高密度+模糊召回友好（标题同义词头部）是
+# founder 自然语言检索习惯的硬要求，故固化在 prompt 里而非交给调用方。
+_INDEX_CARD_SYSTEM_PROMPT = (
+    "把以下同主题记忆压缩成一张高密度索引卡，中文，不超过约 400 字，必须包含："
+    "①自然语言同义词头部（便于模糊召回）②核心结论 bullet 列表③来源 id 列表。"
+)
+# tune_model_parameters 的 LLM 输出契约：严格只回 JSON，便于机器解析+护栏校验。
+_TUNE_SYSTEM_PROMPT = (
+    "你是 RAG 检索参数调优器。根据给定的检索时延/规模/当前参数信号，"
+    "严格只输出一个 JSON 对象（无 markdown 包裹、无解释文字）："
+    '{"similarity_threshold": float|null, "default_topk": int|null, '
+    '"citation_enabled": bool|null, "rationale": str}。null 表示不调整该项。'
+)
+# 调参护栏：allow-list（仅这 3 个键可写）+ 建议键 → config_store 注册键映射。
+_TUNE_ALLOWED_KEYS: tuple[str, ...] = (
+    "similarity_threshold", "default_topk", "citation_enabled",
+)
+_TUNE_CONFIG_KEYS: dict[str, str] = {
+    "similarity_threshold": "config:rag:similarity_threshold",
+    "default_topk": "config:rag:default_topk",
+    "citation_enabled": "config:rag:citation_enabled",
+}
+
+
+async def _llm_oneshot(prompt: str, system_prompt: Optional[str] = None) -> str:
+    """一次性 LLM 调用 —— 经 rag_engine 的 env (`LLM_*`) 网关入口（HR-9 唯一
+    许可通道，自带重试 + token 计量）。任何 import/网络/模型异常都收敛为
+    RuntimeError（invoke_tool 兜底降级为 status='error'，绝不 raise 进 endpoint）。"""
+    try:
+        try:
+            import rag_engine  # type: ignore
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts import rag_engine  # type: ignore
+        return str(await rag_engine._llm_func(prompt, system_prompt=system_prompt))  # noqa: SLF001
+    except Exception as exc:  # noqa: BLE001 - 统一收敛，不让网关细节外溢
+        raise RuntimeError(f"llm call failed: {exc}") from exc
+
+
+def _atomic_write_jsonl(path: Path, rows: list[dict]) -> Path:
+    """原子 JSONL 写（tmp + rename）。镜像 server 端 write_memory_objects 的
+    工艺；自包含实现是因为本模块不可反向 import task_rag_server（会循环）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    tmp_path.replace(path)
+    return path
+
+
+def _governance_dir(container: str) -> Path:
+    """治理 sidecar 目录（快照/隔离文件落点）——与记忆主文件同容器目录隔离存放。"""
+    return _memory_objects_file(container).parent / "governance"
+
+
+def _read_memory_rows(container: str) -> list[dict]:
+    """读取容器 memory_objects.jsonl 全量行（坏行/空行跳过）；缺文件 → 空列表。"""
+    path = _memory_objects_file(container)
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            row = _parse_memory_line(line)
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+# ── Real execution: snapshot_and_quarantine（可逆） ──────────────────────────
+
+
+def _invoke_snapshot_and_quarantine(
+    container: Optional[str], params: dict
+) -> dict[str, Any]:
+    """真执行（可逆）：全量快照 → 候选移入隔离文件 → 幸存行原子重写主文件。
+
+    零硬删：候选行只是搬进 governance/quarantine-<ts>.jsonl，全量快照
+    snapshot-<ts>.jsonl 同时留存 —— 任何时刻可用快照整体回滚。候选判定复用
+    dry_run plan 的同一启发式（_candidate_from_row），预览与执行不会分叉。
+    候选为空时不动主文件（applied=True 但 quarantined_count=0）。"""
+    if not container:
+        return _result("snapshot_and_quarantine", "error", container, {}, False,
+                       "container is required for quarantine execution")
+    rows = _read_memory_rows(container)
+    max_age_days = int(params.get("max_age_days") or _QUARANTINE_MAX_AGE_DAYS)
+    now = time.time()
+    quarantined: list[dict] = []
+    survivors: list[dict] = []
+    for row in rows:
+        raw = json.dumps(row, ensure_ascii=False) + "\n"
+        if _candidate_from_row(row, raw, now, max_age_days) is None:
+            survivors.append(row)
+        else:
+            quarantined.append(row)
+    ts = int(time.time())
+    gov_dir = _governance_dir(container)
+    snapshot_path = _atomic_write_jsonl(gov_dir / f"snapshot-{ts}.jsonl", rows)
+    quarantine_path = _atomic_write_jsonl(gov_dir / f"quarantine-{ts}.jsonl", quarantined)
+    if quarantined:  # 候选为空就不碰主文件，避免无意义的重写+重建
+        _atomic_write_jsonl(_memory_objects_file(container), survivors)
+    result = {
+        "snapshot_path": str(snapshot_path),
+        "quarantine_path": str(quarantine_path),
+        "quarantined_count": len(quarantined),
+        "quarantined_ids": [str(r.get("id") or "") for r in quarantined],
+        "survivors_count": len(survivors),
+        "reindex_required": bool(quarantined),
+        "reversible": True,
+    }
+    return _result(
+        "snapshot_and_quarantine", "applied", container, result, True,
+        f"quarantined {len(quarantined)}/{len(rows)} rows "
+        "(full snapshot retained — reversible, no hard delete)",
+    )
+
+
+# ── Real execution: compress_knowledge_cluster（LLM 索引卡，附加式） ──────────
+
+
+def _pick_cluster(rows: list[dict], cluster_tag: Any) -> tuple[str, list[dict]]:
+    """选簇：params.cluster_tag 指定时取含该 tag 的行；否则按「相同 tags 集合」
+    聚簇取最大簇（同 tag 集 = 同主题的最强信号，无需 LLM 预判）。"""
+    if cluster_tag:
+        tag = str(cluster_tag)
+        return tag, [
+            r for r in rows
+            if isinstance(r.get("tags"), list) and tag in [str(t) for t in r["tags"]]
+        ]
+    clusters: dict[tuple[str, ...], list[dict]] = {}
+    for row in rows:
+        tags = row.get("tags")
+        if isinstance(tags, list) and tags:
+            sig = tuple(sorted({str(t) for t in tags}))
+            clusters.setdefault(sig, []).append(row)
+    if not clusters:
+        return "", []
+    sig, cluster = max(clusters.items(), key=lambda kv: len(kv[1]))
+    return ",".join(sig), cluster
+
+
+async def _invoke_compress_knowledge_cluster(
+    container: Optional[str], params: dict
+) -> dict[str, Any]:
+    """真执行（附加式）：同主题（同 tags 簇）记忆经网关 LLM 压缩成一张高密度
+    索引卡，作为**新行** append 进 memory_objects.jsonl —— 源记忆零删除，
+    回滚 = 删掉这一行新卡。簇 <2 不压缩（单条无聚合价值，省一次 LLM 调用）。"""
+    if not container:
+        return _result("compress_knowledge_cluster", "error", container, {}, False,
+                       "container is required for cluster compression")
+    rows = _read_memory_rows(container)
+    cluster_tag, cluster = _pick_cluster(rows, params.get("cluster_tag"))
+    if len(cluster) < 2:
+        return _result(
+            "compress_knowledge_cluster", "ok", container,
+            {"cluster_tag": cluster_tag, "cluster_size": len(cluster)}, False,
+            "no cluster ≥2 — nothing to compress",
+        )
+    prompt = "\n\n".join(
+        f"[{r.get('id')}] {r.get('title') or ''}\n{r.get('text') or ''}"
+        for r in cluster
+    )
+    card_text = await _llm_oneshot(prompt, system_prompt=_INDEX_CARD_SYSTEM_PROMPT)
+    ts = int(time.time())
+    sig = hashlib.md5(cluster_tag.encode("utf-8")).hexdigest()[:8]
+    source_ids = [str(r.get("id") or "") for r in cluster]
+    tags = sorted({
+        str(t) for r in cluster for t in (r.get("tags") or []) if str(t) != "index-card"
+    })
+    card = {
+        "id": f"idxcard-{sig}-{ts}",
+        "title": f"[索引卡] {cluster_tag}",
+        "text": card_text,
+        "tags": [*tags, "index-card"],
+        "createdAt": ts,
+        "metadata": {
+            "source_ids": source_ids,
+            "generated_by": "compress_knowledge_cluster",
+            "llm_model": os.environ.get("LLM_MODEL"),
+        },
+    }
+    _atomic_write_jsonl(_memory_objects_file(container), [*rows, card])
+    result = {
+        "card_id": card["id"],
+        "source_ids": source_ids,
+        "cluster_tag": cluster_tag,
+        "cluster_size": len(cluster),
+        "llm_model": os.environ.get("LLM_MODEL"),
+        "reindex_required": True,
+    }
+    return _result(
+        "compress_knowledge_cluster", "applied", container, result, True,
+        f"index card appended from {len(cluster)} source rows (sources kept)",
+    )
+
+
+# ── Real execution: tune_model_parameters（LLM 调参带护栏） ──────────────────
+
+
+def _validate_tune_value(key: str, value: Any) -> tuple[bool, Any]:
+    """护栏：逐键类型+范围校验（bool 是 int 子类，须先排除）。返回 (通过?, 规范值)。"""
+    if key == "similarity_threshold":
+        ok = (isinstance(value, (int, float)) and not isinstance(value, bool)
+              and 0.0 <= float(value) <= 1.0)
+        return ok, (float(value) if ok else None)
+    if key == "default_topk":
+        ok = isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 50
+        return ok, (value if ok else None)
+    if key == "citation_enabled":
+        return isinstance(value, bool), value
+    return False, None
+
+
+async def _apply_tune_suggestion(
+    suggestion: dict, before: dict
+) -> tuple[list[str], list[dict], dict]:
+    """护栏过滤 + 应用：allow-list 内逐键校验，越界/类型不符丢弃记 rejected，
+    通过的经 config_store.set 写入（与 PUT /admin/config 同一写路径，无旁路）。
+    返回 (applied_keys, rejected, after)。"""
+    applied_keys: list[str] = []
+    rejected: list[dict] = []
+    after = dict(before)
+    for key in _TUNE_ALLOWED_KEYS:
+        value = suggestion.get(key)
+        if value is None:  # null = LLM 明示不调整该项
+            continue
+        ok, normalized = _validate_tune_value(key, value)
+        if not ok:
+            rejected.append({"key": key, "value": value,
+                             "reason": "out_of_range_or_bad_type"})
+        elif await config_store.set(_TUNE_CONFIG_KEYS[key], normalized):
+            applied_keys.append(key)
+            after[key] = normalized
+        else:
+            rejected.append({"key": key, "value": value,
+                             "reason": "config_store_set_failed"})
+    for k in sorted(set(suggestion) - {*_TUNE_ALLOWED_KEYS, "rationale"}):
+        rejected.append({"key": k, "value": suggestion[k],
+                         "reason": "not_in_allow_list"})
+    return applied_keys, rejected, after
+
+
+async def _invoke_tune_model_parameters(
+    container: Optional[str], params: dict
+) -> dict[str, Any]:
+    """真执行（带护栏）：采集时延/规模/当前参数信号喂网关 LLM → 严格 JSON
+    调参建议 → allow-list + 范围护栏过滤 → 仅把通过校验的键经 config_store
+    加性写入。可逆：PUT /admin/config 把对应键置 null 即回退。解析失败 →
+    status='error' 且 config 零改动。"""
+    latency = _invoke_analyze_retrieval_latency(container, {})
+    object_count = len(_read_memory_rows(container)) if container else 0
+    before = {k: config_store.get_cached(cfg, None)
+              for k, cfg in _TUNE_CONFIG_KEYS.items()}
+    prompt = json.dumps({
+        "latency_metrics": latency.get("result", {}).get("latency_metrics"),
+        "object_count": object_count,
+        "current_config": before,
+    }, ensure_ascii=False)
+    raw = await _llm_oneshot(prompt, system_prompt=_TUNE_SYSTEM_PROMPT)
+    try:
+        suggestion = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return _result("tune_model_parameters", "error", container,
+                       {"error": "llm_output_not_json", "raw_head": str(raw)[:200]},
+                       False, "LLM output was not valid JSON — config untouched")
+    if not isinstance(suggestion, dict):
+        return _result("tune_model_parameters", "error", container,
+                       {"error": "llm_output_not_object"}, False,
+                       "LLM output was not a JSON object — config untouched")
+    applied_keys, rejected, after = await _apply_tune_suggestion(suggestion, before)
+    applied = bool(applied_keys)
+    result = {
+        "before": before,
+        "after": after,
+        "applied_keys": applied_keys,
+        "rejected": rejected,
+        "rationale": str(suggestion.get("rationale") or ""),
+        "llm_model": os.environ.get("LLM_MODEL"),
+    }
+    return _result(
+        "tune_model_parameters", "applied" if applied else "ok", container,
+        result, applied,
+        "tuned config keys applied via config_store (revert: clear the override)"
+        if applied else "no valid tuning suggestion applied — config untouched",
+    )

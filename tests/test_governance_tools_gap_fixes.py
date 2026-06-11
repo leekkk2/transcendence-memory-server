@@ -3,9 +3,10 @@
 * G2 analyze_retrieval_latency：不再 honest-deferred —— 接上 usage analytics
   （/admin/usage/endpoints 同源聚合）。注入假 usage 行到临时 queue.db，断言
   /search、/query 的 calls/p50_ms/p95_ms 聚合正确；窗口过滤 / 非法窗口回退。
-* G4 snapshot_and_quarantine：plan 携带目标容器真实 memory_objects.jsonl 的
-  只读候选扫描（超龄 / 超短启发式），would_execute 恒 False，dry_run 真假
-  都只产 plan、绝不动数据。
+* G4 snapshot_and_quarantine：dry_run=True 的 plan 携带目标容器真实
+  memory_objects.jsonl 的只读候选扫描（超龄 / 超短启发式）不动数据；
+  dry_run=False 真执行（契约升级）——全量快照 + 候选隔离 + 幸存行重写，
+  零硬删可逆（真执行细测另见 test_governance_tools_real_exec.py）。
 
 与 test_governance_tools_p6.py 同款隔离法：scripts/ 注入 sys.path、
 TM_REDIS_ENABLED=0、每例独立 WORKSPACE。G2 聚合用例经 usage_analytics 间接
@@ -201,21 +202,51 @@ def test_quarantine_plan_scans_real_container_rows(tmp_path):
     assert by_id["short-1"]["bytes"] == sizes["short-1"]
 
 
-def test_quarantine_not_dry_run_still_plan_only_and_data_untouched(tmp_path):
+def test_quarantine_not_dry_run_executes_snapshot_and_quarantine(tmp_path):
+    # 契约升级（取代旧「dry_run=False 仍 plan-only」用例）：dry_run=False 真执行
+    # —— 全量快照 + 候选移入隔离文件 + 幸存行重写主文件，零硬删可逆。
     now = int(time.time())
     path, _ = _write_container_rows(tmp_path, "box-a", [
         {"id": "stale-1", "text": "an old but reasonably long memory text",
          "updatedAt": now - 200 * 86_400},
+        {"id": "healthy-1", "text": "a fresh memory with plenty of content here",
+         "updatedAt": now - 3_600},
+    ])
+    res = _invoke_quarantine(dry_run=False)
+    assert res["status"] == "applied"
+    assert res["applied"] is True
+    result = res["result"]
+    assert result["quarantined_count"] == 1
+    assert result["quarantined_ids"] == ["stale-1"]
+    assert result["survivors_count"] == 1
+    assert result["reindex_required"] is True
+    assert result["reversible"] is True
+    # 主文件只剩幸存行
+    survivors = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l]
+    assert [r["id"] for r in survivors] == ["healthy-1"]
+    # 快照含原全量（可逆性依据）；隔离文件恰含候选行
+    snapshot = Path(result["snapshot_path"])
+    quarantine = Path(result["quarantine_path"])
+    snap_rows = [json.loads(l) for l in snapshot.read_text(encoding="utf-8").splitlines() if l]
+    assert {r["id"] for r in snap_rows} == {"stale-1", "healthy-1"}
+    quar_rows = [json.loads(l) for l in quarantine.read_text(encoding="utf-8").splitlines() if l]
+    assert [r["id"] for r in quar_rows] == ["stale-1"]
+
+
+def test_quarantine_not_dry_run_no_candidates_leaves_main_file(tmp_path):
+    # 候选为空：applied=True 但 quarantined_count=0，主文件零改动、无需重建。
+    now = int(time.time())
+    path, _ = _write_container_rows(tmp_path, "box-a", [
+        {"id": "healthy-1", "text": "a fresh memory with plenty of content here",
+         "updatedAt": now - 3_600},
     ])
     before = path.read_bytes()
     res = _invoke_quarantine(dry_run=False)
-    # dry_run=False 同样只产 plan（执行开关 P6 关）—— 蓝图语义不变
-    assert res["status"] == "deferred"
-    assert res["applied"] is False
-    plan = res["result"]["plan"]
-    assert plan["would_execute"] is False
-    assert [c["document_id"] for c in plan["candidates"]] == ["stale-1"]
-    assert path.read_bytes() == before  # 真实文件零改动
+    assert res["status"] == "applied"
+    assert res["applied"] is True
+    assert res["result"]["quarantined_count"] == 0
+    assert res["result"]["reindex_required"] is False
+    assert path.read_bytes() == before  # 主文件原样
 
 
 def test_quarantine_corrupt_lines_skipped_not_counted(tmp_path):

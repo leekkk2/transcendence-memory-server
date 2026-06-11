@@ -235,6 +235,14 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
         label="搜索结果附带出处",
         description="在搜索结果中附带来源出处（文件与行号），便于追溯记忆来自哪里",
     ),
+    # Registered + persistable so the governance tune tool（tune_model_parameters）
+    # can write it through the SAME config_store.set path; no live reader yet →
+    # registering changes nothing until one consults it (index_card 同款先例).
+    "config:rag:default_topk": _ConfigKey(
+        _coerce_int_or_none, typename="int", default=None, group="检索与引用",
+        label="检索默认返回条数",
+        description="检索默认返回的结果条数（top-k）：留空表示使用系统默认；由治理调参工具按护栏范围写入",
+    ),
     # P4: /query answer source-tracing ([Chunk_ID] / References backfill). Opt-in,
     # default False — the live reader (_get_query_citation_enabled) passes
     # default=False so an absent override keeps /query byte-identical to pre-P4

@@ -381,9 +381,10 @@ export function useTriggerDream() {
 
 // ---- Governance toolbox (GET /admin/tools, POST /admin/tools/{tool}/invoke) ----
 // P6 surface. The matrix is read-only; toggling a container's tool switch is a
-// PUT /admin/config write (no write bypass). Invoke is report-only by default —
-// only the safe tools (token quota read / latency read / additive routing) ever
-// execute; LLM/destructive tools return dry_run/deferred.
+// PUT /admin/config write (no write bypass). Invoke defaults to dry_run=true
+// (plan preview); passing dry_run=false executes for real — LLM tools route via
+// the gateway and return status 'applied' (or 'ok' when there is nothing to do),
+// the destructive snapshot tool stays reversible via snapshot + quarantine.
 export interface ToolInfo {
   name: string;
   scope: 'global' | 'container';
@@ -414,7 +415,7 @@ export interface ToolInvokeRequest {
 
 export interface ToolInvokeResponse {
   tool: string;
-  status: 'ok' | 'disabled' | 'dry_run' | 'error' | 'deferred';
+  status: 'ok' | 'applied' | 'disabled' | 'dry_run' | 'error' | 'deferred';
   container: string | null;
   result: Record<string, unknown>;
   applied: boolean;

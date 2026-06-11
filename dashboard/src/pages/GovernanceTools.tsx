@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   ChevronDown,
@@ -10,6 +10,7 @@ import {
   ShieldCheck,
   Sparkles,
   TriangleAlert,
+  Zap,
 } from 'lucide-react';
 import { ConfigField, type ConfigDraft } from '../components/ConfigField';
 import {
@@ -28,9 +29,10 @@ import {
  * The container × tool matrix renders the resolved enable map; toggling a cell
  * stages the whole container enabled_map json and saves it via PUT /admin/config
  * (config:tools:container:{c}:enabled_map) — no write bypass. The global scalar
- * knobs reuse ConfigField. Each tool has a dry-run "try" button that previews
- * the plan (and reads real balances for the safe token-quota tool) without ever
- * mutating data (dry_run=true).
+ * knobs reuse ConfigField. Each tool card offers both a dry-run "try" (preview
+ * plan, dry_run=true, never mutates) and a real "execute" (dry_run=false). The
+ * destructive snapshot/quarantine tool gates execution behind a confirmation
+ * dialog; LLM tools execute directly via the gateway with a loading state.
  */
 
 const GLOBAL_SCALAR_KEYS = [
@@ -306,7 +308,7 @@ export default function GovernanceTools() {
         </section>
       ) : null}
 
-      {/* Container tools — descriptions + dry-run try */}
+      {/* Container tools — descriptions + dry-run try / real execute */}
       <section className="panel space-y-3 p-4">
         <div className="text-dim mono text-xs uppercase tracking-wider">{t('tools.toolsTitle')}</div>
         {containerTools.map((tool) => (
@@ -424,7 +426,7 @@ function ToolKindBadge({ kind }: { kind: ToolKind }) {
     return (
       <span className="badge badge-red">
         <TriangleAlert size={11} aria-hidden />
-        {t('tools.badgeDanger', { defaultValue: '破坏性 · 默认仅预览' })}
+        {t('tools.badgeDanger', { defaultValue: '破坏性 · 执行需确认' })}
       </span>
     );
   }
@@ -432,7 +434,7 @@ function ToolKindBadge({ kind }: { kind: ToolKind }) {
     return (
       <span className="badge badge-yellow">
         <Sparkles size={11} aria-hidden />
-        {t('tools.badgeLlm', { defaultValue: '需 LLM · 默认仅预览' })}
+        {t('tools.badgeLlm', { defaultValue: '需 LLM · 可执行（经网关）' })}
       </span>
     );
   }
@@ -450,15 +452,35 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
   const invoke = useInvokeTool();
   const [scope, setScope] = useState('');
   const [result, setResult] = useState<ToolInvokeResponse | null>(null);
+  // Which button fired the in-flight request — keeps the other button's label
+  // stable while both stay disabled during the (potentially slow) LLM call.
+  const [pendingMode, setPendingMode] = useState<'dry' | 'exec' | null>(null);
+  // Last attempted mode survives the request so the error line reads right.
+  const [lastMode, setLastMode] = useState<'dry' | 'exec'>('dry');
+  const [confirming, setConfirming] = useState(false);
   const kind: ToolKind = TOOL_META[tool.name]?.kind ?? 'safe';
 
-  async function run() {
-    const r = await invoke.mutateAsync({
-      tool: tool.name,
-      container: globalScope || scope.trim() === '' ? null : scope.trim(),
-      dry_run: true,
-    });
-    setResult(r);
+  async function run(dryRun: boolean) {
+    setPendingMode(dryRun ? 'dry' : 'exec');
+    setLastMode(dryRun ? 'dry' : 'exec');
+    try {
+      const r = await invoke.mutateAsync({
+        tool: tool.name,
+        container: globalScope || scope.trim() === '' ? null : scope.trim(),
+        dry_run: dryRun,
+      });
+      setResult(r);
+    } catch {
+      // surfaced via invoke.isError below
+    } finally {
+      setPendingMode(null);
+    }
+  }
+
+  // Destructive tools confirm first; LLM/safe tools execute directly.
+  function onExecuteClick() {
+    if (kind === 'danger') setConfirming(true);
+    else void run(false);
   }
 
   return (
@@ -482,32 +504,131 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         ) : null}
         <button
           type="button"
-          onClick={run}
+          onClick={() => void run(true)}
           disabled={invoke.isPending}
           className={`btn btn-ghost inline-flex items-center gap-1.5 text-xs ${
             globalScope ? 'ml-auto' : ''
           }`}
         >
-          {invoke.isPending ? (
+          {pendingMode === 'dry' ? (
             <Loader2 size={12} aria-hidden className="animate-spin" />
           ) : (
             <Play size={12} aria-hidden />
           )}
-          {invoke.isPending ? t('tools.trying') : t('tools.tryRun')}
+          {pendingMode === 'dry' ? t('tools.trying') : t('tools.tryRun')}
+        </button>
+        <button
+          type="button"
+          onClick={onExecuteClick}
+          disabled={invoke.isPending}
+          className="btn btn-accent inline-flex items-center gap-1.5 text-xs"
+        >
+          {pendingMode === 'exec' ? (
+            <Loader2 size={12} aria-hidden className="animate-spin" />
+          ) : kind === 'danger' ? (
+            <TriangleAlert size={12} aria-hidden />
+          ) : (
+            <Zap size={12} aria-hidden />
+          )}
+          {pendingMode === 'exec' ? t('tools.executing') : t('tools.execRun')}
         </button>
       </div>
       <p className="text-dim mt-1 text-[11px]">{tool.description}</p>
       {invoke.isError ? (
-        <div className="mt-1 text-[11px]" style={{ color: 'var(--red)' }}>
-          {t('tools.tryError')}
+        <div className="mt-1 text-[11px]" style={{ color: 'var(--red)' }} role="alert">
+          {lastMode === 'exec' ? t('tools.execError') : t('tools.tryError')}
         </div>
       ) : null}
       {result ? <InvokeResult result={result} /> : null}
+      {confirming ? (
+        <ConfirmDialog
+          title={t('tools.confirmTitle', { name: toolName(tool.name) })}
+          body={t(`tools.confirmBody.${tool.name}`, {
+            defaultValue: t('tools.confirmBodyDefault'),
+          })}
+          confirmLabel={t('tools.confirmExec')}
+          cancelLabel={t('tools.confirmCancel')}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => {
+            setConfirming(false);
+            void run(false);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
 
-/** Dry-run outcome: status badges + a collapsible mono JSON panel. */
+/** Modal confirmation gate for destructive executions (dry_run=false). Cancel
+ *  is focused by default; Escape / backdrop click both dismiss. */
+function ConfirmDialog({
+  title,
+  body,
+  confirmLabel,
+  cancelLabel,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const titleId = useId();
+  const bodyId = useId();
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') onCancel();
+      }}
+    >
+      <div
+        aria-hidden
+        className="absolute inset-0"
+        style={{ background: 'rgba(0, 0, 0, 0.55)' }}
+        onClick={onCancel}
+      />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={bodyId}
+        className="panel relative w-full max-w-md space-y-3 p-4"
+      >
+        <div id={titleId} className="flex items-center gap-2 text-sm font-medium">
+          <TriangleAlert size={14} aria-hidden style={{ color: 'var(--red)' }} />
+          {title}
+        </div>
+        <p id={bodyId} className="text-dim text-xs leading-relaxed">
+          {body}
+        </p>
+        <div className="flex justify-end gap-2">
+          <button type="button" autoFocus onClick={onCancel} className="btn btn-ghost text-xs">
+            {cancelLabel}
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="btn text-xs"
+            style={{
+              borderColor: 'var(--red)',
+              color: 'var(--red)',
+              background: 'color-mix(in srgb, var(--red) 12%, transparent)',
+            }}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Invoke outcome: status badges, an applied-result summary that follows the
+ *  per-tool contract shapes, and a collapsible mono JSON panel. */
 function InvokeResult({ result }: { result: ToolInvokeResponse }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(true);
@@ -516,12 +637,21 @@ function InvokeResult({ result }: { result: ToolInvokeResponse }) {
       <div className="flex flex-wrap items-center gap-2">
         <InvokeStatusBadge status={result.status} />
         {result.applied ? (
-          <span className="badge badge-yellow">{t('tools.applied')}</span>
+          <span className="badge badge-green">{t('tools.applied')}</span>
         ) : (
-          <span className="badge badge-dim">{t('dreaming.reportOnly')}</span>
+          <span className="badge badge-dim">{t('tools.reportOnly')}</span>
         )}
         {result.notes ? <span className="text-dim text-[11px]">{result.notes}</span> : null}
       </div>
+      {/* 'ok' without applied means "nothing met the execution criteria" for the
+          LLM/destructive tools (e.g. compress found no cluster of 2+); read-only
+          safe tools legitimately return ok+unapplied, so no hint for them. */}
+      {result.status === 'ok' &&
+      !result.applied &&
+      (TOOL_META[result.tool]?.kind ?? 'safe') !== 'safe' ? (
+        <p className="text-dim text-[11px]">{t('tools.okNoop')}</p>
+      ) : null}
+      {result.applied ? <AppliedSummary tool={result.tool} result={result.result} /> : null}
       <button
         type="button"
         aria-expanded={open}
@@ -554,7 +684,7 @@ function InvokeResult({ result }: { result: ToolInvokeResponse }) {
 function InvokeStatusBadge({ status }: { status: string }) {
   const { t } = useTranslation();
   const cls =
-    status === 'ok'
+    status === 'ok' || status === 'applied'
       ? 'badge badge-green'
       : status === 'error'
         ? 'badge badge-red'
@@ -567,6 +697,155 @@ function InvokeStatusBadge({ status }: { status: string }) {
       {t(`tools.status.${status}`, { defaultValue: status })}
     </span>
   );
+}
+
+// ── Applied result summaries (per-tool contract shapes) ─────────────────────
+// Shapes mirror the POST /admin/tools/{tool}/invoke applied=true contract.
+// Everything is optional so an older/partial payload degrades to the JSON panel.
+
+interface QuarantineApplied {
+  snapshot_path?: string;
+  quarantine_path?: string;
+  quarantined_count?: number;
+  quarantined_ids?: string[];
+  survivors_count?: number;
+  reindex_required?: boolean;
+  reversible?: boolean;
+}
+
+interface CompressApplied {
+  card_id?: string;
+  source_ids?: string[];
+  cluster_tag?: string;
+  cluster_size?: number;
+  llm_model?: string;
+  reindex_required?: boolean;
+}
+
+interface TuneApplied {
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
+  applied_keys?: string[];
+  rejected?: unknown[];
+  rationale?: string;
+  llm_model?: string;
+}
+
+function fmtValue(v: unknown): string {
+  if (v === undefined) return '—';
+  if (typeof v === 'string') return v;
+  return JSON.stringify(v) ?? '—';
+}
+
+function KV({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2">
+      <span className="text-dim shrink-0">{label}</span>
+      <span className={mono ? 'mono break-all' : ''}>{value}</span>
+    </div>
+  );
+}
+
+function AppliedSummary({ tool, result }: { tool: string; result: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  if (tool === 'snapshot_and_quarantine') {
+    const r = result as QuarantineApplied;
+    return (
+      <div className="space-y-1 text-[11px]">
+        <div className="flex flex-wrap items-center gap-2">
+          {r.reversible ? (
+            <span className="badge badge-green">{t('tools.appliedQuarantine.reversible')}</span>
+          ) : null}
+          {r.reindex_required ? (
+            <span className="badge badge-yellow">{t('tools.reindexRequired')}</span>
+          ) : null}
+        </div>
+        <KV
+          label={t('tools.appliedQuarantine.counts')}
+          value={t('tools.appliedQuarantine.countsValue', {
+            quarantined: r.quarantined_count ?? 0,
+            survivors: r.survivors_count ?? 0,
+          })}
+        />
+        {r.snapshot_path ? (
+          <KV label={t('tools.appliedQuarantine.snapshotPath')} value={r.snapshot_path} mono />
+        ) : null}
+        {r.quarantine_path ? (
+          <KV label={t('tools.appliedQuarantine.quarantinePath')} value={r.quarantine_path} mono />
+        ) : null}
+      </div>
+    );
+  }
+  if (tool === 'compress_knowledge_cluster') {
+    const r = result as CompressApplied;
+    return (
+      <div className="space-y-1 text-[11px]">
+        {r.reindex_required ? (
+          <div>
+            <span className="badge badge-yellow">{t('tools.reindexRequired')}</span>
+          </div>
+        ) : null}
+        {r.card_id ? <KV label={t('tools.appliedCompress.cardId')} value={r.card_id} mono /> : null}
+        {r.cluster_tag ? (
+          <KV
+            label={t('tools.appliedCompress.cluster')}
+            value={`${r.cluster_tag}${r.cluster_size != null ? ` · ${r.cluster_size}` : ''}`}
+            mono
+          />
+        ) : null}
+        {r.source_ids && r.source_ids.length > 0 ? (
+          <KV
+            label={t('tools.appliedCompress.sourceIds', { count: r.source_ids.length })}
+            value={r.source_ids.join(', ')}
+            mono
+          />
+        ) : null}
+        {r.llm_model ? <KV label={t('tools.appliedCompress.model')} value={r.llm_model} mono /> : null}
+      </div>
+    );
+  }
+  if (tool === 'tune_model_parameters') {
+    const r = result as TuneApplied;
+    const before = r.before ?? {};
+    const after = r.after ?? {};
+    const keys = r.applied_keys ?? [];
+    const rejected = r.rejected ?? [];
+    return (
+      <div className="space-y-1.5 text-[11px]">
+        <div>
+          <span className="text-dim">{t('tools.appliedTune.diff')}</span>
+          {keys.length === 0 ? (
+            <span className="text-dim ml-2">{t('tools.appliedTune.noChanges')}</span>
+          ) : (
+            <div className="mt-0.5 space-y-0.5">
+              {keys.map((k) => (
+                <div key={k} className="mono break-all">
+                  {k}: {fmtValue(before[k])} → {fmtValue(after[k])}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        {rejected.length > 0 ? (
+          <div>
+            <span className="badge badge-red">
+              {t('tools.appliedTune.rejected', { count: rejected.length })}
+            </span>
+            <div className="mt-0.5 space-y-0.5">
+              {rejected.map((item, i) => (
+                <div key={i} className="mono break-all" style={{ color: 'var(--red)' }}>
+                  {fmtValue(item)}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {r.rationale ? <KV label={t('tools.appliedTune.rationale')} value={r.rationale} /> : null}
+        {r.llm_model ? <KV label={t('tools.appliedTune.model')} value={r.llm_model} mono /> : null}
+      </div>
+    );
+  }
+  return null;
 }
 
 /** Scalar config draft dirty check (mirrors ConfigSettings' non-sensitive path —

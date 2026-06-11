@@ -8,7 +8,8 @@ Redis 通过 TM_REDIS_ENABLED=0 + monkeypatch 关掉）。覆盖：
   * resolve_matrix 结构（resolved_map 容器覆盖全局 + raw_map 继承时为 None）；
   * invoke 被禁用工具 → status='disabled' 不动数据；
   * manage_token_quotas 读 P3 token 数据（mock token_meter）；
-  * 破坏性 / LLM 工具 dry_run 不改数据 / deferred；
+  * 破坏性 / LLM 工具 dry_run=True 只产 plan 不改数据（dry_run=False 真执行
+    的细测见 test_governance_tools_real_exec.py / gap_fixes）；
   * update_container_routing 加性 merge 不覆盖其它容器。
 
 conftest.py 在 collection 期 import fastapi（slim 环境无），故本套件设计为
@@ -246,17 +247,25 @@ def test_invoke_destructive_dry_run_does_not_apply(monkeypatch):
     assert res["result"]["plan"]["would_execute"] is False
 
 
-def test_invoke_llm_tool_not_dry_run_is_deferred(monkeypatch):
-    # dry_run=False on an LLM tool → still report-only (deferred), never executes.
+def test_invoke_llm_tool_not_dry_run_without_cluster_is_noop(monkeypatch):
+    # 契约升级：dry_run=False 走真执行 handler；但容器无数据 → 无 ≥2 簇 →
+    # 不调 LLM、不写文件（status='ok', applied=False）。真压缩细测见
+    # test_governance_tools_real_exec.py（mock _llm_oneshot）。
     monkeypatch.setattr(config_store, "get_cached", _fake_cfg({
         "config:tools:global_enabled_map": {"compress_knowledge_cluster": True},
     }))
     monkeypatch.setattr(governance_tools.redis_client, "cfg_get", _async_none)
+
+    async def _boom(prompt, system_prompt=None):  # 不该被调用——簇 <2 必须短路
+        raise AssertionError("LLM must not be called without a cluster")
+
+    monkeypatch.setattr(governance_tools, "_llm_oneshot", _boom)
     res = _run(governance_tools.invoke_tool(
         "compress_knowledge_cluster", container="alpha", dry_run=False
     ))
-    assert res["status"] == "deferred"
+    assert res["status"] == "ok"
     assert res["applied"] is False
+    assert "no cluster" in res["notes"]
 
 
 # ── invoke: update_container_routing additive merge ──────────────────────────
