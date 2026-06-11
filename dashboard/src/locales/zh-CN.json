@@ -208,7 +208,7 @@
       "token": "按天 / 按小时 Token 额度与降级模型。",
       "model": "网关 base URL 与 API key。base URL 写入由服务端校验。",
       "dreaming": "后台整理。调度器默认关闭 —— 全新部署不会新增任何自动任务，只有你手动开启才会跑。",
-      "tools": "维护工具开关与沙箱上限。破坏性工具默认仅预览不执行。",
+      "tools": "维护工具开关与沙箱上限。工具支持试运行预览与真执行；破坏性工具执行前需确认。",
       "index_card": "高密度索引卡聚类参数（占位，待工具读取后才生效）。",
       "container": "容器存活期、议题半衰期与路由规则。"
     },
@@ -282,7 +282,7 @@
   },
   "tools": {
     "title": "治理工具",
-    "intro": "按容器激活维护工具。安全工具（额度 / 时延只读、路由更新）会真执行；LLM 与破坏性工具默认仅预览。",
+    "intro": "按容器激活维护工具。安全工具（额度 / 时延只读、路由更新）会真执行；LLM 与破坏性工具支持试运行预览，也可真执行（LLM 经网关调用，破坏性执行前需确认）。",
     "matrixTitle": "容器 × 工具矩阵",
     "matrixHint": "每格为解析后的开关（容器覆盖叠加在全局表之上）。切换某格会暂存一个容器级覆盖，经配置写入路径保存。",
     "colContainer": "容器",
@@ -297,8 +297,40 @@
     "tryRun": "试运行（dry run）",
     "trying": "试运行中…",
     "tryError": "试运行失败",
+    "execRun": "执行",
+    "executing": "执行中…",
+    "execError": "执行失败",
     "applied": "已生效",
     "reportOnly": "仅预览",
+    "okNoop": "本次无需操作 —— 没有满足条件的目标（例如不足 2 条记忆的聚类）。",
+    "reindexRequired": "需重建索引",
+    "confirmTitle": "确认执行「{{name}}」？",
+    "confirmBodyDefault": "将以 dry_run=false 真实执行该工具。",
+    "confirmBody": {
+      "snapshot_and_quarantine": "将先创建容器快照，再把低价值记忆移入隔离区（不删除原始数据）。操作可逆 —— 随时可从快照 / 隔离区恢复。"
+    },
+    "confirmExec": "确认执行",
+    "confirmCancel": "取消",
+    "appliedQuarantine": {
+      "reversible": "可逆 · 可从快照恢复",
+      "counts": "隔离 / 留存",
+      "countsValue": "已隔离 {{quarantined}} 条 · 留存 {{survivors}} 条",
+      "snapshotPath": "快照路径",
+      "quarantinePath": "隔离路径"
+    },
+    "appliedCompress": {
+      "cardId": "新索引卡",
+      "cluster": "聚类标签 · 簇大小",
+      "sourceIds": "来源记忆（{{count}} 条）",
+      "model": "LLM 模型"
+    },
+    "appliedTune": {
+      "diff": "参数变更（before → after）",
+      "noChanges": "无参数变更",
+      "rejected": "被护栏拒绝 {{count}} 项",
+      "rationale": "调参理由",
+      "model": "LLM 模型"
+    },
     "searchContainers": "搜索容器…",
     "noMatch": "无匹配容器",
     "legendOverride": "实心 = 容器覆盖",
@@ -306,8 +338,8 @@
     "legendStaged": "高亮描边 = 待保存",
     "on": "开",
     "off": "关",
-    "badgeDanger": "破坏性 · 默认仅预览",
-    "badgeLlm": "需 LLM · 默认仅预览",
+    "badgeDanger": "破坏性 · 执行需确认",
+    "badgeLlm": "需 LLM · 可执行（经网关）",
     "badgeSafe": "安全工具",
     "resultJson": "结果 JSON",
     "name": {
@@ -320,6 +352,7 @@
     },
     "status": {
       "ok": "成功",
+      "applied": "已执行",
       "error": "失败",
       "disabled": "已禁用",
       "dry_run": "试运行",

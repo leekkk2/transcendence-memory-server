@@ -930,8 +930,9 @@ class ToolsListResponse(BaseModel):
 class ToolInvokeRequest(BaseModel):
     """Body for ``POST /admin/tools/{tool}/invoke``.
 
-    `dry_run` defaults True. Destructive / LLM tools never mutate unless dry_run
-    is False AND their guarding config switch is on (P6 ships those off).
+    `dry_run` defaults True（plan 预览，不动数据）。Destructive / LLM tools
+    execute for real only on explicit dry_run=false（可逆快照隔离 / 附加式
+    索引卡 / 护栏调参），且仍受 enable map 开关约束。
     """
 
     container: str | None = Field(default=None, description='Target container, or null for global-scope tools.')
@@ -943,7 +944,7 @@ class ToolInvokeResponse(BaseModel):
     """Body for ``POST /admin/tools/{tool}/invoke``."""
 
     tool: str
-    status: Literal['ok', 'disabled', 'dry_run', 'error', 'deferred'] = 'dry_run'
+    status: Literal['ok', 'disabled', 'dry_run', 'error', 'deferred', 'applied'] = 'dry_run'
     container: str | None = None
     result: dict = Field(default_factory=dict)
     applied: bool = False

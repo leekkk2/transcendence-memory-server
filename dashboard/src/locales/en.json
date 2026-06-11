@@ -208,7 +208,7 @@
       "token": "Per-day / per-hour token budgets and fallback model.",
       "model": "Gateway base URLs and API keys. Base URL writes are validated server-side.",
       "dreaming": "Background consolidation. The scheduler stays off until you enable it — fresh deploys add no autonomous work.",
-      "tools": "Maintenance tool switches and sandbox limits. Destructive tools stay preview-only by default.",
+      "tools": "Maintenance tool switches and sandbox limits. Tools support dry-run previews and real execution; destructive tools require confirmation before executing.",
       "index_card": "High-density index-card clustering knobs (placeholders until the tool consults them).",
       "container": "Container TTL, issue half-life and routing rules."
     },
@@ -282,7 +282,7 @@
   },
   "tools": {
     "title": "Governance tools",
-    "intro": "Per-container activation for maintenance tools. Safe tools (quota / latency reads, routing updates) run for real; LLM and destructive tools stay preview-only.",
+    "intro": "Per-container activation for maintenance tools. Safe tools (quota / latency reads, routing updates) run for real; LLM and destructive tools support dry-run previews and can also execute for real (LLM calls route via the gateway, destructive runs require confirmation).",
     "matrixTitle": "container × tool matrix",
     "matrixHint": "Each cell is the resolved switch (container override layered over the global map). Toggling a cell stages a container override saved via the config write path.",
     "colContainer": "Container",
@@ -297,8 +297,40 @@
     "tryRun": "try (dry run)",
     "trying": "trying…",
     "tryError": "try failed",
+    "execRun": "execute",
+    "executing": "executing…",
+    "execError": "execute failed",
     "applied": "applied",
     "reportOnly": "preview",
+    "okNoop": "Nothing to do — no eligible targets (e.g. no cluster of 2+ memories).",
+    "reindexRequired": "reindex required",
+    "confirmTitle": "Execute \"{{name}}\"?",
+    "confirmBodyDefault": "This will run the tool for real (dry_run=false).",
+    "confirmBody": {
+      "snapshot_and_quarantine": "Takes a container snapshot first, then moves low-value memories into quarantine (originals are not deleted). Reversible — restore from the snapshot / quarantine at any time."
+    },
+    "confirmExec": "confirm & execute",
+    "confirmCancel": "cancel",
+    "appliedQuarantine": {
+      "reversible": "reversible · restorable from snapshot",
+      "counts": "quarantined / kept",
+      "countsValue": "{{quarantined}} quarantined · {{survivors}} kept",
+      "snapshotPath": "snapshot path",
+      "quarantinePath": "quarantine path"
+    },
+    "appliedCompress": {
+      "cardId": "new index card",
+      "cluster": "cluster tag · size",
+      "sourceIds": "source memories ({{count}})",
+      "model": "LLM model"
+    },
+    "appliedTune": {
+      "diff": "parameter changes (before → after)",
+      "noChanges": "no parameter changes",
+      "rejected": "{{count}} rejected by guardrails",
+      "rationale": "rationale",
+      "model": "LLM model"
+    },
     "searchContainers": "Search containers…",
     "noMatch": "no matching containers",
     "legendOverride": "solid = container override",
@@ -306,8 +338,8 @@
     "legendStaged": "ring = unsaved",
     "on": "on",
     "off": "off",
-    "badgeDanger": "destructive · preview-only by default",
-    "badgeLlm": "needs LLM · preview-only by default",
+    "badgeDanger": "destructive · confirm to execute",
+    "badgeLlm": "needs LLM · executable (via gateway)",
     "badgeSafe": "safe tool",
     "resultJson": "result JSON",
     "name": {
@@ -320,6 +352,7 @@
     },
     "status": {
       "ok": "ok",
+      "applied": "applied",
       "error": "error",
       "disabled": "disabled",
       "dry_run": "dry run",

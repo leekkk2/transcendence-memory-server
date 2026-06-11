@@ -4006,10 +4006,11 @@ async def admin_dreaming_trigger(req: DreamTriggerRequest) -> DreamReport:
 # ---------------------------------------------------------------------------
 # Governance toolbox admin endpoints (blueprint P6 §A8). Read-only matrix +
 # a guarded invoke. No config WRITE bypass — toggling a container's tool switch
-# goes through PUT /admin/config (config:tools:container:{c}:enabled_map). Only
-# SAFE tools (token quota read / latency read / additive routing write) execute;
-# LLM/destructive tools stay report-only (dry_run/deferred), so these endpoints
-# add no autonomous or destructive behavior on a fresh deploy.
+# goes through PUT /admin/config (config:tools:container:{c}:enabled_map).
+# SAFE tools (token quota read / latency read / additive routing write) always
+# execute; LLM/destructive tools preview (plan) under the default dry_run=true
+# and execute for real only on explicit dry_run=false（可逆快照隔离 / 附加式
+# 索引卡 / 护栏调参）— a fresh deploy with default bodies stays mutation-free.
 # ---------------------------------------------------------------------------
 
 
@@ -4042,13 +4043,32 @@ async def admin_tools_list() -> ToolsListResponse:
     dependencies=[Depends(verify_auth)],
 )
 async def admin_tools_invoke(tool: str, req: ToolInvokeRequest) -> ToolInvokeResponse:
-    """调用一个治理工具（蓝图 P6 §A8）。dry_run 默认 true。仅安全工具真执行
-    （manage_token_quotas / analyze_retrieval_latency 只读；update_container_routing 经
-    config_store 加性写 routing_rules）；LLM/破坏性工具返回 dry_run/deferred 不改数据；
-    工具被禁用返回 disabled。全程降级安全，不 raise。"""
+    """调用一个治理工具（蓝图 P6 §A8）。dry_run 默认 true = plan 预览不改数据。
+    安全工具恒真执行（manage_token_quotas / analyze_retrieval_latency 只读；
+    update_container_routing 经 config_store 加性写 routing_rules）；LLM/破坏性
+    工具显式 dry_run=false 才真执行（可逆快照隔离 / 附加式索引卡 / 护栏调参，
+    LLM 经 rag_engine 网关）；工具被禁用返回 disabled。全程降级安全，不 raise。"""
     result = await governance_tools.invoke_tool(
         tool, container=req.container, params=req.params, dry_run=req.dry_run,
     )
+    # 真执行改动了记忆主文件时触发 re-embed：governance_tools 不可反向 import
+    # 本模块（会循环），故由端点层复用 /embed 同款入队路径 best-effort 接线；
+    # 失败只记 warning + notes，不影响工具结果本身。
+    if (result.get('applied')
+            and (result.get('result') or {}).get('reindex_required')
+            and req.container):
+        try:
+            canonical, _ = resolve_container_or_raise(req.container)
+            resp = _enqueue_or_run(
+                op='embed', container=canonical, payload={},
+                timeout_s=60, wait=False, label='governance-reindex',
+            )
+            result['result']['reindex_job'] = {'job_id': resp.pid, 'status': resp.status}
+        except Exception as exc:  # noqa: BLE001 - re-embed 是 best-effort 附属动作
+            logger.warning('[admin_tools_invoke] reindex enqueue degraded: %s', exc)
+            result['notes'] = (
+                f"{result.get('notes') or ''} | reindex enqueue failed: {exc}"
+            ).strip(' |')
     return ToolInvokeResponse(**result)
 
 
