@@ -165,6 +165,21 @@ def _embed_backoff(attempt: int, retry_after: float | None) -> float:
     return delay
 
 
+def _order_embedding_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """对网关返回的 data[] 排序，容忍 index 为 null / 缺失。
+
+    OpenAI 兼容聚合网关实测会返回 ``index: null``（甚至同一响应里 null 与
+    int 混杂）——直接 ``sorted(key=x["index"])`` 会 TypeError，导致批量
+    预计算 embedding 整体失败、hybrid 检索退化为 0 vector chunks。
+    只有全部 index 都是合法 int 时才按 index 重排；否则按响应顺序回退
+    （OpenAI 协议中响应顺序即输入顺序，index 仅是冗余标注）。
+    """
+    indices = [item.get("index") for item in data]
+    if all(isinstance(i, int) and not isinstance(i, bool) for i in indices):
+        return sorted(data, key=lambda x: x["index"])
+    return list(data)
+
+
 async def _http_embed_single(
     profile: EmbeddingProfile,
     texts: list[str],
@@ -210,8 +225,8 @@ async def _http_embed_single(
                     )
                 resp.raise_for_status()
                 data = resp.json()["data"]
-                sorted_data = sorted(data, key=lambda x: x["index"])
-                return np.array([d["embedding"] for d in sorted_data], dtype="float32")
+                ordered = _order_embedding_data(data)
+                return np.array([d["embedding"] for d in ordered], dtype="float32")
             except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError):
                     code = exc.response.status_code

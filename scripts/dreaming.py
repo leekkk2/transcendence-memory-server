@@ -41,7 +41,10 @@ container name.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -65,6 +68,15 @@ logger = logging.getLogger("transcendence-memory-server.dreaming")
 # Redis namespace for consolidated high-frequency query caches. Distinct from
 # the usage:tokens:* / circuit:* / cfg:* namespaces — additive governance keys.
 _DREAM_CACHE_PREFIX = "dream:cache:hot"
+
+# Daily query-frequency datasource (DR2). /search increments the count hash;
+# the dream cycle reads it back and promotes hot queries. 48h TTL so yesterday's
+# bucket is still readable by a nightly (post-midnight) cycle before evicting.
+_QUERYFREQ_PREFIX = "usage:queryfreq:daily"
+_QUERYFREQ_TEXT_PREFIX = "usage:queryfreq:text"  # hash → truncated query text
+_QUERYFREQ_TTL_S = 48 * 3600
+_HOT_CACHE_TTL_S = 24 * 3600
+_QUERY_TEXT_MAXLEN = 120
 
 # Container-level dreaming config key templates (§A7). Filled at runtime by
 # container name — NOT registered statically in KNOWN_CONFIG (containers are
@@ -131,24 +143,125 @@ async def resolve_container_dream_config(container: str) -> dict[str, Any]:
     }
 
 
+# ── Query-frequency datasource (DR2) ────────────────────────────────────────
+
+
+def normalize_query(query: str) -> str:
+    """strip + lower + collapse whitespace, so trivially-variant queries bucket
+    together (the count is per query *pattern*, not per byte sequence)."""
+    return re.sub(r"\s+", " ", (query or "").strip().lower())
+
+
+def query_hash(normalized: str) -> str:
+    # 16 hex chars keep hash-field cardinality readable while collision odds
+    # stay negligible at daily-query scale.
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+async def record_query_frequency(query: str) -> None:
+    """Count one /search occurrence in today's frequency hash (fire-and-forget).
+
+    Raw client ops (HINCRBY/HSET/EXPIRE) instead of cfg_* helpers because the
+    datasource is hash-shaped; the graceful contract is identical — Redis
+    down/disabled → silently skip, NEVER perturb the retrieval path."""
+    norm = normalize_query(query)
+    if not norm:
+        return
+    client = await redis_client.get_client()
+    if client is None:
+        return
+    day = _utc_day()
+    field = query_hash(norm)
+    count_key = f"{_QUERYFREQ_PREFIX}:{day}"
+    text_key = f"{_QUERYFREQ_TEXT_PREFIX}:{day}"
+    try:
+        await client.hincrby(count_key, field, 1)
+        # hash → truncated original text, so the dream report stays readable.
+        await client.hset(text_key, field, norm[:_QUERY_TEXT_MAXLEN])
+        await client.expire(count_key, _QUERYFREQ_TTL_S)
+        await client.expire(text_key, _QUERYFREQ_TTL_S)
+    except Exception:  # noqa: BLE001 - counting must never raise into /search
+        pass
+
+
 # ── Dream cycle actions ─────────────────────────────────────────────────────
 
 
-async def _consolidate_hot_queries(container: str) -> dict[str, Any]:
-    """SAFE additive action: snapshot high-frequency query stats into a static
-    Redis cache. P6 has no query-frequency log yet, so this records a 'no_data'
-    summary (additive only — it never writes when there's nothing to consolidate,
-    so it cannot perturb anything). When future query counters exist they would
-    be promoted under _DREAM_CACHE_PREFIX via cfg_set. Never raises."""
-    # No query-frequency datasource wired in P6 → report no_data (additive,
-    # writes nothing). Leaving the cfg_set promotion for the follow-up phase keeps
-    # this strictly behavior-preserving.
-    return {
+async def _hot_query_candidates(day: str) -> tuple[int, list[dict[str, Any]]]:
+    """Return (scanned, candidates) from the day's frequency hash.
+
+    A candidate is a query whose count reached config:dreaming:cache_threshold
+    (live config read — Dashboard-tunable). Degrades to (0, []) on Redis down."""
+    counts = await redis_client.hgetall(f"{_QUERYFREQ_PREFIX}:{day}")
+    if not counts:
+        return 0, []
+    threshold = int(config_store.get_cached("config:dreaming:cache_threshold", 10))
+    texts = await redis_client.hgetall(f"{_QUERYFREQ_TEXT_PREFIX}:{day}")
+    candidates: list[dict[str, Any]] = []
+    for field, raw in counts.items():
+        try:
+            count = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if count >= threshold:
+            candidates.append(
+                {"hash": field, "query": texts.get(field, ""), "count": count}
+            )
+    candidates.sort(key=lambda c: (-c["count"], c["hash"]))
+    return len(counts), candidates
+
+
+async def _promote_hot_queries(candidates: list[dict[str, Any]], day: str) -> int:
+    """Write candidates to dream:cache:hot:<hash> (24h TTL). Returns writes done.
+
+    Non-destructive additive cache write — within the report-only boundary (no
+    user data is touched, the keys self-evict)."""
+    written = 0
+    for cand in candidates:
+        payload = json.dumps(
+            {"query": cand["query"], "count": cand["count"], "date": day},
+            ensure_ascii=False,
+        )
+        key = f"{_DREAM_CACHE_PREFIX}:{cand['hash']}"
+        if await redis_client.cfg_set(key, payload, ttl=_HOT_CACHE_TTL_S):
+            written += 1
+    return written
+
+
+async def _consolidate_hot_queries(container: str, dry_run: bool = True) -> dict[str, Any]:
+    """SAFE additive action: promote today's high-frequency queries (count ≥
+    cache_threshold) into the static dream:cache:hot:* Redis cache. dry_run
+    reports the candidates only; a real run also writes the cache keys. Never
+    raises — Redis down degrades to a 'no_data' record."""
+    day = _utc_day()
+    scanned, candidates = await _hot_query_candidates(day)
+    base: dict[str, Any] = {
         "tool": "consolidate_hot_queries",
         "container": container,
-        "summary": "no_data",
-        "candidates": 0,
+        "scanned": scanned,
+        "candidates": len(candidates),
         "applied": False,
+    }
+    if scanned == 0:
+        return {**base, "summary": "no_data"}
+    if not candidates:
+        return {**base, "summary": "no_candidates"}
+    # Truncated-text digest + count per candidate, so the report is auditable.
+    base["candidate_queries"] = [
+        {"query": c["query"], "count": c["count"]} for c in candidates
+    ]
+    if dry_run:
+        return {**base, "summary": "candidates_found"}
+    written = await _promote_hot_queries(candidates, day)
+    return {
+        **base,
+        "summary": "promoted_to_hot_cache",
+        "written": written,
+        "applied": written > 0,
     }
 
 
@@ -210,7 +323,7 @@ async def _run_for_container(
     """Run all per-container dream actions, returning their action records."""
     apply_allowed = (not dry_run) and prune_apply_cfg
     actions: list[dict[str, Any]] = []
-    actions.append(await _consolidate_hot_queries(container))
+    actions.append(await _consolidate_hot_queries(container, dry_run))
     actions.append(_index_card_placeholder(container))
     actions.extend(_prune_candidates(container, apply_allowed))
     return actions

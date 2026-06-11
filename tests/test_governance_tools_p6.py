@@ -210,18 +210,24 @@ def test_invoke_manage_token_quotas_reads_p3(monkeypatch):
     assert result["mode_suggestion"] == "fallback"
 
 
-# ── invoke: latency tool honest deferred ─────────────────────────────────────
+# ── invoke: latency tool reads usage analytics (ok even with no data) ────────
+# Contract upgraded from the P6 honest-deferred stub: real aggregation cases
+# live in test_governance_tools_gap_fixes.py; here we keep the fastapi-free
+# no-data path (fresh WORKSPACE has no usage DB → ok + empty metrics).
 
 
-def test_invoke_analyze_latency_deferred(monkeypatch):
+def test_invoke_analyze_latency_ok_without_usage_data(monkeypatch):
     monkeypatch.setattr(config_store, "get_cached", _fake_cfg({
         "config:tools:global_enabled_map": {"analyze_retrieval_latency": True},
     }))
     monkeypatch.setattr(governance_tools.redis_client, "cfg_get", _async_none)
     res = _run(governance_tools.invoke_tool("analyze_retrieval_latency", container="alpha"))
-    assert res["status"] == "deferred"
+    assert res["status"] == "ok"
     assert res["applied"] is False
-    assert res["result"]["latency_metrics"] is None  # honest, not fabricated
+    # No usage rows recorded → every retrieval endpoint reports zero calls
+    # (empty data, not fabricated numbers).
+    endpoints = res["result"]["latency_metrics"]["endpoints"]
+    assert all(v["calls"] == 0 for v in endpoints.values())
 
 
 # ── invoke: destructive / LLM tools are report-only (dry_run / deferred) ──────

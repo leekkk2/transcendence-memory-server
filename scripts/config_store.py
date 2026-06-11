@@ -431,6 +431,32 @@ _CACHE_LOCK = threading.Lock()
 _SUBSCRIBER_TASK: Any = None  # asyncio.Task | None, set by start_config_subscriber
 # Latched warning so a missing encryption secret logs once, not per write.
 _SECRET_WARNED = False
+# Post-update hooks: async callables `hook(changed_keys: list[str])` fired
+# AFTER a change lands in the local cache. Fired from BOTH paths so a toggle
+# takes effect even with Redis down: set() (local writer) and refresh() (Pub/Sub
+# subscriber). Both run on the main event loop (set() from an async handler,
+# refresh() inside the subscriber asyncio task) so hooks are awaited directly —
+# no cross-thread dispatch needed. The writer node also hears its own broadcast,
+# so a hook can fire twice for one change: hooks MUST be idempotent.
+_UPDATE_HOOKS: list[Any] = []
+
+
+def register_update_hook(hook: Any) -> None:
+    """Register an async config-change hook. Idempotent (re-register is a no-op)."""
+    if hook not in _UPDATE_HOOKS:
+        _UPDATE_HOOKS.append(hook)
+
+
+async def _fire_update_hooks(keys: list[str]) -> None:
+    """Invoke every registered hook; a hook failure never breaks the config write."""
+    for hook in list(_UPDATE_HOOKS):
+        try:
+            await hook(list(keys))
+        except Exception as exc:  # noqa: BLE001 - hooks must not break config plane
+            logger.warning(
+                "[config] update hook %s failed (swallowed): %s",
+                getattr(hook, "__name__", hook), exc,
+            )
 
 
 # ── SQLite façade ───────────────────────────────────────────────────────────
@@ -750,6 +776,10 @@ async def set(key: str, value: Any) -> bool:
             _cache_evict(key)
         else:
             _cache_put(key, stored)
+    # Hooks fire after the cache is consistent so a hook reading get_cached sees
+    # the new value. Also fired here (not only in refresh) so a local PUT takes
+    # effect even when Redis (and thus the subscriber loop) is down.
+    await _fire_update_hooks([key])
     return True
 
 
@@ -789,6 +819,9 @@ async def refresh(keys: list[str]) -> None:
         redis_val = await redis_client.cfg_get(key, None)
         if redis_val is not None:
             _cache_put(key, redis_val)
+    # Subscriber path: let registered hooks react to the (now-cached) change —
+    # this is what makes a peer's PUT hot-apply here (e.g. scheduler toggle).
+    await _fire_update_hooks(list(keys))
 
 
 # ── Pub/Sub subscriber (background task) ────────────────────────────────────
@@ -998,4 +1031,5 @@ def reset_for_tests() -> None:
     _STORE = None
     _SUBSCRIBER_TASK = None
     _SECRET_WARNED = False
+    _UPDATE_HOOKS.clear()
     _cache_clear()

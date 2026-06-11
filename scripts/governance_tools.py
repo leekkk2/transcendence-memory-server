@@ -39,6 +39,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Any, Optional
 
 try:
@@ -308,7 +311,7 @@ async def invoke_tool(
         if tool == "manage_token_quotas":
             return await _invoke_manage_token_quotas(params)
         if tool == "analyze_retrieval_latency":
-            return _invoke_analyze_retrieval_latency(container)
+            return _invoke_analyze_retrieval_latency(container, params)
         if tool == "update_container_routing":
             return await _invoke_update_container_routing(container, params, dry_run)
         # LLM / destructive tools — report-only in P6 (see module docstring).
@@ -362,20 +365,83 @@ async def _agent_hourly_used(agent_id: str) -> int:
         return 0
 
 
-def _invoke_analyze_retrieval_latency(container: Optional[str]) -> dict[str, Any]:
-    """SAFE read: retrieval latency report.
+# Retrieval routes whose latency this tool always reports (RAG read path).
+_RETRIEVAL_PATHS: tuple[str, ...] = ("/search", "/query")
+# Mirrors usage_analytics._WINDOW_SECONDS keys without importing it at module
+# scope (usage_analytics pulls fastapi; this module must stay import-light).
+_LATENCY_WINDOWS: tuple[str, ...] = ("1h", "24h", "7d", "30d")
+_LATENCY_DEFAULT_WINDOW = "7d"
+# usage_analytics.endpoints caps limit at 200; route-template cardinality is
+# bounded, so 200 always covers /search and /query when they have traffic.
+_LATENCY_ENDPOINT_LIMIT = 200
+# The usage log aggregation has no per-container latency cut, so granularity
+# stays global regardless of the requested container.
+_LATENCY_GRANULARITY_NOTE = (
+    "granularity=global: usage analytics aggregates per endpoint, not per "
+    "container — container filter not applied"
+)
 
-    P6 has no governance-side latency datasource wired into this tool, so it
-    answers honestly: status='deferred' + a 'no latency metrics wired' summary
-    rather than fabricating numbers. (The per-endpoint p95 lives in
-    usage_analytics for the dashboard; surfacing it through this tool is a
-    follow-up.) No mutation; never raises."""
+
+def _workspace_root() -> Path:
+    # Read env at call time (not import) so tests / redeploys can repoint it.
+    return Path(os.environ.get("WORKSPACE", Path(__file__).resolve().parents[1]))
+
+
+def _usage_db_path() -> Path:
+    # Same convention as the server's _queue_db_path; not imported from there
+    # because task_rag_server imports this module (would be circular).
+    return _workspace_root() / "tasks" / "rag" / "queue.db"
+
+
+def _usage_endpoint_rows(db_path: Path, window: str) -> list[dict[str, Any]]:
+    """Per-endpoint calls/p50/p95 via the SAME aggregation /admin/usage/endpoints
+    serves (usage_analytics.endpoints) — no parallel SQL to drift from it."""
+    try:
+        try:
+            import usage_analytics  # type: ignore
+        except ModuleNotFoundError:  # pragma: no cover - package import path
+            from scripts import usage_analytics  # type: ignore
+    except ImportError:  # pragma: no cover - slim env without fastapi → no datasource
+        return []
+    data = usage_analytics.endpoints(
+        db_path, window=window, sort="calls", limit=_LATENCY_ENDPOINT_LIMIT
+    )
+    return list(data.get("rows") or [])
+
+
+def _invoke_analyze_retrieval_latency(
+    container: Optional[str], params: dict
+) -> dict[str, Any]:
+    """SAFE read: retrieval latency report from the live usage analytics log.
+
+    Reads the per-endpoint aggregation backing GET /admin/usage/endpoints and
+    projects the retrieval routes (/search, /query) to calls/p50_ms/p95_ms.
+    Read-only: when the usage DB does not exist yet it reports ok + empty
+    metrics instead of creating the file. invoke_tool wraps any handler error."""
+    window = str(params.get("window") or _LATENCY_DEFAULT_WINDOW)
+    if window not in _LATENCY_WINDOWS:
+        window = _LATENCY_DEFAULT_WINDOW
+    metrics: dict[str, Any] = {"window": window, "granularity": "global", "endpoints": {}}
+    db_path = _usage_db_path()
+    if not db_path.exists():
+        return _result(
+            "analyze_retrieval_latency", "ok", container,
+            {"latency_metrics": metrics}, False,
+            "no usage data recorded yet — empty metrics; " + _LATENCY_GRANULARITY_NOTE,
+        )
+    by_path = {r.get("path"): r for r in _usage_endpoint_rows(db_path, window)}
+    for path in _RETRIEVAL_PATHS:
+        row = by_path.get(path) or {}
+        metrics["endpoints"][path] = {
+            "calls": int(row.get("calls") or 0),
+            "p50_ms": int(row.get("p50_latency_ms") or 0),
+            "p95_ms": int(row.get("p95_latency_ms") or 0),
+        }
     return _result(
-        "analyze_retrieval_latency", "deferred", container,
-        {"latency_metrics": None},
-        False,
-        "no latency metrics wired into this tool yet (usage_analytics p95 is a "
-        "follow-up); reported honestly rather than fabricated",
+        "analyze_retrieval_latency", "ok", container,
+        {"latency_metrics": metrics}, False,
+        "read-only retrieval latency report from usage analytics; "
+        + _LATENCY_GRANULARITY_NOTE,
     )
 
 
@@ -419,6 +485,103 @@ async def _invoke_update_container_routing(
     )
 
 
+# Quarantine candidate heuristics — simple, but computed from real rows.
+_QUARANTINE_MAX_AGE_DAYS = 180   # no update/access signal for this long → stale
+_QUARANTINE_MIN_TEXT_CHARS = 20  # shorter content carries too little signal
+_QUARANTINE_MAX_CANDIDATES = 50  # bound the plan payload; scanned_count stays total
+_SECONDS_PER_DAY = 86_400
+
+
+def _memory_objects_file(container: str) -> Path:
+    # Same layout as task_rag_runtime.container_dir — duplicated here because
+    # that helper mkdirs (a write) and this scan must stay strictly read-only.
+    return (
+        _workspace_root() / "tasks" / "rag" / "containers" / container
+        / "memory_objects.jsonl"
+    )
+
+
+def _row_last_updated(row: dict) -> Optional[int]:
+    """Newest epoch-seconds stamp on a memory row (same keys list_memories uses)."""
+    stamps = [
+        int(row[k]) for k in ("updatedAt", "createdAt", "storedAt")
+        if isinstance(row.get(k), (int, float))
+    ]
+    return max(stamps) if stamps else None
+
+
+def _candidate_from_row(
+    row: dict, raw_line: str, now: float, max_age_days: int
+) -> Optional[dict[str, Any]]:
+    """Low-value heuristics on one real row → candidate dict, or None (healthy)."""
+    last_updated = _row_last_updated(row)
+    text = row.get("text") if isinstance(row.get("text"), str) else ""
+    reasons: list[str] = []
+    if last_updated is not None and (now - last_updated) > max_age_days * _SECONDS_PER_DAY:
+        reasons.append(f"stale: last update older than {max_age_days}d")
+    if len(text.strip()) < _QUARANTINE_MIN_TEXT_CHARS:
+        reasons.append(f"short content: text under {_QUARANTINE_MIN_TEXT_CHARS} chars")
+    if not reasons:
+        return None
+    return {
+        "document_id": str(row.get("id") or "") or None,
+        "bytes": len(raw_line.encode("utf-8")),
+        "last_updated": last_updated,
+        "reasons": reasons,
+    }
+
+
+def _scan_quarantine_candidates(
+    container: Optional[str], params: dict
+) -> dict[str, Any]:
+    """Read-only scan of a container's memory_objects.jsonl for low-value rows.
+
+    Feeds the snapshot_and_quarantine plan with real data; never writes, never
+    raises (a missing/unreadable store degrades to an empty scan + note)."""
+    if not container:
+        return {"scanned_count": 0, "candidates": [],
+                "scan_notes": "container required for candidate scan"}
+    path = _memory_objects_file(container)
+    if not path.exists():
+        return {"scanned_count": 0, "candidates": [],
+                "scan_notes": "container has no memory_objects.jsonl — nothing to scan"}
+    max_age_days = int(params.get("max_age_days") or _QUARANTINE_MAX_AGE_DAYS)
+    now = time.time()
+    scanned = 0
+    candidates: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                row = _parse_memory_line(line)
+                if row is None:
+                    continue
+                scanned += 1
+                cand = _candidate_from_row(row, line, now, max_age_days)
+                if cand is not None:
+                    candidates.append(cand)
+    except OSError as exc:
+        return {"scanned_count": scanned, "candidates": [],
+                "scan_notes": f"scan degraded (store unreadable: {exc})"}
+    notes = f"scanned {scanned} memory rows (read-only)"
+    if len(candidates) > _QUARANTINE_MAX_CANDIDATES:
+        notes += (f"; candidates truncated to first {_QUARANTINE_MAX_CANDIDATES} "
+                  f"of {len(candidates)}")
+        candidates = candidates[:_QUARANTINE_MAX_CANDIDATES]
+    return {"scanned_count": scanned, "candidates": candidates, "scan_notes": notes}
+
+
+def _parse_memory_line(line: str) -> Optional[dict]:
+    """One JSONL line → dict row; blank / corrupt lines → None (skip, don't fail)."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return row if isinstance(row, dict) else None
+
+
 def _invoke_deferred_or_dry_run(
     spec: _Tool, container: Optional[str], params: dict, dry_run: bool
 ) -> dict[str, Any]:
@@ -427,8 +590,11 @@ def _invoke_deferred_or_dry_run(
     Returns a plan/preview (status='dry_run') when dry_run is True, else
     'deferred' (the real execution is gated behind a config switch P6 ships off,
     so it is intentionally NOT performed here). applied is always False; no data
-    is touched. The plan names the guarding switch and the HR-9 / governance
-    constraints so a future phase can wire the real action safely."""
+    is touched. snapshot_and_quarantine's plan additionally carries a read-only
+    candidate scan of the target container's real store so the plan is
+    actionable, not a parameter echo. The plan names the guarding switch and the
+    HR-9 / governance constraints so a future phase can wire the real action
+    safely."""
     reason = "needs LLM (route via rag_engine gateway, HR-9)" if spec.needs_llm \
         else "destructive (gated behind an explicit apply switch)"
     plan = {
@@ -438,6 +604,8 @@ def _invoke_deferred_or_dry_run(
         "reason_not_executed": reason,
         "params_echo": params,
     }
+    if spec.name == "snapshot_and_quarantine":
+        plan.update(_scan_quarantine_candidates(container, params))
     if dry_run:
         return _result(spec.name, "dry_run", container, {"plan": plan}, False,
                        f"dry_run plan only — {reason}; P6 does not execute")
