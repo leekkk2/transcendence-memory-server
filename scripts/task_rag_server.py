@@ -588,6 +588,24 @@ def _startup_banner() -> None:
 # WORKER 持有对全局队列的引用，启停由 lifespan 控制。
 JOB_QUEUE: JobQueue | None = None
 JOB_WORKER: JobWorker | None = None
+# 主 event loop 引用（lifespan 启动时捕获）：sync handler（threadpool 线程）要把
+# 治理记账协程投回主 loop —— redis.asyncio 连接绑定创建它的 loop，跨 loop 用会炸。
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _fire_and_forget(coro) -> None:
+    """把治理类协程投递到主 loop，不等待结果；任何失败都静默丢弃。
+
+    /search 是 sync handler，记账（如 dreaming 查询频度计数）绝不允许阻塞或
+    破坏检索路径 —— loop 不在 / 已关闭 / 投递失败一律丢弃协程。"""
+    loop = _MAIN_LOOP
+    if loop is None or loop.is_closed():
+        coro.close()
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(coro, loop)
+    except Exception:  # noqa: BLE001 - 记账失败不可影响请求路径
+        coro.close()
 # 测试可设为 True 来禁用 worker 自动启动；其他场景应保持 False。
 DISABLE_WORKER = os.environ.get('TM_DISABLE_WORKER', '0') in ('1', 'true', 'True')
 
@@ -699,9 +717,27 @@ def _verify_embedding_dim_consistency() -> None:
     print(f'[startup-check] embedding dim consistency OK ({checked} container(s) @ dim={expected_dim})', flush=True)
 
 
+async def _dreaming_scheduler_hook(changed_keys: list[str]) -> None:
+    """config_updated hook（DR4）：PUT scheduler_enabled 即时启停调度器。
+
+    config_store 在 set()（本地写）与 refresh()（Pub/Sub 订阅）两条路径上都在主
+    event loop 内派发 hook，故这里直接 await；同一变更可能双触发（写端也收到自己
+    的广播），start/stop_scheduler 均幂等所以安全。"""
+    if "config:dreaming:scheduler_enabled" not in changed_keys:
+        return
+    try:
+        if config_store.get_cached("config:dreaming:scheduler_enabled", False):
+            await dreaming.start_scheduler()
+        else:
+            await dreaming.stop_scheduler()
+    except Exception as exc:  # noqa: BLE001 - 热开关失败不可波及 config 写路径
+        logger.warning('[dreaming] scheduler hot-toggle failed: %s', exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global JOB_WORKER
+    global JOB_WORKER, _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
     _startup_banner()
     _verify_embedding_dim_consistency()
     # Redis governance foundation (blueprint P0). Non-fatal: a down/disabled
@@ -736,7 +772,10 @@ async def lifespan(app: FastAPI):
     # config:dreaming:scheduler_enabled is true (default false) → deploying P6
     # spawns NO background job and runtime stays byte-identical. The manual
     # /admin/dreaming/trigger endpoint is always available regardless.
+    # DR4: register the hot-toggle hook so a later PUT scheduler_enabled
+    # starts/stops the scheduler live (no restart needed).
     try:
+        config_store.register_update_hook(_dreaming_scheduler_hook)
         await dreaming.start_scheduler()
     except Exception as exc:  # noqa: BLE001 - dreaming must never block boot
         logger.warning('[dreaming] scheduler start failed, disabled: %s', exc)
@@ -1680,6 +1719,9 @@ _DEFAULT_QUERY_GATE_TIMEOUT_S = 30  # /query score-gate 的 top1 向量预检超
 
 @app.post('/search', response_model=SearchResponse, dependencies=[Depends(verify_auth)])
 def search(req: SearchReq) -> SearchResponse:
+    # DR2: 查询频度计数（梦境引擎热查询数据源）。fire-and-forget 投主 loop，
+    # Redis 不可用时静默跳过，绝不影响检索。
+    _fire_and_forget(dreaming.record_query_frequency(req.query))
     targets, union_applied = _resolve_search_targets(req)
     rerank_enabled, rerank_func, reranker_name, candidate_topk = _resolve_search_rerank(req, targets)
 

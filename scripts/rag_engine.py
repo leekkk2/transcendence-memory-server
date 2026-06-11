@@ -63,6 +63,37 @@ _lightrag_instances: dict[tuple[str, str, str], Any] = {}
 _lightrag_locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
 
+# 缓存实例创建时的磁盘存储指纹 —— 子进程摄取会直接改写 working_dir 下的
+# graphml/vdb/kv json，主进程缓存的 LightRAG 实例对此盲视（永远 [no-context]）。
+# get_lightrag 命中缓存时先比对指纹，不一致即丢弃重建。
+_lightrag_fingerprints: dict[tuple[str, str, str], tuple] = {}
+
+# LightRAG 默认存储清单（JsonKVStorage / NanoVectorDBStorage / NetworkXStorage /
+# JsonDocStatusStorage）对应的落盘文件模式。
+_STORAGE_GLOBS = ("kv_store_*.json", "vdb_*.json", "*.graphml")
+# LLM response cache 由查询路径自身写入 —— 计入指纹会让每次 query 自我失效、
+# 实例反复重建；它不影响检索数据可见性，排除。
+_FINGERPRINT_EXCLUDE = {"kv_store_llm_response_cache.json"}
+
+
+def _storage_fingerprint(working_dir: Path) -> tuple:
+    """working_dir 下存储文件的轻量指纹：(文件名, mtime_ns, size) 有序元组。
+
+    只走 os.stat 不读内容 —— 校验必须足够便宜，每次缓存命中都会执行一次。
+    """
+    entries = []
+    for pattern in _STORAGE_GLOBS:
+        for path in working_dir.glob(pattern):
+            if path.name in _FINGERPRINT_EXCLUDE:
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue  # 并发删除/替换瞬间 — 当作不存在，靠指纹差异触发重建
+            entries.append((path.name, st.st_mtime_ns, st.st_size))
+    entries.sort()
+    return tuple(entries)
+
 
 _LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
 _LLM_RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "1.5"))
@@ -408,6 +439,28 @@ def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
     return route, emb_sig, embedding_func
 
 
+def _cached_instance_if_fresh(
+    cache_key: tuple[str, str, str], container: str,
+) -> Any:
+    """缓存命中时核对磁盘存储指纹：子进程摄取直接改写 working_dir 后，
+    旧实例的内存态/句柄不会感知新数据，必须丢弃重建（否则 query 永远
+    [no-context]）。指纹不一致 → pop 缓存并返回 None 让调用方重建。
+    同一请求内只在这里校验一次，拿到实例后不再重复 stat。"""
+    instance = _lightrag_instances.get(cache_key)
+    if instance is None:
+        return None
+    fingerprint = _storage_fingerprint(_container_working_dir(container))
+    if fingerprint == _lightrag_fingerprints.get(cache_key):
+        return instance
+    logger.info(
+        "LightRAG storage changed on disk for container=%s; rebuilding instance",
+        container,
+    )
+    _lightrag_instances.pop(cache_key, None)
+    _lightrag_fingerprints.pop(cache_key, None)
+    return None
+
+
 async def get_lightrag(container: str) -> Any:
     """获取（必要时创建并初始化）container 对应的 LightRAG 实例。
 
@@ -421,7 +474,7 @@ async def get_lightrag(container: str) -> Any:
         _resolve_route_emb_rrk(container)
     cache_key = (container, emb_sig, rrk_sig)
 
-    instance = _lightrag_instances.get(cache_key)
+    instance = _cached_instance_if_fresh(cache_key, container)
     if instance is not None:
         return instance
 
@@ -429,6 +482,7 @@ async def get_lightrag(container: str) -> Any:
     async with lock:
         instance = _lightrag_instances.get(cache_key)
         if instance is not None:
+            # 等锁期间由并发协程刚建好的实例，指纹刚登记过 — 不重复校验
             return instance
 
         from lightrag import LightRAG
@@ -465,6 +519,8 @@ async def get_lightrag(container: str) -> Any:
         await initialize_pipeline_status()
 
         _lightrag_instances[cache_key] = instance
+        # 指纹必须在 initialize_storages 之后取 —— 初始化可能落盘新文件
+        _lightrag_fingerprints[cache_key] = _storage_fingerprint(working_dir)
         logger.info(
             "LightRAG instance initialized for container=%s emb=%s rrk=%s at %s",
             container, emb_sig, rrk_sig or "<none>", working_dir,
@@ -476,6 +532,7 @@ def clear_rag_cache() -> None:
     """Test helper — also clears registries so reload picks up new env / yaml."""
     _lightrag_instances.clear()
     _lightrag_locks.clear()
+    _lightrag_fingerprints.clear()
     # 同步清 registry：测试切换 env / profiles.yaml 后必须让 registry 重新加载，
     # 否则 build_*_func 仍返回旧 profile 对应的闭包。embedding 与 reranker
     # 各自缓存 ProfileSet，两边都要清。
