@@ -604,16 +604,72 @@ def _parse_memory_line(line: str) -> Optional[dict]:
     return row if isinstance(row, dict) else None
 
 
+def _scan_compress_preview(container: Optional[str], params: dict) -> dict[str, Any]:
+    """Read-only：预览 compress 会聚类哪个簇 + 簇内来源（不调 LLM，永不抛）。
+
+    让 compress 的 dry_run 像 quarantine 一样是可执行预览而非参数回声——
+    复用真执行同一 _pick_cluster 启发式，所见即所得。"""
+    if not container:
+        return {"cluster_tag": None, "cluster_size": 0, "source_ids": [],
+                "would_compress": False,
+                "scan_notes": "container required for cluster preview"}
+    try:
+        rows = _read_memory_rows(container)
+    except OSError as exc:
+        return {"cluster_tag": None, "cluster_size": 0, "source_ids": [],
+                "would_compress": False,
+                "scan_notes": f"preview degraded (store unreadable: {exc})"}
+    cluster_tag, cluster = _pick_cluster(rows, params.get("cluster_tag"))
+    would = len(cluster) >= 2
+    return {
+        "cluster_tag": cluster_tag or None,
+        "cluster_size": len(cluster),
+        "source_ids": [str(r.get("id") or "") for r in cluster],
+        "would_compress": would,
+        "scan_notes": (f"largest same-tags cluster has {len(cluster)} rows "
+                       "(read-only; would compress to one index card)" if would
+                       else "no cluster ≥2 — nothing to compress"),
+    }
+
+
+def _scan_tune_preview(container: Optional[str], params: dict) -> dict[str, Any]:
+    """Read-only：预览 tune 会喂给网关 LLM 的信号 + 当前参数 + 护栏（不调 LLM，
+    永不抛）。让 tune 的 dry_run 展示「将依据什么调参、护栏边界」而非空回声。"""
+    try:
+        latency = _invoke_analyze_retrieval_latency(container, {})
+        object_count = len(_read_memory_rows(container)) if container else 0
+        before = {k: config_store.get_cached(cfg, None)
+                  for k, cfg in _TUNE_CONFIG_KEYS.items()}
+    except Exception as exc:  # noqa: BLE001 - preview 必须 graceful
+        return {"signals": None, "tunable_keys": list(_TUNE_ALLOWED_KEYS),
+                "scan_notes": f"preview degraded: {exc}"}
+    return {
+        "signals": {
+            "latency_metrics": latency.get("result", {}).get("latency_metrics"),
+            "object_count": object_count,
+            "current_config": before,
+        },
+        "tunable_keys": list(_TUNE_ALLOWED_KEYS),
+        "guardrails": {
+            "similarity_threshold": "float in [0,1]",
+            "default_topk": "int in [1,50]",
+            "citation_enabled": "bool",
+        },
+        "scan_notes": ("would feed these signals to the gateway LLM; only "
+                       "allow-listed keys within range get written"),
+    }
+
+
 def _invoke_deferred_or_dry_run(
     spec: _Tool, container: Optional[str], params: dict, dry_run: bool
 ) -> dict[str, Any]:
     """LLM / destructive 工具的 plan 预览（不动数据）。
 
     dry_run=True（端点默认）→ status='dry_run'，产真实预览 plan（would_execute
-    恒 False = 「本次不执行」），notes 指引传 dry_run=false 真执行。
-    snapshot_and_quarantine 的 plan 额外携带目标容器真实存储的只读候选扫描，
-    让预览可执行而非参数回声。dry_run=False 仅作未接线工具的兜底（当前注册表
-    三个工具都已有真执行 handler，正常不可达）→ status='deferred'。"""
+    恒 False = 「本次不执行」），notes 指引传 dry_run=false 真执行。三个工具的
+    plan 都额外携带目标容器真实存储的只读扫描（quarantine 候选 / compress 目标簇 /
+    tune 信号+护栏），让预览可执行而非参数回声。dry_run=False 仅作未接线工具的
+    兜底（当前注册表三个工具都已有真执行 handler，正常不可达）→ status='deferred'。"""
     kind = "needs LLM (routes via rag_engine gateway, HR-9)" if spec.needs_llm \
         else "destructive (reversible snapshot + quarantine)"
     plan = {
@@ -625,6 +681,10 @@ def _invoke_deferred_or_dry_run(
     }
     if spec.name == "snapshot_and_quarantine":
         plan.update(_scan_quarantine_candidates(container, params))
+    elif spec.name == "compress_knowledge_cluster":
+        plan.update(_scan_compress_preview(container, params))
+    elif spec.name == "tune_model_parameters":
+        plan.update(_scan_tune_preview(container, params))
     if dry_run:
         return _result(spec.name, "dry_run", container, {"plan": plan}, False,
                        f"dry_run preview ({kind}) — pass dry_run=false to execute")
