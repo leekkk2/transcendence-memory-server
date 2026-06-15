@@ -199,9 +199,9 @@ def test_render_fallback_unconfigured_returns_none():
 def test_render_fallback_with_placeholders():
     tpl = "No confident answer for '{query}' (container={container}, threshold={threshold})."
     out = render_fallback_template(
-        tpl, {"query": "how to deploy", "container": "yzjx", "threshold": 0.35}
+        tpl, {"query": "how to deploy", "container": "test-container", "threshold": 0.35}
     )
-    assert out == "No confident answer for 'how to deploy' (container=yzjx, threshold=0.35)."
+    assert out == "No confident answer for 'how to deploy' (container=test-container, threshold=0.35)."
 
 
 def test_render_fallback_missing_placeholder_left_intact():
