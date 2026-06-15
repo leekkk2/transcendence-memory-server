@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -31,7 +32,13 @@ from fastapi.staticfiles import StaticFiles
 
 try:
     from task_rag_server_models import (
+        AgentApprovalInfo,
+        AgentApprovalsResponse,
+        AgentInvokeRequest,
+        AgentInvokeResponse,
         AgentOnboardingResponse,
+        AgentRunInfo,
+        AgentRunsResponse,
         Citation,
         ClientIngestReq,
         ClientIngestResponse,
@@ -86,7 +93,13 @@ try:
     )
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.task_rag_server_models import (
+        AgentApprovalInfo,
+        AgentApprovalsResponse,
+        AgentInvokeRequest,
+        AgentInvokeResponse,
         AgentOnboardingResponse,
+        AgentRunInfo,
+        AgentRunsResponse,
         Citation,
         ClientIngestReq,
         ClientIngestResponse,
@@ -272,6 +285,16 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean env var (1/true/yes/on, case-insensitive). Used for opt-in
+    feature gates so operators can toggle via TM_* env without redeploying. An
+    unset var returns the default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 # Async semaphore for the unbounded-cost RAG query path. Document ingestion
@@ -4070,6 +4093,293 @@ async def admin_tools_invoke(tool: str, req: ToolInvokeRequest) -> ToolInvokeRes
                 f"{result.get('notes') or ''} | reindex enqueue failed: {exc}"
             ).strip(' |')
     return ToolInvokeResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Governance-agent orchestration (`/admin/agent/*`) — Phase 3.
+#
+# Opt-in behind TM_AGENT_ORCHESTRATION_ENABLED (default OFF): a default deploy
+# never enqueues a run-agent job, so ingestion is unaffected. The invoke endpoint
+# mints a run_id, atomically writes the run params to a per-container inbox file,
+# enqueues an op='run-agent' job (the worker resolves it to governance_agent_runner),
+# and records the run head. The approval endpoints are the ONLY place a
+# destructive governance tool is ever executed for real (dry_run=False) — a human
+# behind verify_auth acts as the actuator, keeping destructive execution out of
+# the unattended loop.
+# ---------------------------------------------------------------------------
+
+# Synthetic container token for a global-scope run (no target container). It must
+# satisfy validate_container_name (alnum / underscore / hyphen only).
+_AGENT_GLOBAL_CONTAINER = 'global-agent'
+
+
+def _stage_agent_params(container: str, run_id: str, params: dict) -> Path:
+    """Atomically write a run's params JSON to the container inbox so the runner
+    subprocess reads it by path (argv has length limits; params can be large).
+    tmp-write + rename keeps a partial file from being read. Returns the path."""
+    inbox = _inbox_dir(container)
+    target = inbox / f'agent-{run_id}.json'
+    tmp = inbox / f'agent-{run_id}.json.{uuid.uuid4().hex}.tmp'
+    tmp.write_text(json.dumps(params or {}, ensure_ascii=False), encoding='utf-8')
+    os.replace(tmp, target)
+    return target.resolve()
+
+
+@app.post(
+    '/admin/agent/{agent_name}/invoke',
+    response_model=AgentInvokeResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_agent_invoke(agent_name: str, req: AgentInvokeRequest) -> AgentInvokeResponse:
+    """Enqueue one governance-agent run (Phase 3). dry_run defaults true (plan).
+
+    Gated by TM_AGENT_ORCHESTRATION_ENABLED (default 0): when off, returns
+    status='disabled' without enqueuing. Otherwise mints a run_id, writes the run
+    params to a per-container inbox file, enqueues an op='run-agent' job (coalesce
+    off — each run is a distinct goal/run_id), records the run head, and returns
+    {run_id, job_id, status='enqueued'}. Reversible tools apply only when the run
+    was both dry_run=false AND allow_apply=true; the destructive tool always parks
+    for approval. Degrades to status='error' rather than raising on a staging /
+    enqueue failure."""
+    if not _env_bool('TM_AGENT_ORCHESTRATION_ENABLED', False):
+        return AgentInvokeResponse(
+            agent_name=agent_name,
+            run_id='',
+            status='disabled',
+            container=req.container,
+            dry_run=req.dry_run,
+            allow_apply=req.allow_apply,
+            notes='governance agent orchestration is disabled '
+                  '(set TM_AGENT_ORCHESTRATION_ENABLED=1 to enable)',
+        )
+
+    run_id = f'agentrun-{secrets.token_hex(4)}-{int(time.time())}'
+    # apply authority requires BOTH dry_run=false and allow_apply=true; either
+    # gate left at its safe default keeps the run in plan mode.
+    effective_allow_apply = bool(req.allow_apply) and not bool(req.dry_run)
+
+    # Resolve the working container (or a synthetic global token); validate so the
+    # inbox path stays inside the container tree.
+    if req.container:
+        canonical, _ = resolve_container_or_raise(req.container)
+    else:
+        canonical = _AGENT_GLOBAL_CONTAINER
+    validate_container_name(canonical)
+
+    # The container the agent actually scopes over: None for a global run (the
+    # runner / loop treat None as global), the canonical name otherwise.
+    scope_container = canonical if req.container else None
+
+    run_params = {
+        'goal': req.goal or '',
+        'params': req.params or {},
+        'agent_name': agent_name,
+        'run_id': run_id,
+    }
+    try:
+        params_path = _stage_agent_params(canonical, run_id, run_params)
+    except Exception as exc:  # noqa: BLE001 - staging failure → error, never raise
+        logger.warning('[admin_agent_invoke] params staging failed: %s', exc)
+        return AgentInvokeResponse(
+            agent_name=agent_name, run_id=run_id, status='error',
+            container=scope_container, dry_run=req.dry_run,
+            allow_apply=req.allow_apply,
+            notes=f'failed to stage run params: {exc}',
+        )
+
+    try:
+        resp = _enqueue_or_run(
+            op='run-agent',
+            container=canonical,
+            payload={
+                'agent_name': agent_name,
+                'goal': req.goal or '',
+                'run_id': run_id,
+                'params_path': str(params_path),
+                'allow_apply': effective_allow_apply,
+            },
+            timeout_s=60,
+            wait=False,
+            coalesce=False,
+            label=f'agent:{agent_name}',
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - enqueue failure → error, never raise
+        logger.warning('[admin_agent_invoke] enqueue failed: %s', exc)
+        return AgentInvokeResponse(
+            agent_name=agent_name, run_id=run_id, status='error',
+            container=scope_container, dry_run=req.dry_run,
+            allow_apply=req.allow_apply,
+            notes=f'failed to enqueue run: {exc}',
+        )
+
+    job_id = resp.pid if isinstance(resp.pid, int) else None
+    governance_store.write_agent_run(
+        run_id,
+        goal=req.goal or '',
+        container=scope_container,
+        mode=('apply' if effective_allow_apply else 'dry_run'),
+        status='enqueued',
+        agent_name=agent_name,
+        job_id=job_id,
+    )
+    return AgentInvokeResponse(
+        agent_name=agent_name,
+        run_id=run_id,
+        job_id=job_id,
+        status='enqueued',
+        container=scope_container,
+        dry_run=req.dry_run,
+        allow_apply=effective_allow_apply,
+        notes='run enqueued; the background worker will drain it',
+    )
+
+
+@app.get(
+    '/admin/agent/runs',
+    response_model=AgentRunsResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_agent_runs(limit: int = 50) -> AgentRunsResponse:
+    """List recent governance-agent runs (newest first). Reads the isolated
+    governance store; degrades to an empty list if it is unavailable."""
+    rows = governance_store.list_agent_runs(limit=limit)
+    runs: list[AgentRunInfo] = []
+    for row in rows:
+        runs.append(AgentRunInfo(
+            run_id=str(row.get('run_id') or ''),
+            agent_name=str(row.get('agent_name') or ''),
+            container=row.get('container'),
+            created_at=int(row.get('created_at') or 0),
+            status=str(row.get('status') or ''),
+            dry_run=(str(row.get('mode') or '') != 'apply'),
+            proposals=int(row.get('steps') or 0),
+            job_id=row.get('job_id') if isinstance(row.get('job_id'), int) else None,
+        ))
+    return AgentRunsResponse(runs=runs)
+
+
+@app.get(
+    '/admin/agent/approvals',
+    response_model=AgentApprovalsResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_agent_approvals(status: str = 'pending', limit: int = 50) -> AgentApprovalsResponse:
+    """List governance-agent approvals filtered by status (default pending).
+    Expired pendings (config:tools:approval_ttl_days) are hidden by the store."""
+    rows = governance_store.list_agent_approvals(status=status, limit=limit)
+    approvals: list[AgentApprovalInfo] = []
+    for row in rows:
+        approvals.append(AgentApprovalInfo(
+            id=int(row.get('id') or 0),
+            run_id=str(row.get('run_id') or ''),
+            agent_name=str(row.get('agent_name') or ''),
+            container=row.get('container'),
+            tool=str(row.get('tool') or ''),
+            status=str(row.get('status') or 'pending'),
+            created_at=int(row.get('created_at') or 0),
+        ))
+    return AgentApprovalsResponse(approvals=approvals)
+
+
+@app.post(
+    '/admin/agent/approvals/{approval_id}/approve',
+    response_model=ToolInvokeResponse,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_agent_approve(approval_id: int, request: Request) -> ToolInvokeResponse:
+    """Approve a pending destructive-tool action and execute it for real — this is
+    the ONLY place in the server a governance tool runs with dry_run=False for a
+    destructive op. A human behind verify_auth is the actuator; the unattended
+    loop never executes destructive tools itself.
+
+    Transitions the approval pending→approved (no-op / 404 if missing, already
+    decided, or TTL-expired), then invokes the recorded tool with its recorded
+    params at dry_run=False. Reuses the post-apply re-embed path when the apply
+    flags reindex_required. Degrades to a status='error' result, never raises."""
+    decided_by = _approval_actor(request)
+    row = governance_store.decide_agent_approval(approval_id, 'approved', decided_by)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail='approval not found, already decided, or expired',
+        )
+
+    tool = str(row.get('tool') or '')
+    container = row.get('container')
+    try:
+        params = json.loads(row.get('params_json') or '{}')
+        if not isinstance(params, dict):
+            params = {}
+    except Exception:  # noqa: BLE001 - corrupt params blob → empty params
+        params = {}
+
+    result = await governance_tools.invoke_tool(
+        tool, container=container, params=params, dry_run=False,
+    )
+    # Mirror admin_tools_invoke: a real mutation of a container's memory store
+    # triggers a best-effort re-embed via the same queue path.
+    if (result.get('applied')
+            and (result.get('result') or {}).get('reindex_required')
+            and container):
+        try:
+            canonical, _ = resolve_container_or_raise(container)
+            resp = _enqueue_or_run(
+                op='embed', container=canonical, payload={},
+                timeout_s=60, wait=False, label='governance-reindex',
+            )
+            result['result']['reindex_job'] = {'job_id': resp.pid, 'status': resp.status}
+        except Exception as exc:  # noqa: BLE001 - re-embed 是 best-effort 附属动作
+            logger.warning('[admin_agent_approve] reindex enqueue degraded: %s', exc)
+            result['notes'] = (
+                f"{result.get('notes') or ''} | reindex enqueue failed: {exc}"
+            ).strip(' |')
+    return ToolInvokeResponse(**result)
+
+
+@app.post(
+    '/admin/agent/approvals/{approval_id}/reject',
+    response_model=AgentApprovalInfo,
+    dependencies=[Depends(verify_auth)],
+)
+async def admin_agent_reject(approval_id: int, request: Request) -> AgentApprovalInfo:
+    """Reject a pending approval (no execution). 404 if missing / already decided /
+    expired. Returns the decided approval row."""
+    decided_by = _approval_actor(request)
+    row = governance_store.decide_agent_approval(approval_id, 'rejected', decided_by)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail='approval not found, already decided, or expired',
+        )
+    return AgentApprovalInfo(
+        id=int(row.get('id') or approval_id),
+        run_id=str(row.get('run_id') or ''),
+        agent_name=str(row.get('agent_name') or ''),
+        container=row.get('container'),
+        tool=str(row.get('tool') or ''),
+        status=str(row.get('status') or 'rejected'),
+        created_at=int(row.get('created_at') or 0),
+    )
+
+
+def _approval_actor(request: Request) -> str:
+    """Best-effort identity label for who decided an approval (audit trail). Uses
+    the session-bound api-key hash prefix when present, else the client IP. Never
+    raises — an unidentifiable caller decides as 'admin'."""
+    try:
+        token = request.cookies.get('tm_sid') if request is not None else None
+        if token:
+            session = get_ui_session_store().validate(token)
+            if session is not None and getattr(session, 'api_key_hash', ''):
+                return f'session:{str(session.api_key_hash)[:12]}'
+    except Exception:  # noqa: BLE001 - identity is best-effort
+        pass
+    try:
+        return f'apikey:{_client_ip(request)}' if _client_ip(request) else 'admin'
+    except Exception:  # noqa: BLE001
+        return 'admin'
 
 
 # ---------------------------------------------------------------------------
