@@ -175,6 +175,13 @@ _PRESET_TOOL_NAMES: tuple[str, ...] = (
 )
 _DEFAULT_TOOLS_ENABLED_MAP: dict[str, bool] = {n: True for n in _PRESET_TOOL_NAMES}
 
+# Governance-agent default tool allow-list = every preset tool EXCEPT the one
+# destructive tool (snapshot_and_quarantine). Destructive actions are never in
+# the agent's auto-callable set; they only ever reach a human approval queue.
+_DEFAULT_AGENT_ALLOWED_TOOLS: list[str] = [
+    n for n in _PRESET_TOOL_NAMES if n != "snapshot_and_quarantine"
+]
+
 
 # ── Known config registry ───────────────────────────────────────────────────
 # Only keys registered here are accepted by set(). Each entry: the coercer to
@@ -421,6 +428,42 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
         _coerce_bool, typename="bool", default=False, group="治理工具箱",
         label="新工具默认启用",
         description="新注册的治理工具是否默认开启：默认关闭（需手动逐个开启），更安全",
+    ),
+    # ── Governance agent orchestration (opt-in, default OFF) ─────────────────
+    # Placeholders for the governance-orchestration agent — a gateway-LLM
+    # tool-use loop that plans over the governance toolbox. The master gate is
+    # the env flag TM_AGENT_ORCHESTRATION_ENABLED (default 0) so a default
+    # deploy never enqueues an agent run; these only persist its knobs so the
+    # Dashboard can render them (no live reader changes behavior until consulted).
+    "config:agent:max_steps": _ConfigKey(
+        _coerce_int, typename="int", default=6, group="治理 Agent",
+        label="Agent 单次最大步数",
+        description="一次治理 Agent 运行最多规划/执行的步数：调小更保守、范围更受限；默认 6 步",
+    ),
+    "config:agent:run_timeout_sec": _ConfigKey(
+        _coerce_int, typename="int", default=300, group="治理 Agent",
+        label="Agent 运行墙钟上限(秒)",
+        description="单次治理 Agent 运行的墙钟时间上限（秒），超时即产出部分报告并出局；默认 300 秒",
+    ),
+    "config:agent:allowed_tools": _ConfigKey(
+        _coerce_json, typename="json", default=_DEFAULT_AGENT_ALLOWED_TOOLS,
+        group="治理 Agent", label="Agent 可用工具白名单",
+        description="允许治理 Agent 在循环中调用的工具名列表（默认仅非破坏性工具；破坏性操作始终走人工审批）",
+    ),
+    "config:agent:default_agent_name": _ConfigKey(
+        _coerce_str, typename="str", default="dream-orchestrator", group="治理 Agent",
+        label="默认 Agent 名称",
+        description="未指定时使用的治理 Agent 名称标识；默认 dream-orchestrator",
+    ),
+    "config:agent:compress_batch_bytes": _ConfigKey(
+        _coerce_int, typename="int", default=8388608, group="治理 Agent",
+        label="索引卡压缩分批字节预算",
+        description="知识聚类压缩时单批拼接 prompt 的 UTF-8 字节上限，给上游输入硬限留余量；默认 8 MiB",
+    ),
+    "config:agent:compress_row_char_cap": _ConfigKey(
+        _coerce_int, typename="int", default=20000, group="治理 Agent",
+        label="索引卡压缩单条字符上限",
+        description="压缩前对每条源记忆文本截断的字符上限，防单条超大记忆撑爆一批；默认 20000 字符",
     ),
 }
 

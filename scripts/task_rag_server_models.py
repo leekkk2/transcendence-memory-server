@@ -949,3 +949,67 @@ class ToolInvokeResponse(BaseModel):
     result: dict = Field(default_factory=dict)
     applied: bool = False
     notes: str = ''
+
+
+class AgentInvokeRequest(BaseModel):
+    """Body for ``POST /admin/agent/{agent_name}/invoke``.
+
+    `dry_run` defaults True（plan 预览，循环全程不落地）。可逆工具仅在
+    dry_run=false 且 allow_apply=true 时自动落地；破坏性工具任何情况只进审批队列。
+    """
+
+    container: str | None = Field(default=None, description='Target container, or null for a global-scope run.')
+    goal: str | None = Field(default=None, description='Natural-language objective for the agent run.')
+    params: dict = Field(default_factory=dict, description='Optional run parameters passed through to the runner.')
+    dry_run: bool = Field(default=True, description='True (default) = plan/preview only, no mutation.')
+    allow_apply: bool = Field(default=False, description='Allow reversible tools to apply (only when dry_run=false).')
+
+
+class AgentInvokeResponse(BaseModel):
+    """Body for ``POST /admin/agent/{agent_name}/invoke``."""
+
+    agent_name: str
+    run_id: str
+    job_id: int | None = None
+    status: Literal['enqueued', 'disabled', 'error'] = 'enqueued'
+    container: str | None = None
+    dry_run: bool = True
+    allow_apply: bool = False
+    notes: str = ''
+
+
+class AgentRunInfo(BaseModel):
+    """One row for ``GET /admin/agent/runs``."""
+
+    run_id: str
+    agent_name: str = ''
+    container: str | None = None
+    created_at: int = 0
+    status: str = ''
+    dry_run: bool = True
+    proposals: int = 0
+    job_id: int | None = None
+
+
+class AgentRunsResponse(BaseModel):
+    """Body for ``GET /admin/agent/runs``."""
+
+    runs: list[AgentRunInfo] = Field(default_factory=list)
+
+
+class AgentApprovalInfo(BaseModel):
+    """One row for ``GET /admin/agent/approvals``."""
+
+    id: int
+    run_id: str = ''
+    agent_name: str = ''
+    container: str | None = None
+    tool: str = ''
+    status: str = 'pending'
+    created_at: int = 0
+
+
+class AgentApprovalsResponse(BaseModel):
+    """Body for ``GET /admin/agent/approvals``."""
+
+    approvals: list[AgentApprovalInfo] = Field(default_factory=list)
