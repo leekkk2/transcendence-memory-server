@@ -134,6 +134,14 @@ TOOLS: dict[str, _Tool] = {
 }
 
 
+def tool_is_destructive(name: str) -> bool:
+    """该工具是否破坏性（``TOOLS[name].destructive``）；未知工具名 → False
+    （保守：未知工具不被当成破坏性，由上层 enable-map / dispatch 兜底）。
+    供 agent 安全闸/审批层判定是否必须走人工审批。永不抛。"""
+    spec = TOOLS.get(name)
+    return bool(spec.destructive) if spec is not None else False
+
+
 # Container-level tool override key template (§A8). Dynamic per container name —
 # NOT registered in KNOWN_CONFIG; read/written via Redis + the config_store DB
 # store directly (mirror dreaming's per-container key handling).
@@ -621,14 +629,32 @@ def _scan_compress_preview(container: Optional[str], params: dict) -> dict[str, 
                 "scan_notes": f"preview degraded (store unreadable: {exc})"}
     cluster_tag, cluster = _pick_cluster(rows, params.get("cluster_tag"))
     would = len(cluster) >= 2
+    # 字节账目（不调 LLM）：用真执行同一分批启发式估算簇全文字节 + 批数，
+    # 让预览能预告 map-reduce 会切几批，便于提前发现超大簇。
+    batch_byte_budget = _compress_batch_bytes()
+    row_char_cap = _compress_row_char_cap()
+    estimated_bytes = sum(
+        len(_format_cluster_row(r, row_char_cap).encode("utf-8")) for r in cluster
+    )
+    batches = _batch_cluster_by_bytes(cluster, batch_byte_budget, row_char_cap) \
+        if would else []
+    batch_count = len(batches)
+    if would:
+        mb = batch_byte_budget / (1024 * 1024)
+        scan_notes = (
+            f"largest same-tags cluster has {len(cluster)} rows "
+            f"(read-only; would map-reduce in {batch_count} batch(es) "
+            f"≤{mb:.0f}MiB each to one index card)")
+    else:
+        scan_notes = "no cluster ≥2 — nothing to compress"
     return {
         "cluster_tag": cluster_tag or None,
         "cluster_size": len(cluster),
         "source_ids": [str(r.get("id") or "") for r in cluster],
         "would_compress": would,
-        "scan_notes": (f"largest same-tags cluster has {len(cluster)} rows "
-                       "(read-only; would compress to one index card)" if would
-                       else "no cluster ≥2 — nothing to compress"),
+        "estimated_bytes": estimated_bytes,
+        "batch_count": batch_count,
+        "scan_notes": scan_notes,
     }
 
 
@@ -700,6 +726,15 @@ def _invoke_deferred_or_dry_run(
 _INDEX_CARD_SYSTEM_PROMPT = (
     "把以下同主题记忆压缩成一张高密度索引卡，中文，不超过约 400 字，必须包含："
     "①自然语言同义词头部（便于模糊召回）②核心结论 bullet 列表③来源 id 列表。"
+)
+# map-reduce 的 reduce 阶段 system prompt：把多张「局部索引卡」合并为一张最终卡。
+# 当簇过大（拼成的单条 prompt 超上游网关请求体上限）时，按字节预算分批 map
+# 出多张局部卡，再用本 prompt reduce 合并——同样保高密度+模糊召回友好头部。
+_INDEX_CARD_REDUCE_SYSTEM_PROMPT = (
+    "以下是同一主题记忆分批压缩得到的多张局部索引卡。请把它们合并为一张"
+    "高密度索引卡，中文，不超过约 400 字，必须包含：①自然语言同义词头部"
+    "（便于模糊召回）②去重后的核心结论 bullet 列表③合并所有来源 id 列表。"
+    "不要丢失任一局部卡的关键结论。"
 )
 # tune_model_parameters 的 LLM 输出契约：严格只回 JSON，便于机器解析+护栏校验。
 _TUNE_SYSTEM_PROMPT = (
@@ -814,6 +849,109 @@ def _invoke_snapshot_and_quarantine(
 
 # ── Real execution: compress_knowledge_cluster（LLM 索引卡，附加式） ──────────
 
+# 字节预算护栏：簇全文拼成单条 prompt 曾撑到 ~12.76 MB，越过上游网关 10 MiB
+# 输入硬限 → 400（4xx 不重试，工具 degraded）。默认每批 8 MiB（给 10 MiB 留余量）、
+# 单行截到 20000 字符（防单条超大记忆撑爆一批）。阈值经 config_store 可调，
+# TM_COMPRESS_BATCH_BYTES（int）env 覆盖优先级最高。
+_COMPRESS_BATCH_BYTES_DEFAULT = 8 * 1024 * 1024
+_COMPRESS_ROW_CHAR_CAP_DEFAULT = 20000
+
+
+def _truncate_for_llm(text: str, byte_budget: int) -> str:
+    """UTF-8 安全地把 text 截到 byte_budget 字节内；超限时尾部补
+    " …[truncated N bytes]" 标记。byte_budget<=0 或非字符串 → 返回空串/原值的
+    保守处理。与 agent 循环「工具结果回灌下一轮 prompt」共用，确保任何超大工具
+    输出都不会在循环里重演请求体超限。永不抛。"""
+    if not isinstance(text, str):
+        text = str(text)
+    if byte_budget <= 0:
+        return ""
+    raw = text.encode("utf-8")
+    if len(raw) <= byte_budget:
+        return text
+    dropped = len(raw) - byte_budget
+    marker = f" …[truncated {dropped} bytes]"
+    # 给 marker 留出空间，再在 byte_budget 内做不切断多字节字符的截断。
+    keep_budget = max(0, byte_budget - len(marker.encode("utf-8")))
+    head = raw[:keep_budget].decode("utf-8", errors="ignore")
+    return head + marker
+
+
+def _compress_batch_bytes() -> int:
+    """每批 prompt 的 UTF-8 字节上限。env TM_COMPRESS_BATCH_BYTES 优先（非法忽略），
+    其次 config:agent:compress_batch_bytes，再退默认 8 MiB。永不抛。"""
+    env_raw = os.environ.get("TM_COMPRESS_BATCH_BYTES")
+    if env_raw:
+        try:
+            val = int(env_raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    try:
+        val = int(config_store.get_cached(
+            "config:agent:compress_batch_bytes", _COMPRESS_BATCH_BYTES_DEFAULT))
+        return val if val > 0 else _COMPRESS_BATCH_BYTES_DEFAULT
+    except (TypeError, ValueError):
+        return _COMPRESS_BATCH_BYTES_DEFAULT
+
+
+def _compress_row_char_cap() -> int:
+    """单行 text 截断的字符上限。config:agent:compress_row_char_cap，退默认 20000。
+    永不抛。"""
+    try:
+        val = int(config_store.get_cached(
+            "config:agent:compress_row_char_cap", _COMPRESS_ROW_CHAR_CAP_DEFAULT))
+        return val if val > 0 else _COMPRESS_ROW_CHAR_CAP_DEFAULT
+    except (TypeError, ValueError):
+        return _COMPRESS_ROW_CHAR_CAP_DEFAULT
+
+
+def _format_cluster_row(row: dict, row_char_cap: int) -> str:
+    """把一条记忆行格式化为 prompt 片段，text 先截到 row_char_cap 字符。"""
+    text = str(row.get("text") or "")
+    if len(text) > row_char_cap:
+        text = text[:row_char_cap] + "…"
+    return f"[{row.get('id')}] {row.get('title') or ''}\n{text}"
+
+
+def _batch_cluster_by_bytes(
+    cluster: list[dict], batch_byte_budget: int, row_char_cap: int
+) -> list[list[dict]]:
+    """按 UTF-8 字节贪心 bin-packing 把簇切成多批，使每批拼出的 prompt
+    （含 system prompt 开销）控在 batch_byte_budget 内。
+
+    - 先对每行 text 截到 row_char_cap（防单条超大记忆撑爆一批）再计字节。
+    - 行分隔符 "\\n\\n" 一并计入。单条行本身已超预算（极端）→ 仍单独成一批
+      （后续 _truncate_for_llm 兜底），避免空批死循环。
+    - 永不抛；预算非正时退守每行一批的保守切法。"""
+    if batch_byte_budget <= 0:
+        batch_byte_budget = _COMPRESS_BATCH_BYTES_DEFAULT
+    # 预留给 system prompt + 拼装开销的固定头寸（取两张 system prompt 的较大者）。
+    system_overhead = max(
+        len(_INDEX_CARD_SYSTEM_PROMPT.encode("utf-8")),
+        len(_INDEX_CARD_REDUCE_SYSTEM_PROMPT.encode("utf-8")),
+    )
+    effective_budget = max(1, batch_byte_budget - system_overhead)
+    sep_bytes = len("\n\n".encode("utf-8"))
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_bytes = 0
+    for row in cluster:
+        frag = _format_cluster_row(row, row_char_cap)
+        frag_bytes = len(frag.encode("utf-8"))
+        add_bytes = frag_bytes + (sep_bytes if current else 0)
+        if current and current_bytes + add_bytes > effective_budget:
+            batches.append(current)
+            current = [row]
+            current_bytes = frag_bytes
+        else:
+            current.append(row)
+            current_bytes += add_bytes
+    if current:
+        batches.append(current)
+    return batches
+
 
 def _pick_cluster(rows: list[dict], cluster_tag: Any) -> tuple[str, list[dict]]:
     """选簇：params.cluster_tag 指定时取含该 tag 的行；否则按「相同 tags 集合」
@@ -853,11 +991,29 @@ async def _invoke_compress_knowledge_cluster(
             {"cluster_tag": cluster_tag, "cluster_size": len(cluster)}, False,
             "no cluster ≥2 — nothing to compress",
         )
-    prompt = "\n\n".join(
-        f"[{r.get('id')}] {r.get('title') or ''}\n{r.get('text') or ''}"
-        for r in cluster
-    )
-    card_text = await _llm_oneshot(prompt, system_prompt=_INDEX_CARD_SYSTEM_PROMPT)
+    # map-reduce 字节预算分批：把簇切到每批 prompt < batch_byte_budget（UTF-8），
+    # 防整簇拼成单条 prompt 越过上游网关 10 MiB 输入硬限触发 400。
+    batch_byte_budget = _compress_batch_bytes()
+    row_char_cap = _compress_row_char_cap()
+    batches = _batch_cluster_by_bytes(cluster, batch_byte_budget, row_char_cap)
+    # map：每批单独压缩成一张局部索引卡。
+    partial_cards: list[str] = []
+    for batch in batches:
+        batch_prompt = "\n\n".join(
+            _format_cluster_row(r, row_char_cap) for r in batch
+        )
+        partial_cards.append(
+            await _llm_oneshot(batch_prompt, system_prompt=_INDEX_CARD_SYSTEM_PROMPT)
+        )
+    # reduce：>1 批时合并局部卡为最终卡；==1 批直接用该批输出（廉价单跳路径）。
+    if len(partial_cards) > 1:
+        reduce_prompt = "\n\n".join(
+            f"[局部卡 {i + 1}]\n{c}" for i, c in enumerate(partial_cards)
+        )
+        card_text = await _llm_oneshot(
+            reduce_prompt, system_prompt=_INDEX_CARD_REDUCE_SYSTEM_PROMPT)
+    else:
+        card_text = partial_cards[0]
     ts = int(time.time())
     sig = hashlib.md5(cluster_tag.encode("utf-8")).hexdigest()[:8]
     source_ids = [str(r.get("id") or "") for r in cluster]
@@ -882,12 +1038,16 @@ async def _invoke_compress_knowledge_cluster(
         "source_ids": source_ids,
         "cluster_tag": cluster_tag,
         "cluster_size": len(cluster),
+        "batch_count": len(batches),
         "llm_model": os.environ.get("LLM_MODEL"),
         "reindex_required": True,
     }
+    reduce_note = (f" via {len(batches)}-batch map-reduce"
+                   if len(batches) > 1 else "")
     return _result(
         "compress_knowledge_cluster", "applied", container, result, True,
-        f"index card appended from {len(cluster)} source rows (sources kept)",
+        f"index card appended from {len(cluster)} source rows"
+        f"{reduce_note} (sources kept)",
     )
 
 

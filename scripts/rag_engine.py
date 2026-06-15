@@ -220,6 +220,77 @@ async def call_openai_chat(
     raise last_exc
 
 
+async def call_openai_chat_with_tools(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str = "auto",
+    timeout: float = 180.0,
+    label: str = "AGENT",
+) -> dict[str, Any]:
+    """OpenAI 兼容 chat/completions 调用，支持 tool-use（function calling）。
+
+    与 ``call_openai_chat`` 的关键差异：
+    - 返回整条 ``message`` dict（含可选 ``tool_calls``），**不**只取 content。
+    - tool-call 轮的 ``content`` 可能为 null/空，这是 OpenAI 协议的合法响应，
+      故**绝不**像 ``call_openai_chat`` 那样把空 content 当作错误 raise。
+    - 复用同款指数退避（``_LLM_MAX_RETRIES`` / ``_LLM_RETRY_BASE_DELAY``）：
+      5xx / 429 / 连接错误 / JSON 解析失败可重试；最终失败透传原始异常。
+
+    ``payload`` 默认只含 ``{"model","messages"}``；当 ``tools`` 非空才追加
+    ``tools`` / ``tool_choice`` / ``parallel_tool_calls=False``（串行工具调用，
+    审计顺序清晰且控请求体积）。
+    """
+    import httpx
+
+    if not base_url:
+        raise RuntimeError(f"{label} base_url is empty; configure LLM_BASE_URL/VLM_BASE_URL")
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    payload: dict[str, Any] = {"model": model, "messages": messages}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+        payload["parallel_tool_calls"] = False
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    last_exc: Exception | None = None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(_LLM_MAX_RETRIES):
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    raise httpx.HTTPStatusError(
+                        f"upstream {resp.status_code}", request=resp.request, response=resp,
+                    )
+                resp.raise_for_status()
+                try:
+                    data = resp.json()
+                except ValueError as json_err:
+                    raise ValueError(
+                        f"{label} returned non-JSON body: {resp.text[:200]!r}"
+                    ) from json_err
+                message = data["choices"][0]["message"]
+                # tool-call 轮 content 合法为 null/空 → 不 raise（与 call_openai_chat 不同）。
+                _record_usage_fire_and_forget(model, data.get("usage") or {})
+                return message
+            except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
+                last_exc = exc
+                if attempt == _LLM_MAX_RETRIES - 1:
+                    break
+                delay = _LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "%s call failed (attempt %d/%d): %s; retrying in %.1fs",
+                    label, attempt + 1, _LLM_MAX_RETRIES, exc, delay,
+                )
+                await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 def make_llm_func(chain: list) -> Any:
     """构造注入 LightRAG 的 ``llm_model_func`` —— 按 chain 顺序 fallback 的 LLM 调用。
 
@@ -344,6 +415,28 @@ async def _llm_func(prompt: str, system_prompt: str | None = None, **_: Any) -> 
         model=LLM_MODEL,
         messages=messages,
         label="LLM",
+    )
+
+
+async def llm_chat_with_tools(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str = "auto",
+) -> dict[str, Any]:
+    """env (`LLM_*`) 驱动的 tool-use chat 薄封装。
+
+    走与 ``_llm_func`` 同一网关（HR-9：唯一许可的 LLM 入口，base_url/api_key/model
+    全经 env，绝不硬编码），返回整条 ``message`` dict（含可选 ``tool_calls``）。
+    供治理 agent 循环规划用；行为细节见 ``call_openai_chat_with_tools``。
+    """
+    return await call_openai_chat_with_tools(
+        base_url=LLM_BASE_URL,
+        api_key=LLM_API_KEY,
+        model=LLM_MODEL,
+        messages=messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        label="AGENT",
     )
 
 
