@@ -456,9 +456,9 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
         description="未指定时使用的治理 Agent 名称标识；默认 dream-orchestrator",
     ),
     "config:agent:compress_batch_bytes": _ConfigKey(
-        _coerce_int, typename="int", default=8388608, group="治理 Agent",
+        _coerce_int, typename="int", default=262144, group="治理 Agent",
         label="索引卡压缩分批字节预算",
-        description="知识聚类压缩时单批拼接 prompt 的 UTF-8 字节上限，给上游输入硬限留余量；默认 8 MiB",
+        description="知识聚类压缩时单批拼接 prompt 的 UTF-8 字节上限。默认 256 KiB（262144 B），依据：用真实混合 CJK+Latin 簇内容直探网关实测——768 KiB 200 OK，1 MiB HTTP 400 context_too_large；CJK UTF-8 3 字节/字符 ≈ 1 token/字符，比 ASCII 更费 token，单纯按字节估计是弱代理，故留 ~3× 余量取 256 KiB 为安全默认。按 token 密度而非字节给余量；大 context 模型可经 TM_COMPRESS_BATCH_BYTES 调高",
     ),
     "config:agent:compress_row_char_cap": _ConfigKey(
         _coerce_int, typename="int", default=20000, group="治理 Agent",
