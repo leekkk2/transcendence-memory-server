@@ -600,6 +600,14 @@ async def run_agent(
                     result_summary=summary,
                 )
                 _append_tool_message(messages, call_id, summary)
+                signature = (name, _args_json(args), summary)
+                if signature == last_signature:
+                    status = "stalled"
+                    final_summary = (f"stalled: repeated identical call to {name} "
+                                     "returned the same result")
+                    finished = True
+                    break
+                last_signature = signature
                 continue
 
             if gate.get("blocked"):
@@ -620,6 +628,17 @@ async def run_agent(
                     result_summary=note,
                 )
                 _append_tool_message(messages, call_id, note)
+                # Stall on a repeated identical destructive proposal. Use a
+                # per-call-id-free signature (the approval_id changes every call,
+                # which would otherwise mask the repeat).
+                signature = (name, _args_json(args), "pending_approval")
+                if signature == last_signature:
+                    status = "stalled"
+                    final_summary = (f"stalled: repeated identical call to {name} "
+                                     "returned the same result")
+                    finished = True
+                    break
+                last_signature = signature
                 continue
 
             # SAFE / reversible → execute via the toolbox at the gated dry_run.

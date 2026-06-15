@@ -922,8 +922,9 @@ def _batch_cluster_by_bytes(
     （含 system prompt 开销）控在 batch_byte_budget 内。
 
     - 先对每行 text 截到 row_char_cap（防单条超大记忆撑爆一批）再计字节。
-    - 行分隔符 "\\n\\n" 一并计入。单条行本身已超预算（极端）→ 仍单独成一批
-      （后续 _truncate_for_llm 兜底），避免空批死循环。
+    - 行分隔符 "\\n\\n" 一并计入。单条行本身已超预算（极端）→ 仍单独成一批；
+      map 步送 LLM 前会用 _truncate_for_llm(batch_prompt, batch_byte_budget) 再兜底
+      硬截到预算内，故永不空批死循环、永不触发上游 400。
     - 永不抛；预算非正时退守每行一批的保守切法。"""
     if batch_byte_budget <= 0:
         batch_byte_budget = _COMPRESS_BATCH_BYTES_DEFAULT
@@ -996,12 +997,16 @@ async def _invoke_compress_knowledge_cluster(
     batch_byte_budget = _compress_batch_bytes()
     row_char_cap = _compress_row_char_cap()
     batches = _batch_cluster_by_bytes(cluster, batch_byte_budget, row_char_cap)
-    # map：每批单独压缩成一张局部索引卡。
+    # map：每批单独压缩成一张局部索引卡。送 LLM 前再用 _truncate_for_llm 把整批
+    # prompt 硬截到 batch_byte_budget（< 10 MiB 上游硬限）做 belt-and-suspenders 兜底
+    # ——即便 row_char_cap 被调到很大、bin-packing 仍让单批越界，也永不触发 400。
+    # 正常情况下批本就 < 预算，截断为 no-op。
     partial_cards: list[str] = []
     for batch in batches:
         batch_prompt = "\n\n".join(
             _format_cluster_row(r, row_char_cap) for r in batch
         )
+        batch_prompt = _truncate_for_llm(batch_prompt, batch_byte_budget)
         partial_cards.append(
             await _llm_oneshot(batch_prompt, system_prompt=_INDEX_CARD_SYSTEM_PROMPT)
         )
