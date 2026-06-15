@@ -517,13 +517,21 @@ def decide_agent_approval(
                 return None
             if int(rec.get("created_at", 0)) < cutoff:  # expired pending = void
                 return None
-            conn.execute(
+            decided_at = int(time.time())
+            cur = conn.execute(
                 "UPDATE agent_approvals SET status = ?, decided_at = ?, "
                 "decided_by = ? WHERE id = ? AND status = 'pending'",
-                (str(status or ""), int(time.time()), str(decided_by or ""), approval_id),
+                (str(status or ""), decided_at, str(decided_by or ""), approval_id),
             )
+            # Exactly-once across concurrent approves: only the txn that actually
+            # flips pending→decided (rowcount == 1) owns the executable row; a
+            # racing approve sees rowcount == 0 (someone won first) → None, so the
+            # caller's "already decided → 404" path fires and the destructive tool
+            # never runs twice.
+            if cur.rowcount != 1:
+                return None
             rec["status"] = str(status or "")
-            rec["decided_at"] = int(time.time())
+            rec["decided_at"] = decided_at
             rec["decided_by"] = str(decided_by or "")
         return rec
     except Exception as exc:  # noqa: BLE001 - write failure → degrade, never raise
