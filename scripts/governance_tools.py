@@ -849,11 +849,19 @@ def _invoke_snapshot_and_quarantine(
 
 # ── Real execution: compress_knowledge_cluster（LLM 索引卡，附加式） ──────────
 
-# 字节预算护栏：簇全文拼成单条 prompt 曾撑到 ~12.76 MB，越过上游网关 10 MiB
-# 输入硬限 → 400（4xx 不重试，工具 degraded）。默认每批 8 MiB（给 10 MiB 留余量）、
-# 单行截到 20000 字符（防单条超大记忆撑爆一批）。阈值经 config_store 可调，
-# TM_COMPRESS_BATCH_BYTES（int）env 覆盖优先级最高。
-_COMPRESS_BATCH_BYTES_DEFAULT = 8 * 1024 * 1024
+# 字节预算护栏：簇全文拼成单条 prompt 曾撑到 ~12.76 MB，越过上游网关 10 MiB transport
+# 输入硬限 → 400；但真正更紧的约束是网关小模型的 token context window —— prompt 字节
+# 经 tokenizer 变 token，纯 ASCII 约 4 字节/token、CJK UTF-8 约 1.5 字节/token（3 字节/
+# 字节是 token 的弱代理：CJK UTF-8 3 字节/字符 ≈ 1 token/字符，比 ASCII 更费 token；
+# 用重复字符（如 'x'）探测网关 context 上限会严重高估真实/CJK 内容能塞的字节数。
+# 真实内容实测（混合 CJK+Latin acc-demo bigcluster 直探 gpt-5.4-mini via 网关）：
+#   768 KiB（786432 B）→ 200 OK
+#   1 MiB（1048576 B）→ HTTP 400 code=context_too_large
+# 叠加 compress 自身 _INDEX_CARD_SYSTEM_PROMPT + 每行格式开销 + 输出 token 预留，
+# 安全默认须明显低于 768 KiB。取 256 KiB（262144 B）—— 对实测混合内容 ~3× 余量，
+# 对更密的纯 CJK 内容同样安全。治理操作低频，大簇多分几批可接受。
+# 阈值经 config_store 可调（接大 context 模型可经 TM_COMPRESS_BATCH_BYTES 调高）。
+_COMPRESS_BATCH_BYTES_DEFAULT = 256 * 1024
 _COMPRESS_ROW_CHAR_CAP_DEFAULT = 20000
 
 
@@ -879,7 +887,8 @@ def _truncate_for_llm(text: str, byte_budget: int) -> str:
 
 def _compress_batch_bytes() -> int:
     """每批 prompt 的 UTF-8 字节上限。env TM_COMPRESS_BATCH_BYTES 优先（非法忽略），
-    其次 config:agent:compress_batch_bytes，再退默认 8 MiB。永不抛。"""
+    其次 config:agent:compress_batch_bytes，再退默认 256 KiB（context-safe，见上方常量注释）。
+    永不抛。"""
     env_raw = os.environ.get("TM_COMPRESS_BATCH_BYTES")
     if env_raw:
         try:

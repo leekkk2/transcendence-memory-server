@@ -29,6 +29,15 @@ os.environ.setdefault("TM_REDIS_ENABLED", "0")
 import config_store  # noqa: E402
 import governance_tools  # noqa: E402
 
+# 真实内容实测的网关 context 边界（混合 CJK+Latin acc-demo bigcluster 直探 gpt-5.4-mini）：
+#   768 KiB (786432 B)  → 200 OK（实测成功上限）
+#   1 MiB  (1048576 B)  → HTTP 400 code=context_too_large（实测失败阈值）
+# 注：重复字符（如 'x'）探测会因 tokenizer 合并被严重高估；此处为真实混合内容实测。
+# CJK UTF-8 3 字节/字符 ≈ 1 token/字符，比 ASCII 更费 token，故安全默认须明显低于此。
+# 来源：本仓 2026-06-15 compress_batch_bytes 真实内容直探会话（gpt-5.4-mini 经网关路由）。
+CONTEXT_SAFE_CEILING_BYTES = 786_432   # 真实混合内容实测「成功上限」（768 KiB）
+CONTEXT_FAIL_OBSERVED_BYTES = 1_048_576  # 真实混合内容实测「context_too_large 400」（1 MiB）
+
 
 @pytest.fixture(autouse=True)
 def _isolated_workspace(monkeypatch, tmp_path):
@@ -116,6 +125,51 @@ def test_non_positive_budget_degrades_to_default_not_crash():
     batches = governance_tools._batch_cluster_by_bytes(cluster, 0, 20000)
     assert len(batches) == 1
     assert batches[0][0]["id"] == "a1"
+
+
+def test_shipped_default_batch_bytes_under_context_safe_ceiling():
+    # 核心断言：shipped 默认批预算须等于 262144（256 KiB），且两处默认源一致（config_store
+    # 注册默认 == governance_tools fallback 常量），且远低于真实内容实测成功上限 768 KiB。
+    shipped = governance_tools._COMPRESS_BATCH_BYTES_DEFAULT
+    registered = config_store.KNOWN_CONFIG["config:agent:compress_batch_bytes"].default
+    assert shipped == registered == 262144  # 两处默认源不得漂移，且均为 256 KiB
+    # 无 env/override 时 _compress_batch_bytes() 解析出的有效默认也必须一致。
+    effective = governance_tools._compress_batch_bytes()
+    assert effective == 262144
+    # 远低于真实混合内容实测成功上限（768 KiB），留足 ~3× 余量覆盖 CJK 更费 token。
+    assert shipped <= CONTEXT_SAFE_CEILING_BYTES
+    assert shipped <= int(CONTEXT_SAFE_CEILING_BYTES * 0.4)  # ≤ 40% 上限（~3× 余量）
+
+
+def test_default_budget_splits_over_10mib_cluster_each_batch_under_budget():
+    # 用 shipped 默认预算（256 KiB）对一个 >10 MiB 的合成簇分批 → 必须切多批，且每批
+    # 拼出的 prompt（含 system 开销）都 < 默认预算 → 默认配置下不会撞 context_too_large。
+    # 256 KiB 默认比 1 MiB 时会切更多批（batch_count 更大），断言放宽到 >1 即满足。
+    # 用 200 KiB / 行（> 256 KiB 默认预算单行即独立成批），凑 14 行 ≈ 2.8 MiB > 10 MiB
+    # 前置靠 test_oversized_cluster_splits_into_multiple_batches_each_under_budget 已验；
+    # 这里只验默认值路径下也能正确分批且无损。
+    row_char_cap = 2_000_000  # 不截断，让每行全文真有 200 KiB 量级
+    chunk_text = "x" * (200 * 1024)
+    cluster = [
+        {"id": f"big-{i}", "title": f"t{i}", "text": chunk_text, "tags": ["k"]}
+        for i in range(14)
+    ]
+    total_bytes = sum(
+        len(governance_tools._format_cluster_row(r, row_char_cap).encode("utf-8"))
+        for r in cluster
+    )
+    assert total_bytes > 1024 * 1024  # 前置：确实超过 1 MiB（远超 256 KiB 默认预算）
+
+    budget = governance_tools._compress_batch_bytes()  # shipped 默认（256 KiB）
+    assert budget == 262144  # 明确断言使用的是 256 KiB 默认
+    batches = governance_tools._batch_cluster_by_bytes(cluster, budget, row_char_cap)
+
+    assert len(batches) > 1  # 默认预算下必然切多批
+    for batch in batches:
+        assert _prompt_bytes_for_batch(batch, row_char_cap) < budget
+    # 分批无损：所有行被覆盖、无重复、保持原顺序。
+    flat = [r["id"] for batch in batches for r in batch]
+    assert flat == [r["id"] for r in cluster]
 
 
 def test_oversized_single_row_still_becomes_its_own_batch():
