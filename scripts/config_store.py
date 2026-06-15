@@ -465,6 +465,16 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
         label="索引卡压缩单条字符上限",
         description="压缩前对每条源记忆文本截断的字符上限，防单条超大记忆撑爆一批；默认 20000 字符",
     ),
+    "config:agent:compress_idempotent": _ConfigKey(
+        _coerce_bool, typename="bool", default=True, group="治理 Agent",
+        label="索引卡压缩幂等",
+        description="同一簇源集指纹未变且已有当前卡时跳过压缩（不调 LLM、不产卡），默认开启；置 False 退回无脑追加旧行为（灰度/回退）",
+    ),
+    "config:agent:compress_supersede": _ConfigKey(
+        _coerce_bool, typename="bool", default=True, group="治理 Agent",
+        label="索引卡压缩取代式退役",
+        description="簇源集变更时重新总结新卡并把旧卡移出 active（写 governance 快照可逆退役），始终只留一张当前卡，默认开启；置 False 退回无脑追加旧行为",
+    ),
 }
 
 # Prefixes used by HR-9 guards (so adding more base_url:* / api_keys:* keys

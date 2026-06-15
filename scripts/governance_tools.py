@@ -639,11 +639,32 @@ def _scan_compress_preview(container: Optional[str], params: dict) -> dict[str, 
     batches = _batch_cluster_by_bytes(cluster, batch_byte_budget, row_char_cap) \
         if would else []
     batch_count = len(batches)
+    # 三态决策预览（预览与执行共用 _compress_decision 纯函数，所见即所得）：
+    # skip_unchanged（指纹未变）/ first_card（无当前卡）/ supersede（源变更）。
+    decision = (_compress_decision(rows, cluster_tag, cluster)
+                if would else {"action": "noop", "fingerprint": None, "group": None,
+                               "prior_ids": [], "existing_card_id": None,
+                               "new_source_count": 0})
     if would:
         mb = batch_byte_budget / (1024 * 1024)
+        if decision["action"] == "skip_unchanged":
+            decision_note = (
+                f"would SKIP (unchanged — fingerprint matches existing card "
+                f"{decision['existing_card_id']})")
+        elif decision["action"] == "consolidate":
+            decision_note = (
+                f"would CONSOLIDATE (no LLM) — keep matching card "
+                f"{decision['existing_card_id']}, retire "
+                f"{len(decision['stale_ids'])} stale/orphan card(s)")
+        elif decision["action"] == "supersede":
+            decision_note = (
+                f"would SUPERSEDE {len(decision['prior_ids'])} prior card(s) "
+                f"(+{decision['new_source_count']} new source(s) since last)")
+        else:
+            decision_note = "would create FIRST card"
         scan_notes = (
             f"largest same-tags cluster has {len(cluster)} rows "
-            f"(read-only; would map-reduce in {batch_count} batch(es) "
+            f"(read-only; {decision_note}; map-reduce in {batch_count} batch(es) "
             f"≤{mb:.0f}MiB each to one index card)")
     else:
         scan_notes = "no cluster ≥2 — nothing to compress"
@@ -654,6 +675,15 @@ def _scan_compress_preview(container: Optional[str], params: dict) -> dict[str, 
         "would_compress": would,
         "estimated_bytes": estimated_bytes,
         "batch_count": batch_count,
+        # 决策（dry_run 预览据此显示 first_card/skip_unchanged/consolidate/supersede）。
+        "decision": decision["action"],
+        "cluster_fingerprint": decision["fingerprint"],
+        "cluster_group": decision["group"],
+        "existing_card_id": decision["existing_card_id"],
+        # 会被退役的卡 id：supersede=全部 prior；consolidate=多余孤儿（保留匹配卡）。
+        "superseded_card_ids": decision.get("stale_ids", [])
+            if decision["action"] in ("supersede", "consolidate") else [],
+        "new_source_count": decision["new_source_count"],
         "scan_notes": scan_notes,
     }
 
@@ -963,17 +993,29 @@ def _batch_cluster_by_bytes(
     return batches
 
 
+def _is_index_card_row(row: dict) -> bool:
+    """该行是否为 compress 产出的索引卡（tags 含 "index-card"）。簇选择据此
+    显式排除——索引卡永不二次总结（目标：永不二次总结铁律）。"""
+    tags = row.get("tags")
+    return isinstance(tags, list) and any(str(t) == "index-card" for t in tags)
+
+
 def _pick_cluster(rows: list[dict], cluster_tag: Any) -> tuple[str, list[dict]]:
     """选簇：params.cluster_tag 指定时取含该 tag 的行；否则按「相同 tags 集合」
-    聚簇取最大簇（同 tag 集 = 同主题的最强信号，无需 LLM 预判）。"""
+    聚簇取最大簇（同 tag 集 = 同主题的最强信号，无需 LLM 预判）。
+
+    两条路径都**显式排除 index-card 行**（即便源记忆本身带 index-card tag、或
+    显式 cluster_tag 命中含 index-card 的卡），保证 compress 产出的卡永不被当作
+    源二次总结——不再依赖「卡的 tag 集多一个 index-card → 落不同桶」的巧合。"""
+    src_rows = [r for r in rows if not _is_index_card_row(r)]
     if cluster_tag:
         tag = str(cluster_tag)
         return tag, [
-            r for r in rows
+            r for r in src_rows
             if isinstance(r.get("tags"), list) and tag in [str(t) for t in r["tags"]]
         ]
     clusters: dict[tuple[str, ...], list[dict]] = {}
-    for row in rows:
+    for row in src_rows:
         tags = row.get("tags")
         if isinstance(tags, list) and tags:
             sig = tuple(sorted({str(t) for t in tags}))
@@ -984,12 +1026,199 @@ def _pick_cluster(rows: list[dict], cluster_tag: Any) -> tuple[str, list[dict]]:
     return ",".join(sig), cluster
 
 
+def _compress_idempotent_enabled() -> bool:
+    """幂等开关：env TM_COMPRESS_IDEMPOTENT 优先，其次 config:agent:compress_idempotent，
+    默认 True（新安全行为）。永不抛。"""
+    env_raw = os.environ.get("TM_COMPRESS_IDEMPOTENT")
+    if env_raw is not None and env_raw != "":
+        return env_raw.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        return bool(config_store.get_cached("config:agent:compress_idempotent", True))
+    except Exception:  # noqa: BLE001 - 读失败退守安全默认（开启）
+        return True
+
+
+def _compress_supersede_enabled() -> bool:
+    """取代式退役开关：env TM_COMPRESS_SUPERSEDE 优先，其次 config:agent:compress_supersede，
+    默认 True（新安全行为）。永不抛。"""
+    env_raw = os.environ.get("TM_COMPRESS_SUPERSEDE")
+    if env_raw is not None and env_raw != "":
+        return env_raw.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        return bool(config_store.get_cached("config:agent:compress_supersede", True))
+    except Exception:  # noqa: BLE001 - 读失败退守安全默认（开启）
+        return True
+
+
+def _cluster_group(cluster_tag: str) -> str:
+    """supersede 链的稳定分组键 = md5(cluster_tag)[:8]，与既有 card_id 中段 sig 同源
+    （governance_tools 历史卡 id = idxcard-{group}-{ts}），故可对无 cluster_group 字段的
+    老卡用 id 前缀 idxcard-{group}- 兜底匹配。"""
+    return hashlib.md5(cluster_tag.encode("utf-8")).hexdigest()[:8]
+
+
+def _cluster_fingerprint(cluster: list[dict]) -> str:
+    """该簇当前快照的确定性指纹（幂等键）。对 sorted(source_ids) 敏感（源增删立即
+    变指纹 → 触发取代）+ 含内容/时间分量（每行 updatedAt|createdAt + text 前 512
+    字符 → 捕捉「源被原地编辑、id 不变」）。纯函数，预览与执行共用避免分叉。"""
+    src_ids_sorted = sorted(str(r.get("id") or "") for r in cluster)
+    content_digest = hashlib.md5(
+        "\x00".join(
+            f"{rid}\x01{r.get('updatedAt') or r.get('createdAt') or ''}\x01"
+            f"{(r.get('text') or '')[:512]}"
+            for rid, r in sorted(
+                ((str(x.get("id") or ""), x) for x in cluster), key=lambda kv: kv[0]
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return hashlib.sha256(
+        ("|".join(src_ids_sorted) + "::" + content_digest).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _card_source_ids(row: dict) -> set[str]:
+    """一张索引卡总结的源 id 集（metadata.source_ids），无字段 → 空集。"""
+    meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    return {str(s) for s in (meta.get("source_ids") or [])}
+
+
+def _find_prior_cards(
+    rows: list[dict], group: str, cur_source_ids: Optional[set[str]] = None
+) -> list[dict]:
+    """找该簇已存在的当前（active）索引卡。判定该卡是否属于当前簇，按以下任一命中：
+
+      1. **source_ids 集匹配（兜底真相）**：卡 metadata.source_ids 与当前簇源集相等，
+         或强重叠（Jaccard ≥ 0.5）—— 无论历史 tag 串变化 / 缺 cluster_group / id 前缀
+         哈希不同，只要总结的是同一批源就识别为该簇的卡（修 Bug 2 历史孤儿漏抓）；
+      2. **cluster_group==group（快速路径，新卡）**；
+      3. **id 前缀 idxcard-{group}-（快速路径，老卡无 cluster_group 字段时兜底）**。
+
+    prior 可为多张（历史曾堆多张近重复 / 不同时期 tag 串下的卡），调用方据指纹决定
+    skip / consolidate / supersede，最终该簇只留一张当前卡。"""
+    prior: list[dict] = []
+    for r in rows:
+        if not _is_index_card_row(r):
+            continue
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        rid = str(r.get("id") or "")
+        if meta.get("cluster_group") == group or rid.startswith(f"idxcard-{group}-"):
+            prior.append(r)
+            continue
+        # source_ids 兜底匹配：group 哈希不同 / 无字段的历史老卡，只要总结的是同一批
+        # 源（集相等或强重叠）就纳入该簇，避免残留孤儿（Bug 2 idxcard-39190d8e 案）。
+        if cur_source_ids:
+            card_src = _card_source_ids(r)
+            if card_src and _source_ids_match(card_src, cur_source_ids):
+                prior.append(r)
+    return prior
+
+
+def _source_ids_match(card_src: set[str], cur_src: set[str]) -> bool:
+    """卡的源集 vs 当前簇源集是否「同一批源」：相等，或 Jaccard 重叠 ≥ 0.5（稳健阈值
+    —— 簇随时间增删少量源时仍认定同簇，避免哈希/字段漂移导致孤儿；阈值偏高以防
+    误并不相干的卡）。"""
+    if card_src == cur_src:
+        return True
+    inter = len(card_src & cur_src)
+    union = len(card_src | cur_src)
+    return union > 0 and (inter / union) >= 0.5
+
+
+def _compress_decision(rows: list[dict], cluster_tag: str, cluster: list[dict]) -> dict:
+    """纯函数：算出本次 compress 的决策（预览与执行共用，永不分叉）。
+
+    返回 {action, fingerprint, group, prior_ids, existing_card_id, match_card_id,
+          stale_ids, new_source_count}：
+      * action='skip_unchanged' —— 恰一张 prior 且其 cluster_fingerprint==本次指纹；
+      * action='consolidate' —— prior ≥2 张，其中一张 fingerprint==本次（内容没变，
+        多余的是历史孤儿/近重复卡）→ 廉价合并：保留那张、其余退役，**不调 LLM**；
+      * action='supersede' —— 有 prior 但无一张匹配指纹（内容变了）→ 重总结新卡，
+        所有 prior 退役；
+      * action='first_card' —— 无 prior。
+    幂等/取代开关关闭时由调用方覆盖为旧 append 行为，本函数只给「理想态」。"""
+    fingerprint = _cluster_fingerprint(cluster)
+    group = _cluster_group(cluster_tag)
+    cur_src = {str(r.get("id") or "") for r in cluster}
+    prior = _find_prior_cards(rows, group, cur_src)
+    prior_ids = [str(r.get("id") or "") for r in prior]
+    # 指纹匹配的 active 卡（内容与当前簇一致的那张，可能不止找到一张取第一张）。
+    match_id = next(
+        (str(r.get("id") or "") for r in prior
+         if (r.get("metadata") or {}).get("cluster_fingerprint") == fingerprint),
+        None,
+    )
+    # 自上次以来新增源数：本次源集相对所有 prior 卡记录 source_ids 并集的差集大小。
+    prior_src: set[str] = set()
+    for r in prior:
+        prior_src |= _card_source_ids(r)
+    new_source_count = len(cur_src - prior_src)
+    if not prior:
+        action = "first_card"
+        existing_card_id = None
+        stale_ids: list[str] = []
+    elif match_id is not None and len(prior) == 1:
+        action = "skip_unchanged"
+        existing_card_id = match_id
+        stale_ids = []
+    elif match_id is not None:
+        # 有匹配卡 + 多余孤儿 → 廉价合并：保留匹配卡，退役其余（不调 LLM）。
+        action = "consolidate"
+        existing_card_id = match_id
+        stale_ids = [pid for pid in prior_ids if pid != match_id]
+    else:
+        action = "supersede"
+        existing_card_id = prior_ids[0] if len(prior) == 1 else None
+        stale_ids = list(prior_ids)
+    return {
+        "action": action,
+        "fingerprint": fingerprint,
+        "group": group,
+        "prior_ids": prior_ids,
+        "existing_card_id": existing_card_id,
+        # 廉价合并/取代时实际要退役的卡（consolidate 排除保留卡；supersede 为全部）。
+        "match_card_id": match_id,
+        "stale_ids": stale_ids,
+        "new_source_count": new_source_count,
+    }
+
+
+def _retire_cards(
+    container: str, rows: list[dict], stale_set: set[str], superseded_by: str, ts: int
+) -> tuple[list[dict], str]:
+    """把 stale_set 里的卡移出 active 主文件 → 写 governance/superseded-cards-{ts}.jsonl
+    可逆快照（退出 search/embed）。返回 (保留的行, 快照路径)。supersede 与廉价
+    consolidate 共用，确保两条退役路径行为一致、可逆、不硬删。"""
+    retained = [r for r in rows if str(r.get("id") or "") not in stale_set]
+    moved_out: list[dict] = []
+    for r in rows:
+        if str(r.get("id") or "") in stale_set:
+            meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+            meta = dict(meta)
+            meta["status"] = "superseded"
+            meta["superseded_by"] = superseded_by
+            moved_out.append({**r, "metadata": meta})
+    gov_dir = _governance_dir(container)
+    snap_path = str(_atomic_write_jsonl(
+        gov_dir / f"superseded-cards-{ts}.jsonl", moved_out))
+    return retained, snap_path
+
+
 async def _invoke_compress_knowledge_cluster(
     container: Optional[str], params: dict
 ) -> dict[str, Any]:
-    """真执行（附加式）：同主题（同 tags 簇）记忆经网关 LLM 压缩成一张高密度
-    索引卡，作为**新行** append 进 memory_objects.jsonl —— 源记忆零删除，
-    回滚 = 删掉这一行新卡。簇 <2 不压缩（单条无聚合价值，省一次 LLM 调用）。"""
+    """真执行（幂等 / 取代式 / 排除 index-card）：同主题（同 tags 簇）记忆经网关
+    LLM 压缩成一张高密度索引卡。三态行为（默认开启，可经 config/env 回退旧 append）：
+
+      * skip_unchanged —— 簇源集指纹与当前卡一致 → 不调 LLM、不产卡，返回既有 card_id；
+      * first_card —— 簇无当前卡 → 照常 map-reduce 产卡，metadata 写指纹/group；
+      * supersede —— 簇有当前卡但指纹变了 → 重总结新卡，旧卡移出 active（写
+        governance/superseded-cards-{ts}.jsonl 可逆快照、退出 search/embed），始终只
+        留一张当前卡。
+
+    index-card 行永不进簇（_pick_cluster 显式排除）→ 卡永不被二次总结。簇 <2 不压缩。
+    并发：_read_memory_rows→改→_atomic_write_jsonl 全量重写非事务，与 server 端
+    /ingest-memory/objects 并发写同一 jsonl 有 last-writer-wins 风险（治理操作低频可接受，
+    与既有 quarantine 同风险，未加锁）。"""
     if not container:
         return _result("compress_knowledge_cluster", "error", container, {}, False,
                        "container is required for cluster compression")
@@ -1001,6 +1230,71 @@ async def _invoke_compress_knowledge_cluster(
             {"cluster_tag": cluster_tag, "cluster_size": len(cluster)}, False,
             "no cluster ≥2 — nothing to compress",
         )
+    idempotent = _compress_idempotent_enabled()
+    supersede = _compress_supersede_enabled()
+    decision = _compress_decision(rows, cluster_tag, cluster)
+    action = decision["action"]
+    fingerprint = decision["fingerprint"]
+    group = decision["group"]
+    prior_ids = decision["prior_ids"]
+    # 幂等短路：指纹与既有当前卡一致 → 不调 LLM、不写盘，返回既有 card_id（目标 #1）。
+    # 顶层 status 必须是 ToolInvokeResponse.Literal 合法值——跳过是「成功且无副作用」，
+    # 故顶层用 'ok'（不可用 'skipped_unchanged'，那不在 Literal 内会令响应校验 500）；
+    # 「跳过」语义由 result.action='skipped_unchanged' 表达，与 supersede 用
+    # result.action='superseded' 的约定一致。
+    if idempotent and action == "skip_unchanged":
+        return _result(
+            "compress_knowledge_cluster", "ok", container,
+            {
+                "action": "skipped_unchanged",
+                "card_id": decision["existing_card_id"],
+                "cluster_tag": cluster_tag,
+                "cluster_size": len(cluster),
+                "cluster_fingerprint": fingerprint,
+                "cluster_group": group,
+                "reindex_required": False,
+            },
+            False,
+            f"cluster unchanged since last compression (fingerprint {fingerprint}) "
+            f"— kept existing index card {decision['existing_card_id']}, "
+            "no LLM call, no new card",
+        )
+    # 廉价合并（无 LLM）：已有一张指纹匹配的 active 卡 + 多余历史孤儿/近重复卡
+    # （含 group 哈希不同、靠 source_ids 兜底匹配上的老卡）→ 内容没变，不重新总结，
+    # 只把多余卡退役（移出 active → governance 快照，可逆），保留那张匹配卡为唯一
+    # active。修 Bug 2：历史孤儿（如 idxcard-39190d8e）也被纳入并退役，终态恰一张。
+    if idempotent and supersede and action == "consolidate" and decision["stale_ids"]:
+        ts = int(time.time())
+        match_id = decision["existing_card_id"]
+        stale_ids = list(decision["stale_ids"])
+        retained, snap_path = _retire_cards(
+            container, rows, set(stale_ids), str(match_id), ts)
+        _atomic_write_jsonl(_memory_objects_file(container), retained)
+        return _result(
+            "compress_knowledge_cluster", "applied", container,
+            {
+                "action": "consolidated",
+                "card_id": match_id,
+                "cluster_tag": cluster_tag,
+                "cluster_size": len(cluster),
+                "cluster_fingerprint": fingerprint,
+                "cluster_group": group,
+                "supersedes": stale_ids,
+                "superseded_count": len(stale_ids),
+                "superseded_path": snap_path,
+                "reindex_required": False,
+            },
+            True,
+            f"cheap consolidation (no LLM) — kept fingerprint-matching card "
+            f"{match_id}, retired {len(stale_ids)} stale/orphan card(s) to "
+            "governance snapshot (reversible); content unchanged",
+        )
+    # 关掉幂等/取代两开关 → 退回旧「无脑追加」行为（灰度/回退）：当作 first_card，
+    # 不退役任何 prior，纯 append（保留历史 append 语义）。
+    do_supersede = supersede and bool(prior_ids)
+    if not idempotent and not supersede:
+        action = "first_card"
+        do_supersede = False
     # map-reduce 字节预算分批：把簇切到每批 prompt < batch_byte_budget（UTF-8），
     # 防整簇拼成单条 prompt 越过上游网关 10 MiB 输入硬限触发 400。
     batch_byte_budget = _compress_batch_bytes()
@@ -1029,13 +1323,16 @@ async def _invoke_compress_knowledge_cluster(
     else:
         card_text = partial_cards[0]
     ts = int(time.time())
-    sig = hashlib.md5(cluster_tag.encode("utf-8")).hexdigest()[:8]
     source_ids = [str(r.get("id") or "") for r in cluster]
     tags = sorted({
         str(t) for r in cluster for t in (r.get("tags") or []) if str(t) != "index-card"
     })
+    # card_id 中段 = group（稳定分组键，便于老卡前缀兜底匹配）+ fingerprint 前 8 位
+    # （内容敏感）→ 同 group 内不同快照得到不同 id，避免同秒重跑 ts 相同时旧/新卡 id
+    # 碰撞（supersede 重写时旧卡被新卡同 id 顶掉、退役链断裂）。
+    card_suffix = f"{group}-{fingerprint[:8]}-{ts}"
     card = {
-        "id": f"idxcard-{sig}-{ts}",
+        "id": f"idxcard-{card_suffix}",
         "title": f"[索引卡] {cluster_tag}",
         "text": card_text,
         "tags": [*tags, "index-card"],
@@ -1044,24 +1341,53 @@ async def _invoke_compress_knowledge_cluster(
             "source_ids": source_ids,
             "generated_by": "compress_knowledge_cluster",
             "llm_model": os.environ.get("LLM_MODEL"),
+            # 幂等键：对 sorted(source_ids)+内容摘要敏感（见 _cluster_fingerprint）。
+            "cluster_fingerprint": fingerprint,
+            # supersede 链稳定分组键 = md5(cluster_tag)[:8]，与 card_id 中段同源。
+            "cluster_group": group,
+            "status": "active",
+            "generated_at": ts,
         },
     }
-    _atomic_write_jsonl(_memory_objects_file(container), [*rows, card])
+    if do_supersede:
+        card["metadata"]["supersedes"] = list(prior_ids)
+    # 写盘：取代式 → 把 prior 旧卡移出 active 主文件（写 governance 可逆快照、退出
+    # search/embed），始终只留一张当前卡；first_card / 旧 append 模式 → 纯追加。
+    superseded_path: Optional[str] = None
+    if do_supersede:
+        retained, superseded_path = _retire_cards(
+            container, rows, set(prior_ids), card["id"], ts)
+        _atomic_write_jsonl(_memory_objects_file(container), [*retained, card])
+    else:
+        _atomic_write_jsonl(_memory_objects_file(container), [*rows, card])
     result = {
+        "action": "superseded" if do_supersede else "first_card",
         "card_id": card["id"],
         "source_ids": source_ids,
         "cluster_tag": cluster_tag,
         "cluster_size": len(cluster),
         "batch_count": len(batches),
         "llm_model": os.environ.get("LLM_MODEL"),
+        "cluster_fingerprint": fingerprint,
+        "cluster_group": group,
         "reindex_required": True,
     }
+    if do_supersede:
+        result["supersedes"] = list(prior_ids)
+        result["superseded_count"] = len(prior_ids)
+        result["superseded_path"] = superseded_path
     reduce_note = (f" via {len(batches)}-batch map-reduce"
                    if len(batches) > 1 else "")
+    if do_supersede:
+        notes = (
+            f"index card superseded {len(prior_ids)} prior card(s) from "
+            f"{len(cluster)} source rows{reduce_note} "
+            "(prior moved to governance snapshot — reversible; sources kept)")
+    else:
+        notes = (f"index card appended from {len(cluster)} source rows"
+                 f"{reduce_note} (sources kept)")
     return _result(
-        "compress_knowledge_cluster", "applied", container, result, True,
-        f"index card appended from {len(cluster)} source rows"
-        f"{reduce_note} (sources kept)",
+        "compress_knowledge_cluster", "applied", container, result, True, notes,
     )
 
 
