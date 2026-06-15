@@ -377,6 +377,7 @@ def default_command_resolver(scripts_dir: Path) -> Callable[[Job], list[str]]:
     - 'embed-backlog-retry' → task_rag_lancedb_ingest.py --mode embed-backlog-retry
     - 'ingest-structured' → task_rag_structured_ingest.py
     - 'ingest-document-text' / 'ingest-document-file' → task_rag_graph_ingest.py
+    - 'run-agent' → governance_agent_runner.py (opt-in governance orchestration)
     """
     scripts_dir = Path(scripts_dir)
 
@@ -431,6 +432,27 @@ def default_command_resolver(scripts_dir: Path) -> Callable[[Job], list[str]]:
             parse_method = job.payload.get("parse_method")
             if parse_method:
                 cmd += ["--parse-method", str(parse_method)]
+            return cmd
+        if job.op == "run-agent":
+            # Governance-agent orchestration (opt-in, gated server-side by
+            # TM_AGENT_ORCHESTRATION_ENABLED — a default deploy never enqueues
+            # this op). The endpoint mints run_id, writes the params file, and
+            # the runner self-enforces its own step / wall-clock ceiling, so the
+            # blast radius is bounded even on the shared worker.
+            cmd = [
+                str(scripts_dir / "governance_agent_runner.py"),
+                "--container", job.container,
+                "--agent-name", str(job.payload.get("agent_name") or "dream-orchestrator"),
+                "--run-id", str(job.payload.get("run_id") or ""),
+            ]
+            goal = job.payload.get("goal")
+            if goal:
+                cmd += ["--goal", str(goal)]
+            params_path = job.payload.get("params_path")
+            if params_path:
+                cmd += ["--params-file", str(params_path)]
+            if job.payload.get("allow_apply"):
+                cmd += ["--allow-apply"]
             return cmd
         raise ValueError(f"unknown op: {job.op}")
 
