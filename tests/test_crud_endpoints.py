@@ -30,6 +30,13 @@ def _read_jsonl(workspace: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
 
 
+def _append_raw_line(workspace: Path, raw: str) -> None:
+    path = workspace / "tasks" / "rag" / "containers" / CONTAINER / "memory_objects.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(raw.rstrip("\n") + "\n")
+
+
 def test_update_memory(tmp_path: Path, monkeypatch):
     workspace = make_workspace(tmp_path)
     server = load_server(workspace, monkeypatch)
@@ -101,3 +108,43 @@ def test_delete_memory_not_found(tmp_path: Path, monkeypatch):
         headers=auth_headers(),
     )
     assert resp.status_code == 404
+
+
+def test_update_memory_tolerates_corrupt_sibling_row(tmp_path: Path, monkeypatch):
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    client = TestClient(server.app)
+
+    _seed_object(client, "obj-001", "original text")
+    _seed_object(client, "obj-002", "second row")
+    _append_raw_line(workspace, '{"id":"broken","text":"oops"')
+
+    resp = client.put(
+        f"/containers/{CONTAINER}/memories/obj-001",
+        headers=auth_headers(),
+        json={"text": "updated text"},
+    )
+    assert resp.status_code == 200
+
+    rows = _read_jsonl(workspace)
+    assert {row["id"] for row in rows} == {"obj-001", "obj-002"}
+    assert next(row for row in rows if row["id"] == "obj-001")["text"] == "updated text"
+
+
+def test_delete_memory_tolerates_corrupt_sibling_row(tmp_path: Path, monkeypatch):
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    client = TestClient(server.app)
+
+    _seed_object(client, "obj-del", "to be deleted")
+    _seed_object(client, "obj-keep", "keep me")
+    _append_raw_line(workspace, '{"id":"broken","text":"oops"')
+
+    resp = client.delete(
+        f"/containers/{CONTAINER}/memories/obj-del",
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+
+    rows = _read_jsonl(workspace)
+    assert {row["id"] for row in rows} == {"obj-keep"}

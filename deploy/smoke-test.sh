@@ -231,8 +231,32 @@ sys.exit(2 if (d.get('detail') or d.get('error')) else 0)
     pass "/search against $PROD_CONTAINER reached LanceDB without dim mismatch"
 fi
 
-# 13. Frontend Playwright E2E assertions
-info "13. running frontend Playwright E2E assertions"
+# 13. Existing-container /memories read guard — catches corrupt JSONL rows in a
+# live production container. Uses read-only pagination (no writes against real
+# data) and requires valid JSON with a 200-style payload.
+info "13. /containers/{name}/memories against an existing production container"
+if [ -z "$PROD_CONTAINER" ]; then
+    info "  no pre-existing production container found, skipping memories list guard"
+else
+    LIST_RESP="$(req GET "/containers/$PROD_CONTAINER/memories?limit=1&offset=0")"
+    if ! echo "$LIST_RESP" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(
+    0 if isinstance(d, dict)
+    and isinstance(d.get('items'), list)
+    and 'total' in d
+    and d.get('offset') == 0
+    else 1
+)
+" 2>/dev/null; then
+        fail "/containers/$PROD_CONTAINER/memories failed JSON/shape validation: $LIST_RESP"
+    fi
+    pass "/containers/$PROD_CONTAINER/memories returned readable JSON"
+fi
+
+# 14. Frontend Playwright E2E assertions
+info "14. running frontend Playwright E2E assertions"
 if [ ! -d "$PROJECT_ROOT/dashboard/node_modules/@playwright/test" ]; then
     info "  installing E2E dependencies in dashboard..."
     pnpm --prefix "$PROJECT_ROOT/dashboard" install --prod=false
@@ -241,11 +265,11 @@ TM_TEST_BASE="$ENDPOINT" TM_TEST_API_KEY="$RAG_API_KEY" TM_TEST_CONTAINER="$CONT
   pnpm --prefix "$PROJECT_ROOT/dashboard" exec playwright test || fail "Frontend E2E test failed"
 pass "Frontend E2E assertions passed"
 
-# 14. Redis governance dep connectivity (blueprint P0). Redis is a SOFT
+# 15. Redis governance dep connectivity (blueprint P0). Redis is a SOFT
 # dependency — the app degrades gracefully when it's down — so a failed ping
 # WARNS but does NOT fail the smoke test. This only runs when a redis compose
 # service is present (skipped on hosts that haven't adopted the redis service).
-info "14. redis governance connectivity probe (soft)"
+info "15. redis governance connectivity probe (soft)"
 if command -v docker >/dev/null 2>&1 \
    && (cd "$PROJECT_ROOT" && docker compose ps --services 2>/dev/null | grep -qx redis); then
     if (cd "$PROJECT_ROOT" && docker compose exec -T redis redis-cli ping 2>/dev/null | grep -qi PONG); then
@@ -258,5 +282,4 @@ else
 fi
 
 echo ""
-echo -e "${GREEN}=== all smoke checks passed (14 steps: core + admin/ui + dim-drift guard + frontend E2E + redis probe) ===${NC}"
-
+echo -e "${GREEN}=== all smoke checks passed (15 steps: core + admin/ui + dim-drift guard + memories list guard + frontend E2E + redis probe) ===${NC}"

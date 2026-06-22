@@ -11,6 +11,10 @@ from fastapi.testclient import TestClient
 CONTAINER = "listtest"
 
 
+def _objects_path(workspace: Path) -> Path:
+    return workspace / "tasks" / "rag" / "containers" / CONTAINER / "memory_objects.jsonl"
+
+
 def _seed_objects(client: TestClient, count: int) -> None:
     """顺序写入 count 个对象（ids obj-000..obj-N），storedAt 由 server 注入。"""
     objects = [
@@ -23,6 +27,14 @@ def _seed_objects(client: TestClient, count: int) -> None:
         json={"container": CONTAINER, "objects": objects},
     )
     assert resp.status_code == 200, resp.text
+
+
+def _append_raw_lines(workspace: Path, *lines: str) -> None:
+    path = _objects_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for line in lines:
+            fh.write(line.rstrip("\n") + "\n")
 
 
 def test_list_memories_default_returns_all(tmp_path: Path, monkeypatch):
@@ -112,6 +124,31 @@ def test_list_memories_requires_auth(tmp_path: Path, monkeypatch):
 
     resp = client.get(f"/containers/{CONTAINER}/memories")
     assert resp.status_code in (401, 403)
+
+
+def test_list_memories_skips_corrupt_and_non_dict_rows(tmp_path: Path, monkeypatch, caplog):
+    workspace = make_workspace(tmp_path)
+    server = load_server(workspace, monkeypatch)
+    client = TestClient(server.app)
+    _seed_objects(client, 2)
+    _append_raw_lines(
+        workspace,
+        '{"id":"broken","text":"oops"',
+        '["not-a-dict"]',
+    )
+
+    caplog.set_level("WARNING", logger="transcendence-memory-server")
+    caplog.clear()
+    resp = client.get(f"/containers/{CONTAINER}/memories", headers=auth_headers())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert {item["id"] for item in body["items"]} == {"obj-000", "obj-001"}
+
+    warnings = [r for r in caplog.records if "memory_objects_skip_bad_lines" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "container=listtest" in warnings[0].getMessage()
+    assert "skipped=2" in warnings[0].getMessage()
 
 
 # ---- _humanize_search_failure：搜索失败文案带原因，不再裸透传退出码 ----

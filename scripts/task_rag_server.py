@@ -2420,17 +2420,47 @@ def read_memory_objects(container: str) -> list[dict]:
     """读取 container 下的 memory_objects.jsonl，返回 dict 列表。
 
     Iterates line-by-line so peak RAM is one parsed row, not the whole file.
+    Malformed / non-dict rows are skipped with one summary warning so a single
+    corrupt line does not take down the entire container view.
     """
     path = memory_objects_path(container)
     _check_memory_objects_size(path, op='read_memory_objects')
     if not path.exists():
         return []
     rows: list[dict] = []
+    skipped = 0
+    first_bad_line: int | None = None
+    first_bad_reason: str | None = None
     with path.open('r', encoding='utf-8') as fh:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             line = line.strip()
-            if line:
-                rows.append(json.loads(line))
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                skipped += 1
+                if first_bad_line is None:
+                    first_bad_line = line_no
+                    first_bad_reason = f'{type(exc).__name__}: {exc.msg}'
+                continue
+            if not isinstance(row, dict):
+                skipped += 1
+                if first_bad_line is None:
+                    first_bad_line = line_no
+                    first_bad_reason = f'non-dict JSON value ({type(row).__name__})'
+                continue
+            rows.append(row)
+    if skipped:
+        logger.warning(
+            'memory_objects_skip_bad_lines container=%s path=%s skipped=%d '
+            'first_bad_line=%s first_bad_reason=%s',
+            container,
+            path,
+            skipped,
+            first_bad_line,
+            first_bad_reason or 'unknown',
+        )
     return rows
 
 

@@ -36,7 +36,7 @@ _DEFAULT_LLM_MAX_RETRIES = 4
 _LEGACY_DEFAULT_MODEL = "text-embedding-3-small"
 _LEGACY_DEFAULT_DIM = 1024
 _LEGACY_DEFAULT_BASE_URL = "https://api.openai.com/v1"
-_LEGACY_DEFAULT_LLM_MODEL = "gemini-2.5-flash"
+_LEGACY_DEFAULT_LLM_MODEL = "gemini-3.1-flash-lite-preview"
 # Phase 1：union 多容器子查询 per-container timeout 默认（秒）。旧 12.0 误杀冷启动主容器。
 _DEFAULT_UNION_PER_CONTAINER_TIMEOUT_S = 30.0
 # v1：仅 embedding + reranker；v2：新增 llms / vlms 节点与 route 的 LLM/VLM 字段。

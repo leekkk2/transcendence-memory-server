@@ -411,7 +411,7 @@ async def embed_texts_async(
 # caption；caption 再走 document 文本 embedding 存为兄弟行，闭合「文本查媒体」
 # 的模态间隙。复用 embedding profile 的 base_url + api_key（同一 relay、同一
 # 鉴权 token），避开独立 VLM 网关的可用性风险。VLM 模型 id 可经 env 覆盖。
-_DEFAULT_CAPTION_MODEL = os.environ.get('GE2_CAPTION_VLM_MODEL', 'gemini-2.5-flash-lite')
+_DEFAULT_CAPTION_MODEL = os.environ.get('GE2_CAPTION_VLM_MODEL', 'gemini-3.1-flash-lite-preview')
 
 _CAPTION_PROMPT = (
     'Describe this media concisely and factually for search retrieval. '

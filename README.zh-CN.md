@@ -53,7 +53,7 @@ Transcendence Memory Server 是一个云端记忆后端，多个 AI Agent 可以
 4. LLM / Embedding / 视觉模型配置：
    • LLM_BASE_URL=<你的 LLM 服务地址>        # 例如 https://api.openai.com/v1
    • LLM_API_KEY=<你的 LLM 密钥>
-   • LLM_MODEL=<你的 LLM 模型>               # 例如 gpt-4o、claude-sonnet-4-20250514、gemini-2.5-flash
+   • LLM_MODEL=<你的 LLM 模型>               # 例如 gpt-4o、claude-sonnet-4-20250514、gemini-3.1-flash-lite-preview
    • EMBEDDING_BASE_URL=<你的 Embedding 服务地址>
    • EMBEDDING_API_KEY=<你的 Embedding 密钥>
    • EMBEDDING_MODEL=<你的 Embedding 模型>    # 例如 text-embedding-3-small、gemini-embedding-001
@@ -251,7 +251,7 @@ export EMBEDDING_API_KEY="your-key"
 | `EMBEDDING_BASE_URL` | 否 | 全部 | Embedding 服务地址（默认 OpenAI） |
 | `EMBEDDING_MODEL` | 否 | 全部 | 模型名（默认 gemini-embedding-001） |
 | `LLM_API_KEY` | 否 | lightrag+ | LLM 密钥（知识图谱） |
-| `LLM_MODEL` | 否 | lightrag+ | LLM 模型（默认 gemini-2.5-flash） |
+| `LLM_MODEL` | 否 | lightrag+ | LLM 模型（默认 gemini-3.1-flash-lite-preview） |
 | `VLM_API_KEY` | 否 | everything | 视觉模型密钥 |
 | `VLM_MODEL` | 否 | everything | 视觉模型（默认 qwen3-vl-plus） |
 

@@ -360,9 +360,9 @@ def test_parse_caption_ok_and_errors():
 
 
 def test_generate_caption_endpoint():
-    url = gne._generate_content_endpoint("https://relay.test", "gemini-2.5-flash-lite")
+    url = gne._generate_content_endpoint("https://relay.test", "gemini-3.1-flash-lite-preview")
     assert url == (
-        "https://relay.test/v1beta/models/gemini-2.5-flash-lite:generateContent"
+        "https://relay.test/v1beta/models/gemini-3.1-flash-lite-preview:generateContent"
     )
 
 
