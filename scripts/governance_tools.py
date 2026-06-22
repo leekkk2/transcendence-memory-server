@@ -884,7 +884,7 @@ def _invoke_snapshot_and_quarantine(
 # 经 tokenizer 变 token，纯 ASCII 约 4 字节/token、CJK UTF-8 约 1.5 字节/token（3 字节/
 # 字节是 token 的弱代理：CJK UTF-8 3 字节/字符 ≈ 1 token/字符，比 ASCII 更费 token；
 # 用重复字符（如 'x'）探测网关 context 上限会严重高估真实/CJK 内容能塞的字节数。
-# 真实内容实测（混合 CJK+Latin acc-demo bigcluster 直探 gpt-5.4-mini via 网关）：
+# 真实内容实测（混合 CJK+Latin acc-demo bigcluster 直探 gemini-3.1-flash-lite-preview via 网关）：
 #   768 KiB（786432 B）→ 200 OK
 #   1 MiB（1048576 B）→ HTTP 400 code=context_too_large
 # 叠加 compress 自身 _INDEX_CARD_SYSTEM_PROMPT + 每行格式开销 + 输出 token 预留，

@@ -53,7 +53,7 @@ Please install and configure transcendence-memory-server for me:
 4. LLM / Embedding / Vision config:
    • LLM_BASE_URL=<YOUR_LLM_ENDPOINT>       # e.g. https://api.openai.com/v1
    • LLM_API_KEY=<YOUR_LLM_KEY>
-   • LLM_MODEL=<YOUR_LLM_MODEL>             # e.g. gpt-4o, claude-sonnet-4-20250514, gemini-2.5-flash
+   • LLM_MODEL=<YOUR_LLM_MODEL>             # e.g. gpt-4o, claude-sonnet-4-20250514, gemini-3.1-flash-lite-preview
    • EMBEDDING_BASE_URL=<YOUR_EMBED_ENDPOINT>
    • EMBEDDING_API_KEY=<YOUR_EMBED_KEY>
    • EMBEDDING_MODEL=<YOUR_EMBED_MODEL>      # e.g. text-embedding-3-small, gemini-embedding-001
@@ -270,7 +270,7 @@ All settings via `.env` file (see [.env.example](.env.example)):
 | `EMBEDDING_BASE_URL` | No | All | Embedding endpoint (default: OpenAI) |
 | `EMBEDDING_MODEL` | No | All | Model name (default: gemini-embedding-001) |
 | `LLM_API_KEY` | No | lightrag+ | LLM API key for knowledge graph |
-| `LLM_MODEL` | No | lightrag+ | LLM model (default: gemini-2.5-flash) |
+| `LLM_MODEL` | No | lightrag+ | LLM model (default: gemini-3.1-flash-lite-preview) |
 | `VLM_API_KEY` | No | everything | Vision model API key |
 | `VLM_MODEL` | No | everything | Vision model (default: qwen3-vl-plus) |
 

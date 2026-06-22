@@ -41,7 +41,7 @@ sys.modules.setdefault('model_fallback', model_fallback)
 sys.modules.setdefault('scripts.model_fallback', model_fallback)
 
 # LLM 仍由 env 直接驱动（multi-LLM 升级是后续 phase，本次只动 embedding）。
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.1-flash-lite-preview")
 # LLM_BASE_URL / LLM_API_KEY 历史上 fallback 到 EMBEDDING_BASE_URL / EMBEDDING_API_KEY；
 # 保留 fallback 以避免现有 .env 配置（很多部署只配了一对 base/key）失效。
 LLM_BASE_URL = (

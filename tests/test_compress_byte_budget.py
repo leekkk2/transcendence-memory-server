@@ -29,12 +29,12 @@ os.environ.setdefault("TM_REDIS_ENABLED", "0")
 import config_store  # noqa: E402
 import governance_tools  # noqa: E402
 
-# 真实内容实测的网关 context 边界（混合 CJK+Latin acc-demo bigcluster 直探 gpt-5.4-mini）：
+# 真实内容实测的网关 context 边界（混合 CJK+Latin acc-demo bigcluster 直探 gemini-3.1-flash-lite-preview）：
 #   768 KiB (786432 B)  → 200 OK（实测成功上限）
 #   1 MiB  (1048576 B)  → HTTP 400 code=context_too_large（实测失败阈值）
 # 注：重复字符（如 'x'）探测会因 tokenizer 合并被严重高估；此处为真实混合内容实测。
 # CJK UTF-8 3 字节/字符 ≈ 1 token/字符，比 ASCII 更费 token，故安全默认须明显低于此。
-# 来源：本仓 2026-06-15 compress_batch_bytes 真实内容直探会话（gpt-5.4-mini 经网关路由）。
+# 来源：本仓 2026-06-15 compress_batch_bytes 真实内容直探会话（gemini-3.1-flash-lite-preview 经网关路由）。
 CONTEXT_SAFE_CEILING_BYTES = 786_432   # 真实混合内容实测「成功上限」（768 KiB）
 CONTEXT_FAIL_OBSERVED_BYTES = 1_048_576  # 真实混合内容实测「context_too_large 400」（1 MiB）
 
