@@ -5,3 +5,4 @@
 - [2026-07-03 11:34:45] Add a troubleshooting section for database timeouts
 - [2026-07-04 18:40:57] Document the new caching invalidation rules
 - [2026-07-05 20:07:24] Refine the api documentation for memory retrieval
+- [2026-07-06 12:22:14] Fix typos in deployment guide
