@@ -7,3 +7,4 @@
 - [2026-07-05 20:07:24] Refine the api documentation for memory retrieval
 - [2026-07-06 12:22:14] Fix typos in deployment guide
 - [2026-07-07 21:17:25] Add best practices for system prompt engineering
+- [2026-07-08 19:07:32] Document the new observability metrics
