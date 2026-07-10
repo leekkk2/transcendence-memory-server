@@ -9,3 +9,4 @@
 - [2026-07-07 21:17:25] Add best practices for system prompt engineering
 - [2026-07-08 19:07:32] Document the new observability metrics
 - [2026-07-09 20:22:46] Clarify the data privacy policies
+- [2026-07-10 09:54:25] Clarify the role of the orchestrator agent
