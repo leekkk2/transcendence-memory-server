@@ -10,3 +10,4 @@
 - [2026-07-08 19:07:32] Document the new observability metrics
 - [2026-07-09 20:22:46] Clarify the data privacy policies
 - [2026-07-10 09:54:25] Clarify the role of the orchestrator agent
+- [2026-07-11 22:21:08] Add notes on token limit management
