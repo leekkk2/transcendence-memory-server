@@ -13,3 +13,4 @@
 - [2026-07-11 22:21:08] Add notes on token limit management
 - [2026-07-12 17:45:54] Document the new observability metrics
 - [2026-07-13 19:28:05] Add more examples for the memory hook system
+- [2026-07-14 18:17:14] Expand the plugin development tutorial
