@@ -15,3 +15,4 @@
 - [2026-07-13 19:28:05] Add more examples for the memory hook system
 - [2026-07-14 18:17:14] Expand the plugin development tutorial
 - [2026-07-15 21:09:01] Update sequence diagrams for memory injection
+- [2026-07-16 18:25:18] Add a guide on how to write custom memory adapters
