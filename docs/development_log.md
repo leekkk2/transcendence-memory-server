@@ -18,3 +18,4 @@
 - [2026-07-16 18:25:18] Add a guide on how to write custom memory adapters
 - [2026-07-17 21:29:44] Detail the memory pruning strategies
 - [2026-07-18 09:05:08] Document the new caching invalidation rules
+- [2026-07-19 16:46:50] Document the experimental chunking features
