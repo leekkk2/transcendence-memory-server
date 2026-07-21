@@ -136,3 +136,4 @@ def reset_cache() -> None:
     """清除缓存（用于测试）。"""
     global _cached
     _cached = None
+
