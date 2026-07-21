@@ -20,3 +20,4 @@
 - [2026-07-18 09:05:08] Document the new caching invalidation rules
 - [2026-07-19 16:46:50] Document the experimental chunking features
 - [2026-07-20 14:26:53] Expand the plugin development tutorial
+- [2026-07-21 10:13:46] Add notes on token limit management
