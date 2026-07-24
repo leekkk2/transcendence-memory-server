@@ -23,3 +23,4 @@
 - [2026-07-21 10:13:46] Add notes on token limit management
 - [2026-07-22 15:52:17] Update troubleshooting guide
 - [2026-07-23 12:16:04] Clarify the role of the orchestrator agent
+- [2026-07-24 22:17:39] Document the migration steps for v0.20
