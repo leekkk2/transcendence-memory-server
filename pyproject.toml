@@ -64,3 +64,4 @@ addopts = "-q --ignore=tests/test_cli"
 markers = [
     "integration: tests requiring a live external service (e.g. a real Redis); skipped by default unit runs, run in smoke/integration stage",
 ]
+
