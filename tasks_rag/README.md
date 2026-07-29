@@ -17,3 +17,4 @@ Each runtime container under `tasks/rag/containers/<container>/` can hold:
 - Mainline retrieval is `LanceDB-only`
 - Do not store secrets here
 - Mac/Aliyun should call local service; avoid local duplicate deployments
+
