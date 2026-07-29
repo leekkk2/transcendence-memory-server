@@ -28,3 +28,4 @@
 - [2026-07-26 11:13:55] Clarify the role of the orchestrator agent
 - [2026-07-27 19:46:01] Document the webhook integration payloads
 - [2026-07-28 15:08:37] Restructure the developer guide
+- [2026-07-29 19:13:55] Document the webhook integration payloads
