@@ -29,3 +29,4 @@
 - [2026-07-27 19:46:01] Document the webhook integration payloads
 - [2026-07-28 15:08:37] Restructure the developer guide
 - [2026-07-29 19:13:55] Document the webhook integration payloads
+- [2026-07-30 11:12:32] Add notes on agent interaction patterns
