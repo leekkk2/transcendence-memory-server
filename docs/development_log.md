@@ -32,3 +32,4 @@
 - [2026-07-30 11:12:32] Add notes on agent interaction patterns
 - [2026-07-31 13:22:05] Fix typos in deployment guide
 - [2026-08-01 11:25:01] Clean up stale documentation in memory modules
+- [2026-08-02 15:25:56] Document the new observability metrics
