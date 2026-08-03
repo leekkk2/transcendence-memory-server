@@ -67,3 +67,4 @@ echo "[backup-memories] checksum: $(cut -d' ' -f1 "${OUT}.sha256" 2>/dev/null ||
 echo ""
 echo "Restore later with:"
 echo "  bash deploy/backup-memories.sh --restore $OUT"
+
