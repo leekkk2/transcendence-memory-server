@@ -33,3 +33,4 @@
 - [2026-07-31 13:22:05] Fix typos in deployment guide
 - [2026-08-01 11:25:01] Clean up stale documentation in memory modules
 - [2026-08-02 15:25:56] Document the new observability metrics
+- [2026-08-03 15:22:19] Update configuration examples for production
