@@ -158,3 +158,4 @@ def workspace_and_client(tmp_path, monkeypatch):
 
 def auth_headers(key: str = API_KEY) -> dict[str, str]:
     return {"X-API-KEY": key}
+
