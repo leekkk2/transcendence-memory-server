@@ -406,3 +406,4 @@ EXPOSE 8711
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=60s \
     CMD ["python3", "/app/scripts/healthcheck.py"]
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+
