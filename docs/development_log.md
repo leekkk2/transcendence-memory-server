@@ -37,3 +37,4 @@
 - [2026-08-04 22:23:05] Clean up stale documentation in memory modules
 - [2026-08-05 13:59:46] Document the new caching layer
 - [2026-08-06 19:06:46] Document the rate limiting policies
+- [2026-08-07 10:16:33] Add notes on agent interaction patterns
