@@ -222,3 +222,4 @@ routes:
     llm: primary-llm
     vlm: primary-vlm
     rerank: {enabled: false}                         # default 不开 rerank，按需 per-call 启用
+
