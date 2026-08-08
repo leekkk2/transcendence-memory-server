@@ -311,3 +311,4 @@ print('first row meta:', {k: t.to_arrow().slice(0,1).to_pylist()[0].get(k) for k
    ingest writes to the new table with the *old* profile's embedding values
    (because container routing still points to the old profile), creating a
    mixed-vector table.
+
