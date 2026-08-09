@@ -15,3 +15,4 @@ The supported deployment is `docker compose` managed by
 
 If you maintain a non-Docker install: these scripts are reference material,
 not a supported product. The Docker path is what gets CI coverage.
+
