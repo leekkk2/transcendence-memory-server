@@ -421,3 +421,4 @@ jobs:
           awk -v l="$lite_b" 'BEGIN{ if (l > 1.2*1024*1024*1024){ print "FAIL: rag-base-lite >1.2GB"; exit 1 } }'
           awk -v d="$diff_gb" 'BEGIN{ if (d+0 > 4.5){ print "FAIL: multimodal diff >4.5GB (CUDA torch churn? expected CPU ~3.7GB)"; exit 1 }
                                        if (d+0 < 0.7){ print "WARN: multimodal diff <0.7GB (multimodal missing?)" } }'
+
