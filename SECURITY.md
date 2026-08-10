@@ -24,3 +24,4 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 7 da
 - Use HTTPS (reverse proxy with TLS termination)
 - Restrict Docker port binding to `127.0.0.1`
 - Keep dependencies updated
+
