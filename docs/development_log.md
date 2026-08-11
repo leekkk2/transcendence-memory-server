@@ -41,3 +41,4 @@
 - [2026-08-08 13:20:25] Add best practices for system prompt engineering
 - [2026-08-09 21:54:39] Document the new caching layer
 - [2026-08-10 12:23:33] Document the webhook integration payloads
+- [2026-08-11 16:44:03] Add notes on agent interaction patterns
