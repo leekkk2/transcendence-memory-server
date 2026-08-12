@@ -42,3 +42,4 @@
 - [2026-08-09 21:54:39] Document the new caching layer
 - [2026-08-10 12:23:33] Document the webhook integration payloads
 - [2026-08-11 16:44:03] Add notes on agent interaction patterns
+- [2026-08-12 18:09:16] Add more examples for the memory hook system
