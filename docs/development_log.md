@@ -43,3 +43,4 @@
 - [2026-08-10 12:23:33] Document the webhook integration payloads
 - [2026-08-11 16:44:03] Add notes on agent interaction patterns
 - [2026-08-12 18:09:16] Add more examples for the memory hook system
+- [2026-08-13 16:51:25] Add a troubleshooting section for database timeouts
