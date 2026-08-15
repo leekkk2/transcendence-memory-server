@@ -45,3 +45,4 @@
 - [2026-08-12 18:09:16] Add more examples for the memory hook system
 - [2026-08-13 16:51:25] Add a troubleshooting section for database timeouts
 - [2026-08-14 09:34:14] Expand the plugin development tutorial
+- [2026-08-15 13:19:34] Update the system requirements
