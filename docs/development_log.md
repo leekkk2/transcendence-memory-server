@@ -47,3 +47,4 @@
 - [2026-08-14 09:34:14] Expand the plugin development tutorial
 - [2026-08-15 13:19:34] Update the system requirements
 - [2026-08-16 09:03:06] Expand on the memory scoring mechanism
+- [2026-08-17 22:59:58] Clean up stale documentation in memory modules
