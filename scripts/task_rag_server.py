@@ -51,6 +51,8 @@ try:
         ConfigurationGuide,
         ConnectionTokenResponse,
         ContainerDeleteResponse,
+        ContainerRenameRequest,
+        ContainerRenameResponse,
         ContainerListResponse,
         ContainerMetadataPayload,
         ContainerReq,
@@ -112,6 +114,8 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
         ConfigurationGuide,
         ConnectionTokenResponse,
         ContainerDeleteResponse,
+        ContainerRenameRequest,
+        ContainerRenameResponse,
         ContainerListResponse,
         ContainerMetadataPayload,
         ContainerReq,
@@ -2919,6 +2923,115 @@ def delete_container(name: str) -> ContainerDeleteResponse:
         raise HTTPException(status_code=404, detail=f'container not found: {name}')
     shutil.rmtree(target)
     return ContainerDeleteResponse(container=name, deleted=True, message=f'Container {name} deleted.')
+
+
+@app.post(
+    '/containers/{name}/rename',
+    response_model=ContainerRenameResponse,
+    dependencies=[Depends(verify_auth)],
+)
+@app.put(
+    '/containers/{name}/rename',
+    response_model=ContainerRenameResponse,
+    dependencies=[Depends(verify_auth)],
+)
+def rename_container(name: str, req: ContainerRenameRequest) -> ContainerRenameResponse:
+    """物理重命名 canonical 容器。
+    1. 校验 old_name 和 req.new_name 合法性（validate_container_name）。
+    2. 禁止通过 alias 改名（必须为 canonical 容器）。
+    3. 检查 old_name 容器是否存在。
+    4. 检查 req.new_name 容器是否已存在（避免冲突）。
+    5. 检查容器是否正在建索引（indexing 时禁止改名）。
+    6. 重命名物理目录 tasks/rag/containers/<old_name> -> tasks/rag/containers/<new_name>。
+    7. 同步迁移 container_metadata。
+    8. 同步更新 container_aliases（将指向 old_name 的 canonical 映射更新为 new_name）。
+    9. 返回成功响应。
+    """
+    validate_container_name(name)
+    validate_container_name(req.new_name)
+
+    if name == req.new_name:
+        raise HTTPException(status_code=400, detail='old_name and new_name are identical')
+
+    try:
+        alias_row = get_container_aliases_store().resolve(name)
+    except Exception:
+        alias_row = None
+    if alias_row is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                'error': 'cannot_rename_via_alias',
+                'alias': name,
+                'canonical': alias_row.get('canonical'),
+                'hint': (
+                    "POST /containers/{name}/rename accepts only canonical container names. "
+                    f"Retry with the canonical name '{alias_row.get('canonical')}'."
+                ),
+            },
+        )
+
+    old_target = WS / 'tasks' / 'rag' / 'containers' / name
+    if not old_target.exists():
+        raise HTTPException(status_code=404, detail=f'container not found: {name}')
+
+    new_target = WS / 'tasks' / 'rag' / 'containers' / req.new_name
+    if new_target.exists():
+        raise HTTPException(status_code=409, detail=f'target container already exists: {req.new_name}')
+
+    # 检查是否正在建索引
+    try:
+        status = get_index_state_machine().get_status(name)
+        if status and getattr(status, 'state', None) == 'indexing':
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    'error': 'cannot_rename_while_indexing',
+                    'container': name,
+                    'hint': 'Wait for indexing to complete before renaming the container.',
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # 1. 重命名物理目录
+    try:
+        old_target.rename(new_target)
+    except Exception as exc:
+        logging.exception('Failed to rename container directory: %s -> %s', old_target, new_target)
+        raise HTTPException(status_code=500, detail=f'failed to rename directory: {exc}')
+
+    # 2. 迁移 container_metadata
+    try:
+        meta_store = get_container_metadata_store()
+        old_meta = meta_store.get(name)
+        if old_meta:
+            meta_store.delete(name)
+            old_meta.pop('container', None)
+            old_meta.pop('updated_at', None)
+            meta_store.upsert(req.new_name, **old_meta)
+    except Exception:
+        logging.exception('Failed to migrate container metadata for %s -> %s', name, req.new_name)
+
+    # 3. 迁移 container_aliases（指向 old_name 的 canonical 批量重定向至 new_name）
+    try:
+        aliases_store = get_container_aliases_store()
+        pointing_aliases = aliases_store.aliases_for_canonical(name)
+        for item in pointing_aliases:
+            alias_name = item.get('alias')
+            if alias_name:
+                aliases_store.upsert(alias_name, req.new_name, reason=f'migrated from {name} rename')
+    except Exception:
+        logging.exception('Failed to migrate aliases pointing to %s -> %s', name, req.new_name)
+
+    return ContainerRenameResponse(
+        old_name=name,
+        new_name=req.new_name,
+        renamed=True,
+        message=f'Container {name} successfully renamed to {req.new_name}.',
+    )
 
 
 @app.put(
