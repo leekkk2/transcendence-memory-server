@@ -34,15 +34,25 @@ name: Deploy
 #   DEPLOY_SMOKE         — "true" or "false" — run smoke test post-deploy (default: true)
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'src/**'
+      - 'deploy/**'
+      - 'Dockerfile'
+      - 'pyproject.toml'
+      - 'docker-compose*.yml'
+      - '.github/workflows/deploy.yml'
   workflow_run:
     workflows: ["CI/CD"]
     types: [completed]
   workflow_dispatch:
     inputs:
       ref:
-        description: "Tag or commit to deploy (default: latest tag)"
+        description: "Branch, tag or commit to deploy (default: main)"
         required: false
-        default: ""
+        default: "main"
 
 permissions:
   contents: read
@@ -69,8 +79,13 @@ jobs:
         run: |
           set -euo pipefail
           should_deploy=false
-          ref=""
+          ref="main"
           case "$EVENT_NAME" in
+            push)
+              should_deploy=true
+              ref="main"
+              echo "::notice::Auto-deploy triggered by push to main"
+              ;;
             workflow_run)
               # Only deploy when the upstream CI/CD succeeded on a tag push.
               if [ "$WORKFLOW_RUN_CONCLUSION" = "success" ] \
@@ -84,7 +99,7 @@ jobs:
               ;;
             workflow_dispatch)
               should_deploy=true
-              ref="${DISPATCH_REF:-}"
+              ref="${DISPATCH_REF:-main}"
               ;;
           esac
           echo "should_deploy=${should_deploy}" >> "$GITHUB_OUTPUT"
@@ -153,8 +168,8 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/transcendence-memory-server' }}
-          DEPLOY_SUDO: ${{ vars.DEPLOY_SUDO || 'sudo' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/home/ubuntu/services/transcendence-memory-server' }}
+          DEPLOY_SUDO: ${{ vars.DEPLOY_SUDO || '' }}
           DEPLOY_REF: ${{ needs.preflight.outputs.ref }}
         run: |
           set -euo pipefail
@@ -176,48 +191,46 @@ jobs:
           set -euo pipefail
           : "${DEPLOY_PATH:?}"
           : "${DEPLOY_SUDO:=}"
-          : "${DEPLOY_REF:=}"
+          : "${DEPLOY_REF:=main}"
           cd "$DEPLOY_PATH"
-          # --force needed when origin tags have been rewritten (sanitization
-          # force-push, retag scenarios). Without --force a single conflicting
-          # tag aborts the entire fetch and downstream checkout fails.
           git fetch --tags --prune --force origin
-          if [ -n "$DEPLOY_REF" ]; then
-            git checkout --detach "$DEPLOY_REF"
+          if [ "$DEPLOY_REF" = "main" ] || [ -z "$DEPLOY_REF" ]; then
+            git checkout -B main origin/main
+            git pull origin main
           else
-            # Default: checkout the most recent tag (newest by version sort).
-            latest=$(git tag --sort=-v:refname | head -n1)
-            [ -n "$latest" ] || { echo "no tags found in repo; aborting"; exit 1; }
-            git checkout --detach "$latest"
-            DEPLOY_REF="$latest"
+            git checkout --detach "$DEPLOY_REF"
           fi
-          # Pin the image tag to the git ref so each deploy is reproducible
-          # and rolling-tag pulls (`:full` / `:lite`) never block the deploy
-          # while a multi-GB layer downloads. We learn `image_base` and the
-          # flavor from .env so user-side image-repo choice is preserved.
+
           if [ -f .env ]; then
             env_image=$(grep -E '^TM_IMAGE=' .env | tail -n1 | cut -d= -f2- || true)
           else
             env_image=""
           fi
-          [ -n "$env_image" ] || { echo "TM_IMAGE not set in .env; aborting"; exit 1; }
-          image_base=$(printf '%s' "$env_image" | sed -E 's/:[^:]+$//')
-          env_tag=$(printf '%s' "$env_image" | awk -F: '{print $NF}')
-          case "$env_tag" in
-            lite|full) flavor="$env_tag" ;;
-            *-lite)    flavor=lite ;;
-            *-full)    flavor=full ;;
-            *)         flavor=lite ;;  # safe default
-          esac
-          version="${DEPLOY_REF#v}"
-          export TM_IMAGE="${image_base}:${version}-${flavor}"
-          echo "::notice::Deploying ref=${DEPLOY_REF} as TM_IMAGE=${TM_IMAGE} on $(hostname)"
-          # Always operate via docker compose at $DEPLOY_PATH so the cwd matches
-          # the compose project; systemd unit (if installed) is just there to
-          # restart the stack on host reboot — not used in the deploy hot path.
-          # Carry TM_IMAGE all the way down to docker compose. Two paths:
-          #   * with sudo: `sudo` strips env by default, so we must whitelist
-          #     TM_IMAGE via --preserve-env=TM_IMAGE.
+
+          if [ -n "$env_image" ] && [[ "$DEPLOY_REF" == v* ]]; then
+            image_base=$(printf '%s' "$env_image" | sed -E 's/:[^:]+$//')
+            env_tag=$(printf '%s' "$env_image" | awk -F: '{print $NF}')
+            case "$env_tag" in
+              lite|full) flavor="$env_tag" ;;
+              *-lite)    flavor=lite ;;
+              *-full)    flavor=full ;;
+              *)         flavor=lite ;;
+            esac
+            version="${DEPLOY_REF#v}"
+            export TM_IMAGE="${image_base}:${version}-${flavor}"
+            echo "::notice::Deploying ref=${DEPLOY_REF} as TM_IMAGE=${TM_IMAGE} on $(hostname)"
+          fi
+
+          run_compose() {
+            if [ -n "$DEPLOY_SUDO" ]; then
+              $DEPLOY_SUDO "$@"
+            else
+              "$@"
+            fi
+          }
+
+          echo "Recreating transcendence-memory-server containers..."
+          run_compose docker compose up -d --remove-orphans
           #   * without sudo (root deploys): plain `env TM_IMAGE=... docker ...`
           #     because --preserve-env is a sudo flag and would become the
           #     literal command name.

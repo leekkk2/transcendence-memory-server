@@ -23,11 +23,11 @@
 
 set -euo pipefail
 
-HOST=""
+HOST="${DEPLOY_HOST:-3.129.217.131}"
 USER_NAME="ubuntu"
 PORT="22"
-REMOTE_PATH="/opt/transcendence-memory-server"
-SUDO="sudo"
+REMOTE_PATH="/home/ubuntu/services/transcendence-memory-server"
+SUDO=""
 SMOKE="true"
 KEY_DIR="${HOME}/.ssh/transcendence-memory-deploy"
 

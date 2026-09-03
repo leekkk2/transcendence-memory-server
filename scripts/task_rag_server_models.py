@@ -391,6 +391,17 @@ class ContainerDeleteResponse(BaseModel):
     message: str
 
 
+class ContainerRenameRequest(BaseModel):
+    new_name: str = Field(..., min_length=1, max_length=64, description="New canonical container name")
+
+
+class ContainerRenameResponse(BaseModel):
+    old_name: str
+    new_name: str
+    renamed: bool = True
+    message: str
+
+
 class JobStatusResponse(BaseModel):
     pid: int
     running: bool
