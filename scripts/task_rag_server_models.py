@@ -370,7 +370,8 @@ class ContainerListResponse(BaseModel):
 
 
 class ContainerInfo(BaseModel):
-    name: str
+    id: str = Field(..., description="Fixed immutable container ID")
+    name: str = Field(..., description="Primary human-readable display name / alias")
     objects: int
     indexed: bool
     last_modified: str | None = None
@@ -378,6 +379,8 @@ class ContainerInfo(BaseModel):
         default=None,
         description='容器索引状态机：fresh / indexing / backlog / quota_blocked / error / stale / unknown。',
     )
+    aliases: list[str] = Field(default_factory=list, description="All aliases pointing to this container")
+    metadata: dict[str, Any] | None = None
 
 
 class ContainerListDetailedResponse(BaseModel):
@@ -391,13 +394,28 @@ class ContainerDeleteResponse(BaseModel):
     message: str
 
 
+class ContainerCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64, description="Primary human-readable container name / alias")
+    id: str | None = Field(None, min_length=1, max_length=64, description="Optional custom immutable container ID (default: cnt_xxxxxx)")
+    description: str | None = None
+    tags: list[str] | None = None
+
+
+class ContainerCreateResponse(BaseModel):
+    id: str
+    name: str
+    status: str = "active"
+    message: str = "Container created successfully."
+
+
 class ContainerRenameRequest(BaseModel):
-    new_name: str = Field(..., min_length=1, max_length=64, description="New canonical container name")
+    new_name: str = Field(..., min_length=1, max_length=64, description="New human-readable display name (alias) for the container")
 
 
 class ContainerRenameResponse(BaseModel):
-    old_name: str
-    new_name: str
+    id: str = Field(..., description="Fixed immutable container ID")
+    old_name: str = Field(..., description="Previous display name (now deprecated alias)")
+    new_name: str = Field(..., description="Newly assigned active primary name (alias)")
     renamed: bool = True
     message: str
 
