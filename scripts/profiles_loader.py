@@ -317,6 +317,13 @@ def _validate_embedding_refs(r: Route, embeddings: dict[str, EmbeddingProfile]) 
                 f"fallback {fb!r} dim={embeddings[fb].dim} 与 primary "
                 f"{r.embedding!r} dim={primary_dim} 不一致，无法 fallback"
             )
+        primary, fallback = embeddings[r.embedding], embeddings[fb]
+        if (fallback.model, fallback.provider) != (primary.model, primary.provider):
+            raise ValueError(
+                f"fallback {fb!r} has a different embedding vector space from "
+                f"{r.embedding!r}; equal dimensions do not make models compatible. "
+                "Use the same model or explicitly rebuild a separate index."
+            )
 
 
 def _validate_model_refs(r: Route, ps: ProfileSet) -> None:

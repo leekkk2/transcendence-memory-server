@@ -74,6 +74,7 @@ export default function GovernanceTools() {
   // Staged container override maps: container → { tool → bool }.
   const [overrides, setOverrides] = useState<Record<string, Record<string, boolean>>>({});
   const [query, setQuery] = useState('');
+  const [target, setTarget] = useState('');
 
   const data = matrix.data;
   const containerTools = useMemo(
@@ -86,6 +87,7 @@ export default function GovernanceTools() {
   );
 
   const containers = data?.containers ?? [];
+  const selectedTarget = target || containers.find(c => c.container === 'main')?.container || containers[0]?.container || '';
   const visibleContainers = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (q === '') return containers;
@@ -310,9 +312,14 @@ export default function GovernanceTools() {
 
       {/* Container tools — descriptions + dry-run try / real execute */}
       <section className="panel space-y-3 p-4">
-        <div className="text-dim mono text-xs uppercase tracking-wider">{t('tools.toolsTitle')}</div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="text-dim mono text-xs uppercase tracking-wider">{t('tools.toolsTitle')}</div>
+          <label className="text-xs">{t('tools.targetContainer')} <select className="input mono" value={selectedTarget} onChange={e => setTarget(e.target.value)}>
+            {containers.map(c => <option key={c.container} value={c.container}>{c.container}</option>)}
+          </select></label>
+        </div>
         {containerTools.map((tool) => (
-          <ToolCard key={tool.name} tool={tool} globalScope={false} />
+          <ToolCard key={`${tool.name}:${selectedTarget}`} tool={tool} globalScope={false} container={selectedTarget} />
         ))}
       </section>
 
@@ -446,11 +453,15 @@ function ToolKindBadge({ kind }: { kind: ToolKind }) {
   );
 }
 
-function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean }) {
+function ToolCard({ tool, globalScope, container = '' }: { tool: ToolInfo; globalScope: boolean; container?: string }) {
   const { t } = useTranslation();
   const toolName = useToolName();
   const invoke = useInvokeTool();
-  const [scope, setScope] = useState('');
+  const scope = container;
+  const [paramsText, setParamsText] = useState(tool.name === 'update_container_routing' ? '{"rules":{}}' : '{}');
+  let params: Record<string, unknown> = {};
+  let paramsError = false;
+  try { params = JSON.parse(paramsText); paramsError = !params || Array.isArray(params) || typeof params !== 'object'; } catch { paramsError = true; }
   const [result, setResult] = useState<ToolInvokeResponse | null>(null);
   // Which button fired the in-flight request — keeps the other button's label
   // stable while both stay disabled during the (potentially slow) LLM call.
@@ -471,6 +482,7 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         tool: tool.name,
         container: globalScope || scope.trim() === '' ? null : scope.trim(),
         dry_run: dryRun,
+        params,
       });
       setResult(r);
     } catch {
@@ -495,20 +507,11 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         <span className="text-sm font-medium">{toolName(tool.name)}</span>
         <span className="text-dim mono text-[10px]">{tool.name}</span>
         <ToolKindBadge kind={kind} />
-        {!globalScope ? (
-          <input
-            type="text"
-            value={scope}
-            placeholder={t('tools.scopePlaceholder')}
-            aria-label={t('tools.scopePlaceholder')}
-            onChange={(e) => setScope(e.target.value)}
-            className="input mono ml-auto w-40 text-xs"
-          />
-        ) : null}
+        {!globalScope ? <span className="badge badge-dim ml-auto">{scope}</span> : null}
         <button
           type="button"
           onClick={() => void run(true)}
-          disabled={invoke.isPending || containerMissing}
+          disabled={invoke.isPending || containerMissing || paramsError}
           className={`btn btn-ghost inline-flex items-center gap-1.5 text-xs ${
             globalScope ? 'ml-auto' : ''
           }`}
@@ -523,7 +526,7 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         <button
           type="button"
           onClick={onExecuteClick}
-          disabled={invoke.isPending || containerMissing}
+          disabled={invoke.isPending || containerMissing || paramsError}
           className="btn btn-accent inline-flex items-center gap-1.5 text-xs"
         >
           {pendingMode === 'exec' ? (
@@ -537,6 +540,10 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
         </button>
       </div>
       <p className="text-dim mt-1 text-[11px]">{tool.description}</p>
+      <details className="mt-2 text-xs"><summary className="cursor-pointer">{t('tools.parameters')}</summary>
+        <textarea className="input mono mt-2 w-full" aria-label={`${tool.name} ${t('tools.parameters')}`} value={paramsText} onChange={e => setParamsText(e.target.value)} rows={3} />
+        {paramsError ? <p role="alert">{t('tools.invalidParameters')}</p> : null}
+      </details>
       {containerMissing ? (
         <p className="mt-1 text-[11px] italic" style={{ color: 'var(--red)' }}>
           {t('tools.containerRequired', {
@@ -546,7 +553,7 @@ function ToolCard({ tool, globalScope }: { tool: ToolInfo; globalScope: boolean 
       ) : null}
       {invoke.isError ? (
         <div className="mt-1 text-[11px]" style={{ color: 'var(--red)' }} role="alert">
-          {lastMode === 'exec' ? t('tools.execError') : t('tools.tryError')}
+          {lastMode === 'exec' ? t('tools.execError') : t('tools.tryError')} · {invoke.error?.message}
         </div>
       ) : null}
       {result ? <InvokeResult result={result} /> : null}

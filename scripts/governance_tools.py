@@ -498,7 +498,8 @@ async def _invoke_update_container_routing(
                        "params.rules (object) is required")
     current = config_store.get_cached("config:container:routing_rules", {})
     merged = dict(current) if isinstance(current, dict) else {}
-    merged[container] = rules  # additive: only this container's entry changes
+    previous = merged.get(container, {})
+    merged[container] = {**(previous if isinstance(previous, dict) else {}), **rules}
     effective_dry_run = dry_run or bool(params.get("dry_run", False))
     if effective_dry_run:
         return _result("update_container_routing", "dry_run", container,

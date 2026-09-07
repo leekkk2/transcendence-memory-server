@@ -28,8 +28,10 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
+import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -99,6 +101,10 @@ def ensure_schema(db_path: str | Path) -> None:
     with closing(sqlite3.connect(db_path)) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(_SCHEMA_REQUEST_LOG)
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(api_request_log)')}
+        for name in ('error_detail', 'request_id'):
+            if name not in columns:
+                conn.execute(f'ALTER TABLE api_request_log ADD COLUMN {name} TEXT')
         conn.execute(_SCHEMA_DAILY_ROLLUP)
         for stmt in _SCHEMA_INDEXES:
             conn.execute(stmt)
@@ -144,6 +150,50 @@ def classify_error(status: int) -> str:
     if status >= 500:
         return "permanent"
     return "client"
+
+
+def safe_error_detail(payload: Any) -> str:
+    """Keep diagnostic fields, never validation input or arbitrary response data."""
+    allowed = {'detail', 'error', 'message', 'hint', 'code', 'type', 'loc', 'msg', 'notes'}
+    def clean(value):
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items() if k in allowed}
+        if isinstance(value, list):
+            return [clean(v) for v in value[:20]]
+        return value
+    text = json.dumps(clean(payload), ensure_ascii=False, default=str)
+    text = re.sub(r'(?i)(bearer\s+|(?:api[_-]?key|token|password|secret)[\s"\x27:=]+)[^\s,"\x27}]+', r'\1[REDACTED]', text)
+    text = re.sub(r'\b(?:sk-|gh[pousr]_|xox[baprs]-)[A-Za-z0-9_-]+', '[REDACTED]', text)
+    text = re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED]', text)
+    text = re.sub(r'(https?://)[^\s/@]+:[^\s/@]+@', r'\1[REDACTED]@', text)
+    return text[:2048]
+
+
+async def _inspect_error_response(response: Response) -> str | None:
+    """Inspect bounded JSON errors and replay the original bytes unchanged."""
+    if 'application/json' not in response.headers.get('content-type', ''):
+        return None
+    if not 0 < int(response.headers.get('content-length') or 0) <= 16384:
+        return None
+    iterator = response.body_iterator
+    parts, size = [], 0
+    async for part in iterator:
+        parts.append(part)
+        size += len(part)
+        if size > 16384:
+            break
+    async def replay():
+        for part in parts:
+            yield part
+        async for part in iterator:
+            yield part
+    response.body_iterator = replay()
+    if size > 16384:
+        return None
+    try:
+        return safe_error_detail(json.loads(b''.join(parts)))
+    except (ValueError, TypeError):
+        return None
 
 
 _PATH_TEMPLATE_CACHE: dict[tuple[str, str], str] = {}
@@ -324,12 +374,12 @@ class UsageBatcher:
                     """
                     INSERT INTO api_request_log
                         (ts, method, path, status, latency_ms, container,
-                         api_key_hash, ua, bytes_in, bytes_out, error_type)
+                         api_key_hash, ua, bytes_in, bytes_out, error_type, error_detail, request_id)
                     VALUES
                         (:ts, :method, :path, :status, :latency_ms, :container,
-                         :api_key_hash, :ua, :bytes_in, :bytes_out, :error_type)
+                         :api_key_hash, :ua, :bytes_in, :bytes_out, :error_type, :error_detail, :request_id)
                     """,
-                    batch,
+                    [{'error_detail': None, 'request_id': None, **r} for r in batch],
                 )
                 conn.commit()
             self._consecutive_failures = 0
@@ -433,9 +483,16 @@ class UsageMiddleware(BaseHTTPMiddleware):
         status = 500
         bytes_out = 0
         response: Response | None = None
+        error_detail = None
+        request_id = uuid.uuid4().hex
         try:
             response = await call_next(request)
             status = response.status_code
+            response.headers['X-Request-ID'] = request_id
+            if status >= 400:
+                error_detail = await _inspect_error_response(response)
+            if getattr(request.state, 'usage_error', None):
+                error_detail = safe_error_detail(request.state.usage_error)
             cl = response.headers.get("content-length")
             if cl is not None:
                 try:
@@ -443,6 +500,9 @@ class UsageMiddleware(BaseHTTPMiddleware):
                 except ValueError:
                     bytes_out = 0
             return response
+        except Exception as exc:
+            error_detail = safe_error_detail({'error': type(exc).__name__, 'message': str(exc)})
+            raise
         finally:
             latency_ms = int((time.monotonic() - start) * 1000)
             try:
@@ -458,7 +518,9 @@ class UsageMiddleware(BaseHTTPMiddleware):
                     "ua": ua,
                     "bytes_in": int(bytes_in or 0),
                     "bytes_out": int(bytes_out or 0),
-                    "error_type": classify_error(int(status)),
+                    "error_type": "tool" if getattr(request.state, "usage_error", None) else classify_error(int(status)),
+                    "error_detail": error_detail,
+                    "request_id": request_id,
                 }
                 self.batcher.add(record)
             except Exception as exc:  # pragma: no cover - never block response
@@ -516,13 +578,13 @@ def summary(db_path: str | Path, window: str = "24h") -> dict[str, Any]:
     cutoff_ms = int(time.time() * 1000) - seconds * 1000
     with closing(_connect(db_path)) as conn:
         rows = conn.execute(
-            "SELECT status, latency_ms, path, container, api_key_hash "
+            "SELECT status, latency_ms, path, container, api_key_hash, error_type "
             "FROM api_request_log WHERE ts >= ?",
             (cutoff_ms,),
         ).fetchall()
 
     total_calls = len(rows)
-    total_errors = sum(1 for r in rows if int(r["status"]) >= 400)
+    total_errors = sum(1 for r in rows if (int(r["status"]) >= 400 or r["error_type"] == "tool"))
     latencies = [int(r["latency_ms"]) for r in rows]
     containers = {r["container"] for r in rows if r["container"]}
     api_keys = {r["api_key_hash"] for r in rows if r["api_key_hash"]}
@@ -548,6 +610,8 @@ def summary(db_path: str | Path, window: str = "24h") -> dict[str, Any]:
         "window": window,
         "total_calls": total_calls,
         "total_errors": total_errors,
+        "unauthenticated_not_found": sum(1 for r in rows if r['status'] == 404 and not r['api_key_hash']),
+        "authenticated_errors": sum(1 for r in rows if (r['status'] >= 400 or r['error_type'] == 'tool') and r['api_key_hash']),
         "error_rate": (total_errors / total_calls) if total_calls else 0.0,
         "p50_latency_ms": _percentile(latencies, 50),
         "p95_latency_ms": _percentile(latencies, 95),
@@ -558,6 +622,28 @@ def summary(db_path: str | Path, window: str = "24h") -> dict[str, Any]:
 
 
 SortBy = Literal["calls", "errors", "p95"]
+
+
+def errors(db_path: str | Path, window: str = '24h', category: str = 'all',
+           limit: int = 50, offset: int = 0, path: str = '', container: str = '') -> dict:
+    filters = {'all': '1=1', 'authenticated': 'api_key_hash IS NOT NULL',
+               'unauthenticated_404': 'status=404 AND api_key_hash IS NULL',
+               'other': 'NOT (status=404 AND api_key_hash IS NULL)'}
+    if category not in filters or not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, 'invalid error filter or pagination')
+    where = f"ts >= ? AND (status >= 400 OR error_type='tool') AND ({filters[category]})"
+    args = [int(time.time()*1000) - _window_seconds(window)*1000]
+    for key, value in [('path', path), ('container', container)]:
+        if value:
+            where += f' AND {key} = ?'
+            args.append(value)
+    with closing(_connect(db_path)) as conn:
+        total = conn.execute(f'SELECT COUNT(*) FROM api_request_log WHERE {where}', args).fetchone()[0]
+        rows = conn.execute(f'SELECT id,ts,method,path,status,latency_ms,container,ua,error_type,error_detail,request_id '
+                            f'FROM api_request_log WHERE {where} ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?',
+                            [*args, limit, offset]).fetchall()
+    return {'window': window, 'category': category, 'total': total, 'rows': [dict(r) for r in rows],
+            'limit': limit, 'offset': offset}
 
 
 def endpoints(

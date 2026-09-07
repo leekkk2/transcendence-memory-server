@@ -570,6 +570,8 @@ class UsageSummaryResponse(BaseModel):
     window: str
     total_calls: int = 0
     total_errors: int = 0
+    unauthenticated_not_found: int = 0
+    authenticated_errors: int = 0
     error_rate: float = 0.0
     p50_latency_ms: int = 0
     p95_latency_ms: int = 0

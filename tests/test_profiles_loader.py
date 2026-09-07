@@ -63,9 +63,9 @@ embeddings:
     request_dim: null
     timeout_s: 45
     max_retries: 5
-  - name: openai-3072
+  - name: gemini-backup-3072
     provider: openai_compatible
-    model: text-embedding-3-large
+    model: gemini-embedding-001
     dim: 3072
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
@@ -81,7 +81,7 @@ rerankers:
 routes:
   - match: {exact: default}
     embedding: gemini-3072
-    embedding_fallbacks: [openai-3072]
+    embedding_fallbacks: [gemini-backup-3072]
     reranker: selfhosted-bge
     rerank: {enabled: true, chunk_top_k: 40, top_k: 10}
   - match: {default: true}
@@ -91,7 +91,7 @@ routes:
     ps = load_profiles(str(yaml_path))
 
     assert isinstance(ps, ProfileSet)
-    assert set(ps.embeddings) == {"gemini-3072", "openai-3072"}
+    assert set(ps.embeddings) == {"gemini-3072", "gemini-backup-3072"}
     assert set(ps.rerankers) == {"selfhosted-bge"}
     gem = ps.embeddings["gemini-3072"]
     assert isinstance(gem, EmbeddingProfile)
@@ -102,7 +102,7 @@ routes:
     assert gem.request_dim is None
     assert gem.api_key == "gem-key"
 
-    oa = ps.embeddings["openai-3072"]
+    oa = ps.embeddings["gemini-backup-3072"]
     assert oa.request_dim == 3072
 
     rr = ps.rerankers["selfhosted-bge"]
@@ -114,7 +114,7 @@ routes:
     matcher, route = ps.routes[0]
     assert matcher == {"exact": "default"}
     assert route.embedding == "gemini-3072"
-    assert route.embedding_fallbacks == ("openai-3072",)
+    assert route.embedding_fallbacks == ("gemini-backup-3072",)
     assert route.reranker == "selfhosted-bge"
     assert route.rerank_enabled is True
     assert route.chunk_top_k == 40
@@ -667,3 +667,19 @@ routes:
     )
     ps = load_profiles(str(yaml_path))
     assert "p1" in ps.embeddings
+
+
+def test_reject_same_dimension_cross_model_fallback(tmp_path, monkeypatch):
+    from scripts.profiles_loader import load_profiles
+    p=tmp_path/'profiles.yaml'
+    p.write_text('''embeddings:
+  - {name: primary, model: model-a, dim: 8, base_url: https://example.com/v1, api_key_env: TEST_KEY}
+  - {name: backup, model: model-b, dim: 8, base_url: https://example.com/v1, api_key_env: TEST_KEY}
+routes:
+  - match: {default: true}
+    embedding: primary
+    embedding_fallbacks: [backup]
+''')
+    monkeypatch.setenv('TEST_KEY','test')
+    with pytest.raises(ValueError, match='vector space'):
+        load_profiles(p)

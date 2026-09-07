@@ -184,6 +184,17 @@ async def _http_embed_single(
     profile: EmbeddingProfile,
     texts: list[str],
 ) -> np.ndarray:
+    try:
+        from embedding_input import limits, embed_bounded
+    except ImportError:
+        from scripts.embedding_input import limits, embed_bounded
+    cap, batch_size = limits()
+    if (cap and any(len(t) > cap for t in texts)) or (batch_size and len(texts) > batch_size):
+        return await embed_bounded(texts, lambda batch: _http_embed_single(profile, batch))
+    return await _http_embed_request(profile, texts)
+
+
+async def _http_embed_request(profile: EmbeddingProfile, texts: list[str]) -> np.ndarray:
     """单 profile 调用：429/5xx 内部重试 + Retry-After 解析。
 
     与 v0.8.0 _http_embed 行为一致，仅改名 _http_embed_single 以便上层

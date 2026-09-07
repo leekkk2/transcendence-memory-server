@@ -25,6 +25,8 @@ export interface UsageSummary {
   window: string;
   total_calls: number;
   total_errors: number;
+  unauthenticated_not_found: number;
+  authenticated_errors: number;
   error_rate: number;
   p50_latency_ms: number;
   p95_latency_ms: number;
