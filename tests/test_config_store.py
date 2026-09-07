@@ -380,3 +380,23 @@ def test_pubsub_refresh_roundtrip(monkeypatch, tmp_path):
         await redis_client.close_pool()
 
     asyncio.run(_flow())
+
+
+def test_container_tool_map_persists_and_survives_reload():
+    key='config:tools:container:main:enabled_map'
+    value={'compress_knowledge_cluster':True,'snapshot_and_quarantine':False}
+    assert asyncio.run(config_store.set(key,value)) is True
+    config_store._cache_clear()
+    asyncio.run(config_store.load_all())
+    assert config_store.get_cached(key)==value
+    import governance_tools
+    assert asyncio.run(governance_tools.read_container_raw_map('main'))==value
+    assert asyncio.run(config_store.set(key,None)) is True
+    assert asyncio.run(governance_tools.read_container_raw_map('main')) is None
+
+
+def test_container_tool_map_rejects_invalid_names_and_non_booleans():
+    assert not asyncio.run(config_store.set('config:tools:container:../main:enabled_map',{}))
+    key='config:tools:container:main:enabled_map'
+    assert not asyncio.run(config_store.set(key,{'compress_knowledge_cluster':'false'}))
+    assert not asyncio.run(config_store.set(key,{'misspelled_tool':True}))

@@ -90,3 +90,15 @@ def test_tool_business_failure_has_details(tmp_path):
     assert row['status']==200 and row['error_type']=='tool'
     assert 'gateway failed' in row['error_detail']
     assert usage.summary(db)['total_errors']==1
+
+
+def test_container_switch_api_persists(tmp_path,monkeypatch):
+    from conftest import load_server,make_workspace,auth_headers
+    from fastapi.testclient import TestClient
+    server=load_server(make_workspace(tmp_path),monkeypatch)
+    key='config:tools:container:main:enabled_map'
+    with TestClient(server.app) as client:
+        result=client.put('/admin/config',headers=auth_headers(),json={'updates':[{'key':key,'value':{'compress_knowledge_cluster':True}}]})
+        assert result.json()['applied']==1,result.json()
+        import asyncio
+        assert asyncio.run(server.governance_tools.read_container_raw_map('main'))=={'compress_knowledge_cluster':True}

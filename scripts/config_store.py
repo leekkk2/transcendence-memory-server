@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -477,6 +478,29 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     ),
 }
 
+def _coerce_container_tool_map(raw: Any) -> dict[str, bool]:
+    value = _coerce_json(raw)
+    if not isinstance(value, dict) or any(
+        key not in _PRESET_TOOL_NAMES or not isinstance(enabled, bool)
+        for key, enabled in value.items()
+    ):
+        raise ValueError('expected a map of preset tool names to booleans')
+    return value
+
+
+_CONTAINER_TOOLS_SPEC = _ConfigKey(
+    _coerce_container_tool_map, typename='json', default={}, group='治理工具箱',
+    label='容器工具开关', description='容器级开关覆盖；清空后继承全局配置',
+)
+
+
+def spec_for_key(key: str) -> Optional[_ConfigKey]:
+    spec = KNOWN_CONFIG.get(key)
+    if spec is None and re.fullmatch(r'config:tools:container:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}:enabled_map', key):
+        return _CONTAINER_TOOLS_SPEC
+    return spec
+
+
 # Prefixes used by HR-9 guards (so adding more base_url:* / api_keys:* keys
 # above keeps the guard coverage automatic).
 _BASE_URL_PREFIX = "config:model:base_url:"
@@ -694,7 +718,7 @@ def get_cached(key: str, default: Any = None) -> Any:
         if key not in _CONFIG_CACHE:
             return default
         raw = _CONFIG_CACHE[key]
-    spec = KNOWN_CONFIG.get(key)
+    spec = spec_for_key(key)
     if spec is None:
         return default
     try:
@@ -741,7 +765,7 @@ async def load_all() -> None:
         return
     loaded = 0
     for key, raw in rows.items():
-        spec = KNOWN_CONFIG.get(key)
+        spec = spec_for_key(key)
         if spec is None:
             continue  # ignore unknown rows (forward-compat with future keys)
         if spec.sensitive:
@@ -766,7 +790,7 @@ async def set(key: str, value: Any) -> bool:
     load_all/restart. A DB failure returns False (nothing was persisted).
     Never raises — validation failures return False with a warning.
     """
-    spec = KNOWN_CONFIG.get(key)
+    spec = spec_for_key(key)
     if spec is None:
         logger.warning("[config] rejected set of unknown key %s", key)
         return False
@@ -857,7 +881,7 @@ async def refresh(keys: list[str]) -> None:
     """
     store = _get_store()
     for key in keys:
-        spec = KNOWN_CONFIG.get(key)
+        spec = spec_for_key(key)
         if spec is None or spec.sensitive:
             continue
         if store is not None:
