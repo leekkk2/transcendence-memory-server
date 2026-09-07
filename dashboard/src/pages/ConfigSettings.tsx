@@ -149,7 +149,7 @@ export default function ConfigSettings() {
             {update.isError ? (
               <span className="badge badge-red">
                 <span className="dot" />
-                {t('config.saveError')}
+                {t('config.saveError')} · {update.error?.message}
               </span>
             ) : null}
             {update.isSuccess && dirtyKeys.length === 0 && Object.keys(results).length > 0 ? (

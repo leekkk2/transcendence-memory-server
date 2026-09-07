@@ -136,7 +136,7 @@ export default function GovernanceTools() {
     }
     for (const key of scalarDirtyKeys) updates.push({ key, value: drafts[key] });
     if (updates.length === 0) return;
-    await update.mutateAsync(updates);
+    try { await update.mutateAsync(updates); } catch { return; }
     setOverrides({});
     setDrafts({});
   }
@@ -149,7 +149,7 @@ export default function GovernanceTools() {
           {update.isError ? (
             <span className="badge badge-red">
               <span className="dot" />
-              {t('config.saveError')}
+              {t('config.saveError')} · {update.error?.message}
             </span>
           ) : null}
           <span className="text-dim mono text-xs">

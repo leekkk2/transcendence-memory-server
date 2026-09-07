@@ -275,11 +275,18 @@ export function useConfig() {
 export function useUpdateConfig() {
   const qc = useQueryClient();
   return useMutation<ConfigUpdateResponse, Error, ConfigUpdate[]>({
-    mutationFn: (updates) => api.put('/admin/config', { updates }),
+    mutationFn: async (updates) => {
+      const result = await api.put<ConfigUpdateResponse>('/admin/config', { updates });
+      if (result.rejected > 0) {
+        throw new Error(result.results.filter(r => !r.ok).map(r => `${r.key}: ${r.rejected_reason}`).join('; '));
+      }
+      return result;
+    },
     // PUT never echoes written values (secrets stay server-side); refetch GET
     // so value / is_override / configured reflect what actually persisted.
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['config'] });
+      qc.invalidateQueries({ queryKey: ['tools', 'matrix'] });
     },
   });
 }
