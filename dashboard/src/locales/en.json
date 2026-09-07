@@ -45,8 +45,8 @@
     "workerIdle": "worker idle",
     "containers": "Containers",
     "activeContainers": "{{count}} active 24h",
-    "todayCalls": "Today calls",
-    "errorsSub": "{{count}} errors",
+    "todayCalls": "Requests in last 24 hours",
+    "errorsSub": "{{count}} error responses",
     "p95Latency": "p95 latency",
     "p50Sub": "p50 {{value}} ms",
     "topEndpoints": "top endpoints (24h)",
@@ -120,7 +120,21 @@
     "colContainers": "Containers",
     "coldEndpoints": "cold endpoints (low call volume — review for deletion)",
     "callsUnit": "{{count}} calls",
-    "noData": "no data"
+    "noData": "no data",
+    "viewErrors": "Error details",
+    "errorCategory": "Error category",
+    "errorWindow": "Time window",
+    "noErrors": "No errors in this window",
+    "historicalError": "Historical response body was not recorded (HTTP {{status}}). New errors retain redacted details.",
+    "previous": "Previous",
+    "next": "Next",
+    "breakdown": "Last 24h: {{api}} errors with API credentials; {{noise}} unauthenticated 404 responses (often scans or wrong URLs).",
+    "categories": {
+      "all": "All errors",
+      "authenticated": "With API credentials",
+      "unauthenticated_404": "Unauthenticated 404",
+      "other": "Exclude unauthenticated 404"
+    }
   },
   "jobs": {
     "title": "Jobs",
@@ -294,7 +308,7 @@
     "globalConfig": "global settings",
     "globalConfigHint": "Master switch map, sandbox memory cap, approval window and the default for newly added tools.",
     "scopePlaceholder": "container",
-    "containerRequired": "Enter a target container in the box above first, then try / execute",
+    "containerRequired": "Select a target container first",
     "tryRun": "try (dry run)",
     "trying": "trying…",
     "tryError": "try failed",
@@ -358,6 +372,9 @@
       "disabled": "disabled",
       "dry_run": "dry run",
       "deferred": "deferred"
-    }
+    },
+    "targetContainer": "Target container",
+    "parameters": "Parameters (JSON)",
+    "invalidParameters": "Enter a JSON object"
   }
 }

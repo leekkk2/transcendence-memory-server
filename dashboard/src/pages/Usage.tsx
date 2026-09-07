@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { EndpointTable } from '../components/EndpointTable';
 import { TimeseriesChart } from '../components/TimeseriesChart';
+import { ErrorLog } from '../components/ErrorLog';
 import { useUsageEndpoints, useUsageSummary, useUsageTimeseries } from '../lib/queries';
 import { formatMs, formatNumber } from '../lib/format';
 
@@ -33,6 +34,7 @@ export default function Usage() {
       </div>
 
       <EndpointTable rows={(data?.rows ?? []).map((r) => ({ ...r }))} sort={sort} onSortChange={setSort} />
+      <ErrorLog />
 
       <section className="panel space-y-3 p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">

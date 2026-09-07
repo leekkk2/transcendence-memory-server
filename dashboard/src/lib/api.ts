@@ -55,7 +55,8 @@ async function request<T>(method: Method, path: string, body?: unknown): Promise
   }
 
   if (!res.ok) {
-    throw new ApiError(res.status, parsed);
+    const detail = parsed && typeof parsed === 'object' && 'detail' in parsed ? parsed.detail : parsed;
+    throw new ApiError(res.status, parsed, `HTTP ${res.status}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
   }
   return parsed as T;
 }

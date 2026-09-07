@@ -188,12 +188,12 @@ embeddings:
     base_url: https://x/v1
     api_key_env: K1
   - name: openai-3072
-    model: text-embedding-3-large
+    model: gemini-embedding-001
     dim: 3072
     base_url: https://x/v1
     api_key_env: K2
   - name: backup-3072
-    model: backup
+    model: gemini-embedding-001
     dim: 3072
     base_url: https://x/v1
     api_key_env: K3

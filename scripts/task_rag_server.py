@@ -4118,6 +4118,13 @@ def admin_usage_summary(window: str = '24h') -> UsageSummaryResponse:
     return UsageSummaryResponse(**data)
 
 
+@app.get('/admin/usage/errors', dependencies=[Depends(verify_auth)])
+def admin_usage_errors(window: str = '24h', category: str = 'all', limit: int = 50,
+                       offset: int = 0, path: str = '', container: str = '') -> dict:
+    return usage_analytics.errors(_queue_db_path(), window=window, category=category,
+                                  limit=limit, offset=offset, path=path, container=container)
+
+
 @app.get(
     '/admin/usage/endpoints',
     response_model=UsageEndpointsResponse,
@@ -4329,14 +4336,20 @@ async def admin_tools_list() -> ToolsListResponse:
     response_model=ToolInvokeResponse,
     dependencies=[Depends(verify_auth)],
 )
-async def admin_tools_invoke(tool: str, req: ToolInvokeRequest) -> ToolInvokeResponse:
+async def admin_tools_invoke(tool: str, req: ToolInvokeRequest, request: Request = None) -> ToolInvokeResponse:
     """调用一个治理工具（蓝图 P6 §A8）。dry_run 默认 true = plan 预览不改数据。
     安全工具恒真执行（manage_token_quotas / analyze_retrieval_latency 只读；
     update_container_routing 经 config_store 加性写 routing_rules）；LLM/破坏性
     工具显式 dry_run=false 才真执行（可逆快照隔离 / 附加式索引卡 / 护栏调参，
     LLM 经 rag_engine 网关）；工具被禁用返回 disabled。全程降级安全，不 raise。"""
+    container = req.container
+    if container:
+        validate_container_name(container)
+        container, _ = resolve_container_or_raise(container)
+        if not (WS / 'tasks' / 'rag' / 'containers' / container).is_dir():
+            raise HTTPException(404, 'container not found')
     result = await governance_tools.invoke_tool(
-        tool, container=req.container, params=req.params, dry_run=req.dry_run,
+        tool, container=container, params=req.params, dry_run=req.dry_run,
     )
     # 真执行改动了记忆主文件时触发 re-embed：governance_tools 不可反向 import
     # 本模块（会循环），故由端点层复用 /embed 同款入队路径 best-effort 接线；
@@ -4356,6 +4369,9 @@ async def admin_tools_invoke(tool: str, req: ToolInvokeRequest) -> ToolInvokeRes
             result['notes'] = (
                 f"{result.get('notes') or ''} | reindex enqueue failed: {exc}"
             ).strip(' |')
+    if request is not None and result.get('status') == 'error':
+        request.state.usage_error = {'error': (result.get('result') or {}).get('error'),
+                                     'notes': result.get('notes')}
     return ToolInvokeResponse(**result)
 
 

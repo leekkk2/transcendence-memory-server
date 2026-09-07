@@ -45,8 +45,8 @@
     "workerIdle": "worker 空闲",
     "containers": "容器数",
     "activeContainers": "近 24h 活跃 {{count}} 个",
-    "todayCalls": "今日调用",
-    "errorsSub": "{{count}} 个错误",
+    "todayCalls": "近24小时请求",
+    "errorsSub": "{{count}} 个错误响应",
     "p95Latency": "p95 延迟",
     "p50Sub": "p50 {{value}} ms",
     "topEndpoints": "热门端点 (24h)",
@@ -120,7 +120,21 @@
     "colContainers": "容器",
     "coldEndpoints": "冷端点（低调用量 — 评估是否下线）",
     "callsUnit": "{{count}} 次调用",
-    "noData": "暂无数据"
+    "noData": "暂无数据",
+    "viewErrors": "查看错误详情",
+    "errorCategory": "错误分类",
+    "errorWindow": "时间范围",
+    "noErrors": "所选范围没有错误",
+    "historicalError": "历史记录未保存响应正文（HTTP {{status}}）；新错误会保留脱敏详情。",
+    "previous": "上一页",
+    "next": "下一页",
+    "breakdown": "近24小时：带凭证调用错误 {{api}} 次；未认证 404 响应 {{noise}} 次（通常来自扫描或错误地址）。",
+    "categories": {
+      "all": "全部错误",
+      "authenticated": "带 API 凭证",
+      "unauthenticated_404": "未认证 404",
+      "other": "排除未认证 404"
+    }
   },
   "jobs": {
     "title": "任务队列",
@@ -294,7 +308,7 @@
     "globalConfig": "全局设置",
     "globalConfigHint": "工具总开关表、沙箱内存上限、审批有效期，以及新增工具的默认状态。",
     "scopePlaceholder": "容器",
-    "containerRequired": "请先在右上输入框填写目标容器名，再试运行 / 执行",
+    "containerRequired": "请先选择目标容器",
     "tryRun": "试运行（dry run）",
     "trying": "试运行中…",
     "tryError": "试运行失败",
@@ -358,6 +372,9 @@
       "disabled": "已禁用",
       "dry_run": "试运行",
       "deferred": "已延期"
-    }
+    },
+    "targetContainer": "目标容器",
+    "parameters": "参数（JSON）",
+    "invalidParameters": "请输入 JSON 对象"
   }
 }

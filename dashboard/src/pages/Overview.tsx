@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
 import { MetricCard } from '../components/MetricCard';
 import { ProfileList } from '../components/ProfileList';
 import { formatNumber, formatUptime } from '../lib/format';
@@ -33,7 +34,7 @@ export default function Overview() {
         <MetricCard
           title={t('overview.todayCalls')}
           value={formatNumber(summary.data?.total_calls ?? 0)}
-          sub={t('overview.errorsSub', { count: summary.data?.total_errors ?? 0 })}
+          sub={<Link to="/usage#errors" className="underline">{t('overview.errorsSub', { count: summary.data?.total_errors ?? 0 })} · {t('usage.viewErrors')}</Link>}
           trend={(summary.data?.total_errors ?? 0) > 0 ? 'down' : 'up'}
         />
         <MetricCard
@@ -42,6 +43,8 @@ export default function Overview() {
           sub={t('overview.p50Sub', { value: formatNumber(summary.data?.p50_latency_ms ?? 0) })}
         />
       </div>
+
+      <p className="text-dim text-xs">{t('usage.breakdown', { api: summary.data?.authenticated_errors ?? 0, noise: summary.data?.unauthenticated_not_found ?? 0 })}</p>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <section className="panel p-4">

@@ -161,6 +161,18 @@ def _resolve_chain_for_worker() -> list:
 def _embed_text_single(
     profile, text: str, mode: str, title: str | None,
 ) -> np.ndarray:
+    try:
+        from embedding_input import limits, parts, pool
+    except ImportError:
+        from scripts.embedding_input import limits, parts, pool
+    cap, _ = limits()
+    chunks = parts(text, cap)
+    if len(chunks) > 1:
+        return pool([_embed_text_single(profile, part, mode, title) for part in chunks], chunks)
+    return _embed_text_request(profile, text, mode, title)
+
+
+def _embed_text_request(profile, text: str, mode: str, title: str | None) -> np.ndarray:
     """单 profile 的同步 embedding 执行器 —— run_with_fallback_sync 的 per-profile 回调。
 
     profile 内部 429/5xx 走指数退避重试；4xx 非 429 立即抛 requests.HTTPError
