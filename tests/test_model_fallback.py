@@ -227,18 +227,49 @@ def test_half_open_probe_success_resets(monkeypatch):
 # =========================================================================
 # 3. 错误分类决定是否前进
 # =========================================================================
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
-def test_4xx_non_429_does_not_advance(status):
-    """4xx 非 429 → 不前进、直接上抛原始异常，fallback 不被触达。"""
+@pytest.mark.parametrize("status", [400, 401, 403, 422])
+def test_4xx_non_429_404_does_not_advance(status):
+    """4xx 非 429/404（400/401/403/422）→ 不前进、直接上抛原始异常，fallback 不被触达。"""
     ex = ProgrammableExecutor({
         "p1": [_http_error(status)],
         "p2": ["should-not-be-reached"],
     })
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(run_with_fallback("embed", [_p("p1"), _p("p2")], ex.aexec))
-    assert ex.calls == ["p1"], "非 429 错误不应触达 fallback"
+    assert ex.calls == ["p1"], f"状态码 {status} 不应触达 fallback"
     # 不计入 breaker（用户配置错，不是上游不可用）
     assert "embed:p1" not in mf._breakers or mf._breakers["embed:p1"].consecutive_fails == 0
+
+
+def test_404_advances_to_fallback():
+    """404 Not Found（模型在当前端点不存在/上游 404）→ 应前进到 fallback profile 并计入 breaker。"""
+    ex = ProgrammableExecutor({
+        "p1": [_http_error(404)],
+        "p2": ["fallback-on-404-ok"],
+    })
+    out = asyncio.run(run_with_fallback("embed", [_p("p1"), _p("p2")], ex.aexec))
+    assert out == "fallback-on-404-ok"
+    assert ex.calls == ["p1", "p2"]
+    assert mf._breakers["embed:p1"].consecutive_fails == 1
+
+
+def test_requests_http_error_404_advances_to_fallback():
+    """requests.exceptions.HTTPError(404) 在 sync runner 下同样触发 fallback。"""
+    import requests
+
+    req = requests.models.Response()
+    req.status_code = 404
+    req.url = "http://new-api:3000/v1/embeddings"
+    http_err = requests.exceptions.HTTPError("404 Client Error: Not Found", response=req)
+
+    ex = ProgrammableExecutor({
+        "p1": [http_err],
+        "p2": ["requests-fallback-ok"],
+    })
+    out = run_with_fallback_sync("embed", [_p("p1"), _p("p2")], ex.sexec)
+    assert out == "requests-fallback-ok"
+    assert ex.calls == ["p1", "p2"]
+    assert mf._breakers["embed:p1"].consecutive_fails == 1
 
 
 def test_context_overflow_does_not_advance():
@@ -253,7 +284,7 @@ def test_context_overflow_does_not_advance():
 
 
 def test_permanent_error_does_not_advance():
-    """typed ModelPermanentError → 不前进。"""
+    """typed ModelPermanentError（非 404）→ 不前进。"""
     ex = ProgrammableExecutor({
         "p1": [ModelPermanentError("bad request", status=400)],
         "p2": ["should-not-be-reached"],
@@ -264,14 +295,16 @@ def test_permanent_error_does_not_advance():
 
 
 def test_is_fallback_eligible_classification():
-    """_is_fallback_eligible：429/5xx/transport/typed-retryable 前进；
-    4xx 非 429 / permanent / context-overflow 不前进。"""
+    """_is_fallback_eligible：429/404/5xx/transport/typed-retryable 前进；
+    4xx（非 429/404）/ permanent / context-overflow 不前进。"""
     elig = mf._is_fallback_eligible
     assert elig(_http_error(429)) is True
+    assert elig(_http_error(404)) is True
     assert elig(_http_error(503)) is True
     assert elig(httpx.ConnectError("dns")) is True
     assert elig(ModelQuotaError("q", status=429)) is True
     assert elig(ModelTimeoutError("t")) is True
+    assert elig(ModelPermanentError("not found", status=404)) is True
     assert elig(_http_error(401)) is False
     assert elig(_http_error(400)) is False
     assert elig(ModelPermanentError("p", status=400)) is False

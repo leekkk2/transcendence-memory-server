@@ -333,9 +333,9 @@ def test_all_profiles_fail_raises_no_upstream_available(monkeypatch):
 # =========================================================================
 
 
-@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
-def test_4xx_non_429_does_not_fallback(monkeypatch, status_code):
-    """primary 4xx（非 429）→ 不 fallback、不消耗 fallback quota，直接抛
+@pytest.mark.parametrize("status_code", [400, 401, 403, 422])
+def test_4xx_non_429_404_does_not_fallback(monkeypatch, status_code):
+    """primary 4xx（非 429/404）→ 不 fallback、不消耗 fallback quota，直接抛
     HTTPStatusError。breaker 不计入（用户配置错，不算上游不可用）。"""
     primary = _make_profile("primary")
     fb = _make_profile("fallback")
@@ -360,13 +360,40 @@ def test_4xx_non_429_does_not_fallback(monkeypatch, status_code):
     fallback_calls = [c for c in _FakeAsyncClient.calls
                       if c["url"].startswith("https://fallback")]
     assert len(primary_calls) == 1
-    assert len(fallback_calls) == 0, "非 429 错误不应 fallback"
+    assert len(fallback_calls) == 0, "非 429/404 错误不应 fallback"
 
     # breaker 不计入失败（rerun 必须仍然能访问 primary，不会被 cooling 挡住）
     state = er_mod._breakers.get("embed:primary")
     assert state is None or state.consecutive_fails == 0, (
-        f"401/400/403 不应触发 breaker，但 state={state}"
+        f"401/400/403/422 不应触发 breaker，但 state={state}"
     )
+
+
+def test_404_does_fallback(monkeypatch):
+    """primary 404（模型在当前端点不存在 / 上游 404）→ 触发 fallback 并成功调用备用模型。"""
+    primary = _make_profile("primary")
+    fb = _make_profile("fallback")
+    reg = _make_registry([primary, fb], fallbacks=("fallback",))
+    route = reg.resolve("any")
+    func, _ = reg.build_embedding_func(route)
+
+    _install_fake_httpx(monkeypatch, {
+        "https://primary.example/v1/embeddings": [_MockResponse(404)],
+        "https://fallback.example/v1/embeddings": [
+            _MockResponse(200, embeddings=_embedding_payload(1)),
+        ],
+    })
+
+    result = asyncio.run(func(["x"]))
+    assert len(result) == 1
+    # primary 与 fallback 各被调用 1 次
+    primary_calls = [c for c in _FakeAsyncClient.calls if c["url"].startswith("https://primary")]
+    fallback_calls = [c for c in _FakeAsyncClient.calls if c["url"].startswith("https://fallback")]
+    assert len(primary_calls) == 1
+    assert len(fallback_calls) == 1
+    # 404 计入 primary breaker 失败
+    state = er_mod._breakers.get("embed:primary")
+    assert state is not None and state.consecutive_fails == 1
 
 
 def test_401_does_not_trigger_breaker_even_after_many_calls(monkeypatch):

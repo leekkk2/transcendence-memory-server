@@ -223,31 +223,68 @@ def _clear_all_breakers() -> None:
         _breakers.clear()
 
 
+def _extract_status_code(exc: BaseException) -> int | None:
+    """从异常中安全提取 HTTP 状态码（兼容 httpx、requests、ModelError）。"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    resp = getattr(exc, "response", None)
+    if resp is not None and hasattr(resp, "status_code"):
+        try:
+            return int(resp.status_code)
+        except (TypeError, ValueError):
+            pass
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status
+    return None
+
+
 # ---- 错误分类：是否值得跨 profile fallback ------------------------------
 def _is_fallback_eligible(exc: BaseException) -> bool:
     """判定异常是否值得跨 profile fallback。
 
     可前进（上游不可用，换一家可能成功）：
     - typed ModelError：error_class ∈ RETRYABLE_CLASSES（quota/timeout/
-      transient/auth）
+      transient/auth），或 status == 404
+    - 404 Not Found（模型不存在 / 上游网关返回 404，换 fallback profile 有独立模型 / 端点）
     - 429 Too Many Requests / 5xx Server Error
-    - httpx.TransportError（网络层抖动 / DNS / TCP）
+    - httpx.TransportError / requests 网络层错误（网络层抖动 / DNS / TCP / 超时）
     - ValueError（响应体损坏 / JSON 错 —— 等价上游异常）
 
     不可前进（换 profile 也没用，直接上抛）：
     - context-overflow（输入超过上下文窗口 —— 换模型救不了超长输入）
-    - 4xx 非 429（400/401/403/404/422 等配置或代码问题）
-    - typed ModelPermanentError
+    - 4xx 非 429/404（400/422 等请求参数格式错误或不可处理实体）
+    - typed ModelPermanentError（且非 404）
     """
     # context-overflow 优先判定 —— 即便包成 ValueError 也不应前进
     if model_errors.is_context_overflow(exc):
         return False
     if isinstance(exc, model_errors.ModelError):
-        return exc.error_class in model_errors.RETRYABLE_CLASSES
-    if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
-        return code == 429 or code >= 500
-    if isinstance(exc, (httpx.TransportError, ValueError)):
+        if exc.error_class in model_errors.RETRYABLE_CLASSES:
+            return True
+        if exc.status == 404:
+            return True
+        return False
+
+    status = _extract_status_code(exc)
+    if status is not None:
+        if status in (404, 429) or status >= 500:
+            return True
+        return False
+
+    if isinstance(exc, httpx.TransportError):
+        return True
+
+    try:
+        import requests
+
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout, requests.RequestException)):
+            if not isinstance(exc, requests.HTTPError):
+                return True
+    except ImportError:
+        pass
+
+    if isinstance(exc, ValueError):
         return True
     return False
 
