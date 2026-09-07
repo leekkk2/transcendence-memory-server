@@ -30,14 +30,14 @@ if [ "$(id -u)" = "0" ]; then
     chown -R "${UID_TARGET}:${GID_TARGET}" /data 2>/dev/null || \
         echo "[tm-server] WARNING: chown /data failed; continuing (volume may be on a host fs that disallows chown)"
     echo "[tm-server] flavor=${TM_BUILD_FLAVOR:-lite} workspace=${WORKSPACE:-/data} run-as=${UID_TARGET}:${GID_TARGET}"
-    exec gosu "${UID_TARGET}:${GID_TARGET}" uvicorn task_rag_server:app \
+    exec gosu "${UID_TARGET}:${GID_TARGET}" python3 -m uvicorn task_rag_server:app \
         --app-dir /app/scripts \
         --host 0.0.0.0 \
         --port 8711
 else
     ensure_data_dirs
     echo "[tm-server] flavor=${TM_BUILD_FLAVOR:-lite} workspace=${WORKSPACE:-/data} (already non-root: $(id -u))"
-    exec uvicorn task_rag_server:app \
+    exec python3 -m uvicorn task_rag_server:app \
         --app-dir /app/scripts \
         --host 0.0.0.0 \
         --port 8711
