@@ -19,6 +19,7 @@ files += [(p,'app/static/admin/'+p.relative_to(root/'dashboard/dist').as_posix()
 with tarfile.open(out,'w') as archive:
  for path,name in files:
   entry=archive.gettarinfo(str(path),name);entry.uid=entry.gid=10001;entry.uname=entry.gname='tm';entry.mtime=0
+  if path.suffix in ('.sh','.py'):entry.mode=0o755
   with path.open('rb') as f:archive.addfile(entry,f)
  data=(rev+'\n').encode();entry=tarfile.TarInfo('app/.tm-source-rev');entry.size=len(data);entry.mode=0o644;entry.uid=entry.gid=10001;archive.addfile(entry,io.BytesIO(data))
 print('source',rev,'layer_sha256',hashlib.sha256(out.read_bytes()).hexdigest())
