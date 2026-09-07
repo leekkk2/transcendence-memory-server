@@ -4243,7 +4243,7 @@ async def admin_config_update(req: ConfigUpdateRequest) -> ConfigUpdateResponse:
         if not ok:
             # set 不区分失败原因，按 KNOWN_CONFIG / HR-9 守卫推断一个可读类别，
             # 不暴露 value 本身（可能是 api_keys:* 敏感值）。
-            if upd.key not in config_store.KNOWN_CONFIG:
+            if config_store.spec_for_key(upd.key) is None:
                 reason = 'unknown_key'
             elif upd.key.startswith('config:model:base_url:'):
                 # 已知 base_url 键 set 失败：唯一附加守卫是 HR-9 主机锁。
