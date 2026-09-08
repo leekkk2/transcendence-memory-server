@@ -9,7 +9,7 @@ def private_directory(path:Path):
     if os.name!='nt':path.chmod(0o700);return
     env=os.environ.copy();env['TM_ACL_PATH']=str(path)
     # PowerShell 7's inherited module path can hide the Windows PowerShell 5.1 modules.
-    env.pop('PSModulePath',None)
+    env={k:v for k,v in env.items() if k.upper()!='PSMODULEPATH'}
     command='''$ErrorActionPreference='Stop'; $p=$env:TM_ACL_PATH;
 if ((Get-Item -LiteralPath $p).Attributes -band [IO.FileAttributes]::ReparsePoint) {throw 'Config reparse point refused'};
 $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;
