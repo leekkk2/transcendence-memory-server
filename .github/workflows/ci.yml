@@ -23,7 +23,22 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v --tb=short --junitxml=server-results.xml
+      - name: Report test failures
+        if: failure()
+        shell: python
+        run: |
+          import pathlib,xml.etree.ElementTree as ET
+          path=pathlib.Path('server-results.xml')
+          if path.exists():
+              count=0
+              for item in ET.parse(path).iter('testcase'):
+                  for kind in ['failure','error']:
+                      failure=item.find(kind)
+                      if failure is not None and count < 8:
+                          text=(failure.text or '')[-5000:].replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+                          print('::error title='+item.get('name','test')+'::'+text)
+                          count+=1
 
   docker-validate:
     needs: test
