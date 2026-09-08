@@ -32,7 +32,7 @@ def load_sources(root, sources):
     for name in sources:
         directory = root / 'tasks/rag/containers' / name
         source = directory / 'memory_objects.jsonl'
-        rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
+        rows = [json.loads(line) for line in source.read_text(encoding='utf-8').splitlines() if line.strip()]
         table = lancedb.connect(str(directory / 'lancedb')).open_table('chunks')
         indexed = table.to_arrow().to_pylist()
         manifest[name] = {'sha256': digest(source), 'objects': len(rows), 'chunks': len(indexed)}
@@ -72,7 +72,7 @@ def build(args):
     checkpoint = output / 'reconciliation-plan.json'
     if target.exists() and not getattr(args, 'resume', False):
         raise ValueError('Output target exists; retain it for inspection and use a new output workspace')
-    if target.exists() and (not checkpoint.exists() or json.loads(checkpoint.read_text()) != report):
+    if target.exists() and (not checkpoint.exists() or json.loads(checkpoint.read_text(encoding='utf-8')) != report):
         raise ValueError('Resume plan does not match source hashes, profile or input strategy')
     # Retain graph, governance snapshots and source artifacts from the primary.
     if not target.exists():
@@ -84,7 +84,7 @@ def build(args):
         if (secondary / 'raganything').exists():
             raise ValueError('Secondary has a knowledge graph: merge graph explicitly before cutover')
     source = target / 'memory_objects.jsonl'
-    source.write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in objects))
+    source.write_bytes(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in objects).encode('utf-8'))
     embed, dim, model = _build_embed_callable(args.profile)
     db = lancedb.connect(str(target / 'lancedb'))
     table = db.open_table('chunks') if (target/'lancedb/chunks.lance').exists() else None
