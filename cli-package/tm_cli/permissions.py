@@ -18,4 +18,7 @@ $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl;
 $read=Get-Acl -LiteralPath $p;
 if (-not $read.AreAccessRulesProtected) {throw 'ACL inheritance not disabled'};
 foreach($r in $read.Access) {if($r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'Unexpected ACL principal'}}'''
-    subprocess.run(['powershell','-NoProfile','-NonInteractive','-Command',command],env=env,check=True,capture_output=True)
+    result=subprocess.run(['powershell','-NoProfile','-NonInteractive','-Command',command],env=env,capture_output=True)
+    if result.returncode:
+        from .redaction import redact_text
+        raise RuntimeError('Cannot establish private config ACL: '+redact_text(result.stderr.decode(errors='replace'))[-2000:])
