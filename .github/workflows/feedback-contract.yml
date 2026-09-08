@@ -19,4 +19,17 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -e "./cli-package[dev]"
-      - run: python -m pytest --confcutdir=tests/test_cli -o addopts='' tests/test_cli -q
+      - run: python -m pytest --confcutdir=tests/test_cli -o addopts='' tests/test_cli -q --junitxml=client-results.xml
+      - name: Report contract failures
+        if: failure()
+        shell: python
+        run: |
+          import pathlib,xml.etree.ElementTree as ET
+          path=pathlib.Path('client-results.xml')
+          if path.exists():
+              for item in ET.parse(path).iter('testcase'):
+                  for kind in ['failure','error']:
+                      failure=item.find(kind)
+                      if failure is not None:
+                          text=(failure.text or '')[-12000:].replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+                          print('::error title='+item.get('name','test')+'::'+text)
