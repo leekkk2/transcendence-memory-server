@@ -1,0 +1,427 @@
+{
+  "dataset_version": "synthetic-2026-09-09",
+  "documents": [
+    {
+      "id": "eval-backup",
+      "title": "备份恢复",
+      "text": "恢复前应保存原始备份及SHA256，再在隔离目录验证，最后执行可回滚切换。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-scores",
+      "title": "检索分数",
+      "text": "平方L2距离越小越相关，重排相关性越大越相关，不能将二者求平均。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-receipts",
+      "title": "异步写入",
+      "text": "accepted代表正文已保存，index_job_id用于跟踪后台任务，索引完成后要确认原始来源召回。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-proxy",
+      "title": "网络故障",
+      "text": "代理和直连属于传输路径；502不能独自证明代理错误。写入超时后先查状态，不自动重放。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-model",
+      "title": "模型一致性",
+      "text": "相同维度不意味着相同向量空间。兼容模型别名要记录实际模型，未经批准不切换模型。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-windows",
+      "title": "Windows接入",
+      "text": "Windows以NTFS ACL保护凭证。安装器应保留用户规则，检查Python运行时及中文参数。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-queue",
+      "title": "任务队列",
+      "text": "同容器pending任务应原子合并；running期间的新写入保留后续任务，队列饱和不能丢失正文。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-rules",
+      "title": "技能发现",
+      "text": "仓库根不等于技能根。Agent入口必须关联完整SKILL、references和脚本，不能只复制一个Markdown。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-redaction",
+      "title": "凭证脱敏",
+      "text": "正文、标题、metadata和报告都应去除明文令牌。正则不是零泄露保证，需要最终扫描和受限存储。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    },
+    {
+      "id": "eval-capabilities",
+      "title": "能力探测",
+      "text": "Lite部署可以支持search但不支持query。健康接口返回的本地就绪不等于上游模型推理验证。",
+      "tags": [
+        "evaluation-fixture"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "backup-0",
+      "family": "backup",
+      "split": "calibration",
+      "query": "恢复数据前如何保留备份证据？",
+      "relevant_ids": [
+        "eval-backup"
+      ]
+    },
+    {
+      "id": "backup-1",
+      "family": "backup",
+      "split": "calibration",
+      "query": "怎样先备份再恢复服务？",
+      "relevant_ids": [
+        "eval-backup"
+      ]
+    },
+    {
+      "id": "backup-2",
+      "family": "backup",
+      "split": "calibration",
+      "query": "backup checksum before recovery",
+      "relevant_ids": [
+        "eval-backup"
+      ]
+    },
+    {
+      "id": "scores-0",
+      "family": "scores",
+      "split": "holdout",
+      "query": "向量距离和重排分分别怎么看？",
+      "relevant_ids": [
+        "eval-scores"
+      ]
+    },
+    {
+      "id": "scores-1",
+      "family": "scores",
+      "split": "holdout",
+      "query": "score是距离时应该越大越好吗？",
+      "relevant_ids": [
+        "eval-scores"
+      ]
+    },
+    {
+      "id": "scores-2",
+      "family": "scores",
+      "split": "holdout",
+      "query": "vector distance and rerank relevance directions",
+      "relevant_ids": [
+        "eval-scores"
+      ]
+    },
+    {
+      "id": "receipts-0",
+      "family": "receipts",
+      "split": "calibration",
+      "query": "accepted是否表示索引已经完成？",
+      "relevant_ids": [
+        "eval-receipts"
+      ]
+    },
+    {
+      "id": "receipts-1",
+      "family": "receipts",
+      "split": "calibration",
+      "query": "怎么验证写入的原始记录可检索？",
+      "relevant_ids": [
+        "eval-receipts"
+      ]
+    },
+    {
+      "id": "receipts-2",
+      "family": "receipts",
+      "split": "calibration",
+      "query": "accepted queued indexed receipt",
+      "relevant_ids": [
+        "eval-receipts"
+      ]
+    },
+    {
+      "id": "proxy-0",
+      "family": "proxy",
+      "split": "holdout",
+      "query": "收到502能否认定代理坏了？",
+      "relevant_ids": [
+        "eval-proxy"
+      ]
+    },
+    {
+      "id": "proxy-1",
+      "family": "proxy",
+      "split": "holdout",
+      "query": "写入超时可以立刻重复提交吗？",
+      "relevant_ids": [
+        "eval-proxy"
+      ]
+    },
+    {
+      "id": "proxy-2",
+      "family": "proxy",
+      "split": "holdout",
+      "query": "proxy failure write replay safety",
+      "relevant_ids": [
+        "eval-proxy"
+      ]
+    },
+    {
+      "id": "model-0",
+      "family": "model",
+      "split": "calibration",
+      "query": "两个1024维模型可以混写吗？",
+      "relevant_ids": [
+        "eval-model"
+      ]
+    },
+    {
+      "id": "model-1",
+      "family": "model",
+      "split": "calibration",
+      "query": "模型兼容别名和实际名称有何区别？",
+      "relevant_ids": [
+        "eval-model"
+      ]
+    },
+    {
+      "id": "model-2",
+      "family": "model",
+      "split": "calibration",
+      "query": "embedding alias vector space consistency",
+      "relevant_ids": [
+        "eval-model"
+      ]
+    },
+    {
+      "id": "windows-0",
+      "family": "windows",
+      "split": "holdout",
+      "query": "Windows配置密钥用什么权限保护？",
+      "relevant_ids": [
+        "eval-windows"
+      ]
+    },
+    {
+      "id": "windows-1",
+      "family": "windows",
+      "split": "holdout",
+      "query": "中文路径下安装客户端要检查什么？",
+      "relevant_ids": [
+        "eval-windows"
+      ]
+    },
+    {
+      "id": "windows-2",
+      "family": "windows",
+      "split": "holdout",
+      "query": "Windows NTFS ACL Python client",
+      "relevant_ids": [
+        "eval-windows"
+      ]
+    },
+    {
+      "id": "queue-0",
+      "family": "queue",
+      "split": "calibration",
+      "query": "高并发同容器任务如何合并？",
+      "relevant_ids": [
+        "eval-queue"
+      ]
+    },
+    {
+      "id": "queue-1",
+      "family": "queue",
+      "split": "calibration",
+      "query": "索引任务运行中写入怎样避免遗漏？",
+      "relevant_ids": [
+        "eval-queue"
+      ]
+    },
+    {
+      "id": "queue-2",
+      "family": "queue",
+      "split": "calibration",
+      "query": "atomic pending queue coalescing",
+      "relevant_ids": [
+        "eval-queue"
+      ]
+    },
+    {
+      "id": "rules-0",
+      "family": "rules",
+      "split": "holdout",
+      "query": "技能安装后为什么找不到references？",
+      "relevant_ids": [
+        "eval-rules"
+      ]
+    },
+    {
+      "id": "rules-1",
+      "family": "rules",
+      "split": "holdout",
+      "query": "仓库目录与Agent技能入口如何关联？",
+      "relevant_ids": [
+        "eval-rules"
+      ]
+    },
+    {
+      "id": "rules-2",
+      "family": "rules",
+      "split": "holdout",
+      "query": "skill root references complete installation",
+      "relevant_ids": [
+        "eval-rules"
+      ]
+    },
+    {
+      "id": "redaction-0",
+      "family": "redaction",
+      "split": "calibration",
+      "query": "报告可以写入API密钥吗？",
+      "relevant_ids": [
+        "eval-redaction"
+      ]
+    },
+    {
+      "id": "redaction-1",
+      "family": "redaction",
+      "split": "calibration",
+      "query": "只有记忆正文脱敏是否足够？",
+      "relevant_ids": [
+        "eval-redaction"
+      ]
+    },
+    {
+      "id": "redaction-2",
+      "family": "redaction",
+      "split": "calibration",
+      "query": "credentials report redaction metadata",
+      "relevant_ids": [
+        "eval-redaction"
+      ]
+    },
+    {
+      "id": "capabilities-0",
+      "family": "capabilities",
+      "split": "holdout",
+      "query": "lite的query未启用算服务坏了吗？",
+      "relevant_ids": [
+        "eval-capabilities"
+      ]
+    },
+    {
+      "id": "capabilities-1",
+      "family": "capabilities",
+      "split": "holdout",
+      "query": "health正常就能证明上游模型可调用吗？",
+      "relevant_ids": [
+        "eval-capabilities"
+      ]
+    },
+    {
+      "id": "capabilities-2",
+      "family": "capabilities",
+      "split": "holdout",
+      "query": "lite capability readiness versus inference",
+      "relevant_ids": [
+        "eval-capabilities"
+      ]
+    },
+    {
+      "id": "negative-0",
+      "family": "negative-0",
+      "split": "calibration",
+      "query": "怎样烤一只苹果派？",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-1",
+      "family": "negative-1",
+      "split": "holdout",
+      "query": "明天火星天气是多少度？",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-2",
+      "family": "negative-2",
+      "split": "calibration",
+      "query": "帮我挑选婚礼鲜花颜色",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-3",
+      "family": "negative-3",
+      "split": "holdout",
+      "query": "海底章鱼的睡眠时间",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-4",
+      "family": "negative-4",
+      "split": "calibration",
+      "query": "足球比赛中越位规则",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-5",
+      "family": "negative-5",
+      "split": "holdout",
+      "query": "油画颜料如何调紫色",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-6",
+      "family": "negative-6",
+      "split": "calibration",
+      "query": "儿童生日气球采购清单",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-7",
+      "family": "negative-7",
+      "split": "holdout",
+      "query": "小提琴弓毛如何更换",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-8",
+      "family": "negative-8",
+      "split": "calibration",
+      "query": "古典诗歌的平仄押韵",
+      "relevant_ids": []
+    },
+    {
+      "id": "negative-9",
+      "family": "negative-9",
+      "split": "holdout",
+      "query": "fictional dragon migration map",
+      "relevant_ids": []
+    }
+  ]
+}

@@ -770,6 +770,7 @@ _INDEX_CARD_REDUCE_SYSTEM_PROMPT = (
 # tune_model_parameters 的 LLM 输出契约：严格只回 JSON，便于机器解析+护栏校验。
 _TUNE_SYSTEM_PROMPT = (
     "你是 RAG 检索参数调优器。根据给定的检索时延/规模/当前参数信号，"
+    "similarity_threshold是平方L2距离上界，越小越严格；不是相似度或正确概率。没有质量校准数据时不修改该阈值。"
     "严格只输出一个 JSON 对象（无 markdown 包裹、无解释文字）："
     '{"similarity_threshold": float|null, "default_topk": int|null, '
     '"citation_enabled": bool|null, "rationale": str}。null 表示不调整该项。'

@@ -76,6 +76,7 @@ jobs:
           WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
           DISPATCH_REF: ${{ inputs.ref }}
+          AUTO_DEPLOY: ${{ vars.TM_AUTO_DEPLOY }}
         run: |
           set -euo pipefail
           should_deploy=false
@@ -102,6 +103,10 @@ jobs:
               ref="${DISPATCH_REF:-main}"
               ;;
           esac
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$AUTO_DEPLOY" != "true" ]; then
+            should_deploy=false
+            echo "::notice::Automatic deployment requires TM_AUTO_DEPLOY=true; use pinned per-environment rollout."
+          fi
           echo "should_deploy=${should_deploy}" >> "$GITHUB_OUTPUT"
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
           echo "decision: should_deploy=${should_deploy} ref='${ref}'"

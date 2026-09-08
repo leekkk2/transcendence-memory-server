@@ -80,7 +80,10 @@
     "noContainers": "no containers available",
     "untitled": "(untitled)",
     "noText": "(no text)",
-    "score": "score"
+    "score": "Squared L2 distance; lower is better",
+    "vectorDistance": "Vector distance",
+    "rerankRelevance": "Rerank relevance",
+    "degradedStatus": "Degraded"
   },
   "containers": {
     "title": "Containers",

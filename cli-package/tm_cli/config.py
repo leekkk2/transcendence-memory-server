@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ class Settings:
     container: str | None = None
     api_key: str | None = None
     auth_mode: str = "api_key"
+    transport_mode: str = "auto"
 
     def require_endpoint(self) -> str:
         if not self.endpoint:
@@ -105,7 +107,8 @@ def resolve_settings(
     """Resolve runtime settings with the documented priority order."""
 
     environ = env if env is not None else os.environ
-    file_cfg = load_config_file(config_path)
+    effective_path = config_path or (Path(environ["TM_CONFIG_FILE"]) if environ.get("TM_CONFIG_FILE") else None)
+    file_cfg = load_config_file(effective_path)
 
     connection = file_cfg.get("connection", {}) if isinstance(file_cfg, dict) else {}
     auth = file_cfg.get("auth", {}) if isinstance(file_cfg, dict) else {}
@@ -132,6 +135,7 @@ def resolve_settings(
         container=resolved_container,
         api_key=resolved_api_key,
         auth_mode=auth_mode,
+        transport_mode=environ.get("TM_TRANSPORT_MODE") or ("direct" if environ.get("TM_NO_PROXY")=="1" else connection.get("transport_mode", "auto")),
     )
 
 
@@ -161,7 +165,7 @@ def write_config(
 ) -> Path:
     """Write the resolved settings back to ``config.toml`` (atomic replace)."""
 
-    target = config_path or CONFIG_PATH
+    target = config_path or (Path(os.environ["TM_CONFIG_FILE"]) if os.environ.get("TM_CONFIG_FILE") else CONFIG_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     body = (
         "[connection]\n"
@@ -172,8 +176,11 @@ def write_config(
         f'mode = "{_toml_escape(auth_mode)}"\n'
         f'api_key = "{_toml_escape(api_key)}"\n'
     )
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(body, encoding="utf-8")
+    from .permissions import private_directory
+    private_directory(target.parent)
+    with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=target.parent,delete=False) as handle:
+        tmp=Path(handle.name)
+        handle.write(body)
     tmp.replace(target)
     try:
         target.chmod(0o600)

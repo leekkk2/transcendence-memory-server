@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from tm_cli import __version__
 
 from typer.testing import CliRunner
 
@@ -13,7 +14,7 @@ def test_version_prints_cli_string():
     runner = CliRunner()
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0, result.output
-    assert "transcendence-memory-cli 0.1.0" in result.stdout
+    assert f"transcendence-memory-cli {__version__}" in result.stdout
 
 
 def test_version_json():
@@ -23,4 +24,4 @@ def test_version_json():
     result = runner.invoke(app, ["--json", "version"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["cli"] == "transcendence-memory-cli 0.1.0"
+    assert payload["cli"] == f"transcendence-memory-cli {__version__}"

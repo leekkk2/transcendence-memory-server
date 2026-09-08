@@ -59,6 +59,9 @@ class EmbeddingProfile:
     timeout_s: float = _DEFAULT_EMBED_TIMEOUT_S
     max_retries: int = _DEFAULT_EMBED_MAX_RETRIES
 
+    resolved_model: str | None = None
+    model_revision: str | None = None
+
     def __repr__(self) -> str:  # 强制 redact，防止日志/调试输出泄漏 key
         return (
             f"EmbeddingProfile(name={self.name!r}, model={self.model!r}, "
@@ -216,6 +219,8 @@ def _parse_embedding(item: dict[str, Any]) -> EmbeddingProfile:
     api_key = _read_api_key(item["api_key_env"], name)
     return EmbeddingProfile(
         name=name,
+        resolved_model=item.get("resolved_model"),
+        model_revision=item.get("model_revision"),
         provider=item.get("provider", "openai_compatible"),
         model=item["model"],
         dim=int(item["dim"]),

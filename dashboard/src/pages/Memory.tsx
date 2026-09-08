@@ -32,6 +32,7 @@ interface SearchResponse {
   // Graceful-degradation metadata (Phase 1 §3): a search can partially succeed —
   // some containers return results while siblings are down/uninitialized. The
   // server keeps HTTP 200 + body flags rather than failing the whole request.
+  rerank_applied?: boolean;
   degraded?: boolean;
   is_degraded?: boolean;
   per_container_status?: Record<string, string>;
@@ -157,6 +158,7 @@ export default function Memory() {
         ) : null}
       </div>
 
+      {!isBrowse && resp ? <p className="text-dim text-xs">{t('memory.rerankRelevance')}: {resp.rerank_applied ? '✓' : '—'} · {t('memory.degradedStatus')}: {isDegraded ? '✓' : '—'}</p> : null}
       <div className="panel space-y-3 p-4">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           <label className="text-dim mono w-20 shrink-0 text-xs uppercase">{t('memory.container')}</label>

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Optional
+from pathlib import Path
+import sys
 
 import typer
 
@@ -49,6 +51,12 @@ def register(app: typer.Typer) -> None:
     def _connect(
         ctx: typer.Context,
         token: Optional[str] = typer.Argument(None, help="Base64 connection token from /export-connection-token."),
+        token_stdin: bool = typer.Option(False,"--token-stdin",help="Read the sensitive connection token from stdin."),
+        token_file: Optional[Path] = typer.Option(None,"--token-file",help="Read a protected token file."),
         manual: bool = typer.Option(False, "--manual", help="Prompt for endpoint / container / api-key interactively."),
     ) -> None:
+        if sum([bool(token), token_stdin, token_file is not None, manual]) != 1:
+            raise typer.BadParameter('Select exactly one token source or manual mode')
+        if token_stdin: token=sys.stdin.read().strip()
+        if token_file: token=token_file.read_text(encoding='utf-8').strip()
         run(_do_connect, ctx, token, manual)

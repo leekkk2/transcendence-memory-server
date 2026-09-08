@@ -53,6 +53,8 @@ def _root(
 # Subcommand registration — each command lives in its own module.
 # ---------------------------------------------------------------------------
 from .commands import (  # noqa: E402  (deferred import)
+    doctor as _doctor,
+    diagnostics as _diagnostics,
     batch as _batch,
     config_cmd as _config_cmd,
     connect as _connect,
@@ -71,7 +73,7 @@ from .commands import (  # noqa: E402  (deferred import)
 
 
 for _mod in (
-    _connect,
+    _doctor, _diagnostics,    _connect,
     _status,
     _search,
     _remember,

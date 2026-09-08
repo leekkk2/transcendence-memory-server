@@ -15,6 +15,7 @@ root=pathlib.Path.cwd();out=root/'.local/runtime-layer/app.tar'
 rev=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
 tracked=subprocess.check_output(['git','ls-files','-z','scripts','src']).decode().split('\0')
 files=[(root/p,'app/'+p) for p in tracked if p]
+files.append((root/'pyproject.toml','app/pyproject.toml'))
 files += [(p,'app/static/admin/'+p.relative_to(root/'dashboard/dist').as_posix()) for p in sorted((root/'dashboard/dist').rglob('*')) if p.is_file()]
 with tarfile.open(out,'w') as archive:
  for path,name in files:
@@ -24,6 +25,6 @@ with tarfile.open(out,'w') as archive:
  data=(rev+'\n').encode();entry=tarfile.TarInfo('app/.tm-source-rev');entry.size=len(data);entry.mode=0o644;entry.uid=entry.gid=10001;archive.addfile(entry,io.BytesIO(data))
 print('source',rev,'layer_sha256',hashlib.sha256(out.read_bytes()).hexdigest())
 PY
-"$CRANE" append --platform linux/arm64 --base "$TM_BASE_IMAGE" \
+"$CRANE" append --platform "${TM_PLATFORM:-linux/arm64}" --base "$TM_BASE_IMAGE" \
   --new_layer .local/runtime-layer/app.tar --new_tag "$TM_TARGET_IMAGE" \
   --set-base-image-annotations

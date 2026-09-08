@@ -166,7 +166,11 @@ def safe_error_detail(payload: Any) -> str:
     text = re.sub(r'\b(?:sk-|gh[pousr]_|xox[baprs]-)[A-Za-z0-9_-]+', '[REDACTED]', text)
     text = re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED]', text)
     text = re.sub(r'(https?://)[^\s/@]+:[^\s/@]+@', r'\1[REDACTED]@', text)
-    return text[:2048]
+    try:
+        from secret_redaction import redact_text
+    except ImportError:
+        from scripts.secret_redaction import redact_text
+    return redact_text(text)[:2048]
 
 
 async def _inspect_error_response(response: Response) -> str | None:

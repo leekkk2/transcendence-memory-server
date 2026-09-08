@@ -17,6 +17,10 @@ export interface MemoryRow {
   text?: string;
   tags?: string[];
   score?: number;
+  vectorScore?: number | null;
+  vector_distance?: number | null;
+  rerankScore?: number | null;
+  rerank_score?: number | null;
 }
 
 /** Stable key for a result row — taskId+chunkId is unique per chunk. */
@@ -27,7 +31,9 @@ export function memoryRowKey(row: MemoryRow, index: number): string {
 export function MemoryCard({ row }: { row: MemoryRow }) {
   const { t } = useTranslation();
   const title = row.title?.trim() || row.taskId || t('memory.untitled');
-  const hasScore = typeof row.score === 'number' && Number.isFinite(row.score);
+  const distance = row.vector_distance ?? row.vectorScore ?? row.score;
+  const rerank = row.rerank_score ?? row.rerankScore;
+  const hasScore = typeof distance === 'number' && Number.isFinite(distance);
 
   return (
     <div className="panel fade-in flex flex-col gap-2 p-3.5">
@@ -35,9 +41,10 @@ export function MemoryCard({ row }: { row: MemoryRow }) {
         <div className="min-w-0 flex-1 text-sm font-semibold leading-snug line-clamp-2">{title}</div>
         {hasScore ? (
           <span className="badge badge-cyan shrink-0" title={t('memory.score')}>
-            {row.score!.toFixed(2)}
+            {t('memory.vectorDistance')} ↓ {distance!.toFixed(4)}
           </span>
         ) : null}
+        {typeof rerank === 'number' && Number.isFinite(rerank) ? <span className="badge badge-dim">{t('memory.rerankRelevance')} ↑ {rerank.toFixed(4)}</span> : null}
       </div>
 
       <div className="text-dim line-clamp-4 text-xs leading-relaxed">{row.text ?? t('memory.noText')}</div>

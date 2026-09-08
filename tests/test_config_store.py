@@ -140,9 +140,9 @@ def test_describe_all_user_friendly_metadata_complete():
         assert isinstance(d["description"], str)
     # 抽样：老键（P6 前无 label/group）现在也有用户友好元数据。
     d = config_store.describe_key("config:rag:similarity_threshold")
-    assert d["label"] == "检索相关性门槛"
+    assert d["label"] == "向量距离上限（越小越相关）"
     assert d["group"] == "检索与引用"
-    assert "门槛" in d["description"]
+    assert "平方L2距离" in d["description"]
     d = config_store.describe_key("config:token:daily_budget")
     assert d["group"] == "用量与预算"
     assert "上限" in d["description"]

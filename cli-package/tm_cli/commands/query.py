@@ -25,7 +25,9 @@ def _do_query(state: GlobalState, mode, question: str, mode_param: str, top_k: i
     console.print(f"[bold]container[/bold]: {result.get('container', container)}")
     console.print(f"[bold]mode[/bold]     : {result.get('mode', mode_param)}")
     console.print()
-    console.print(result.get("answer") or "(no answer)")
+    console.print(result.get("answer") or "(no answer)", markup=False)
+    for citation in result.get('citations',[]):
+        console.print(f"source: {citation.get('sourcePath') or citation.get('chunkId') or 'unknown'}",markup=False)
 
 
 def register(app: typer.Typer) -> None:

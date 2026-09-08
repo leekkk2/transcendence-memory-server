@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import sys
 from email.utils import parsedate_to_datetime
@@ -170,7 +171,11 @@ async def _http_rerank(
                         score = float(item["relevance_score"])
                     except (KeyError, TypeError, ValueError):
                         continue
+                    if not math.isfinite(score) or idx < 0 or idx >= len(documents) or any(i == idx for i, _ in parsed):
+                        raise ValueError('invalid reranker score/index')
                     parsed.append((idx, score))
+                if documents and not parsed:
+                    raise ValueError('reranker returned no valid results')
                 return parsed
             except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
                 # 4xx（非 429）配置/输入错误，不重试，直接暴露给上层

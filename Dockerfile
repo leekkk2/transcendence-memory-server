@@ -353,6 +353,7 @@ ENV TM_BUILD_FLAVOR=lite \
 RUN printf '%s\n' "$TM_SOURCE_REV" > /app/.tm-source-rev
 COPY --chown=tm:tm scripts/ ./scripts/
 COPY --chown=tm:tm src/ ./src/
+COPY --chown=tm:tm pyproject.toml ./pyproject.toml
 # Admin dashboard bundle (Vite output)；FastAPI 启动时检测并挂载到 /admin/ui。
 COPY --from=ui-builder --chown=tm:tm /ui/dist /app/static/admin
 RUN chmod 755 /app/scripts/*.sh /app/scripts/*.py
@@ -398,6 +399,7 @@ ENV TM_BUILD_FLAVOR=full \
 RUN printf '%s\n' "$TM_SOURCE_REV" > /app/.tm-source-rev
 COPY --chown=tm:tm scripts/ ./scripts/
 COPY --chown=tm:tm src/ ./src/
+COPY --chown=tm:tm pyproject.toml ./pyproject.toml
 COPY --from=ui-builder --chown=tm:tm /ui/dist /app/static/admin
 RUN chmod 755 /app/scripts/*.sh /app/scripts/*.py
 

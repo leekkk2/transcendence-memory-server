@@ -327,7 +327,8 @@ def test_containers_list_includes_aliases_field(tmp_path: Path, monkeypatch):
     resp = client.get("/containers", headers=auth_headers())
     assert resp.status_code == 200
     body = resp.json()
-    target = next(c for c in body["containers"] if c["name"] == "personal-notes")
+    target = next(c for c in body["containers"] if c["id"] == "personal-notes")
+    assert target["name"] == "personal"
     assert "aliases" in target
     # active + deprecated 入列，removed 不入列
     assert sorted(target["aliases"]) == ["personal", "personal-old"]
