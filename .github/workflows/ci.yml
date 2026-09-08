@@ -36,7 +36,7 @@ jobs:
                   for kind in ['failure','error']:
                       failure=item.find(kind)
                       if failure is not None and count < 8:
-                          text=(failure.text or '')[-5000:].replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+                          text=(failure.text or '')[-1500:].replace('%','%25').replace('\r','%0D').replace('\n','%0A')
                           print('::error title='+item.get('name','test')+'::'+text)
                           count+=1
 
