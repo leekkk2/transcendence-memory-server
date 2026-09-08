@@ -97,3 +97,20 @@ def test_search_endpoint_reranks_candidates_and_expands_pool(server_module, monk
     assert [hit.chunkId for hit in body.results] == ["c", "a"]
     assert [hit.rerankScore for hit in body.results] == [0.91, 0.42]
     assert [hit.vectorScore for hit in body.results] == [0.30, 0.10]
+
+
+@pytest.mark.parametrize('bad', [
+    {'index': 0, 'relevance_score': float('nan')},
+    {'index': 1, 'relevance_score': float('inf')},
+    {'index': 9, 'relevance_score': .4},
+    {'index': 0, 'relevance_score': .5},
+    {'index': .5, 'relevance_score': .5},
+    {}, None,
+])
+def test_invalid_rerank_is_atomic(server_module, bad):
+    hits = [server_module.SearchHit(text='a', score=0), server_module.SearchHit(text='b', score=1)]
+    async def rerank(*args, **kwargs):
+        return [{'index': 0, 'relevance_score': .2}, bad]
+    with pytest.raises(ValueError):
+        server_module._apply_search_rerank('q', hits, rerank, 2)
+    assert all(h.rerankScore is None for h in hits)

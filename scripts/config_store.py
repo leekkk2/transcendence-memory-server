@@ -235,8 +235,8 @@ KNOWN_CONFIG: dict[str, _ConfigKey] = {
     # ── Live RAG knobs — actually hot-reloaded into /search & /query this round ─
     "config:rag:similarity_threshold": _ConfigKey(
         _coerce_float_or_none, typename="float", default=None, group="检索与引用",
-        label="检索相关性门槛",
-        description="检索相关性门槛：设置后低于该相关度的结果会被过滤，留空表示不过滤（返回全部匹配）",
+        label="向量距离上限（越小越相关）",
+        description="过滤平方L2距离大于该上限的结果；留空或小于等于0关闭。不是相似度或重排分下限。",
     ),
     "config:rag:citation_enabled": _ConfigKey(
         _coerce_bool, typename="bool", default=True, group="检索与引用",

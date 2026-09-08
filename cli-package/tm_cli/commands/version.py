@@ -15,11 +15,11 @@ def _do_version(state: GlobalState, mode) -> None:
     if settings.endpoint and settings.api_key:
         try:
             with state.client() as client:
-                health = client.get("/health")
+                health = client.get("/capabilities")
                 if isinstance(health, dict):
                     server_version = (
-                        health.get("service")
-                        or health.get("version")
+                        health.get("source_revision")
+                        or health.get("server_version")
                         or None
                     )
         except Exception:

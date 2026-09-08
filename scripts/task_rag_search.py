@@ -51,7 +51,7 @@ def search_lancedb(query: str, topk: int, container: str) -> dict[str, object]:
         table = db.open_table('chunks')
     vector = embed_text(query)
     cleaned: list[dict[str, object]] = []
-    for row in table.search(vector).limit(topk).to_list():
+    for row in table.search(vector).metric('l2').limit(topk).to_list():
         item = dict(row)
         distance = item.pop('_distance', None)
         item.pop('vector', None)

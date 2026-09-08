@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -1241,6 +1242,16 @@ async def _collect_health_state(container: str | None) -> dict:
     }
 
 
+@app.get('/capabilities')
+async def capabilities() -> dict:
+    try:
+        from runtime_capabilities import describe
+    except ImportError:
+        from scripts.runtime_capabilities import describe
+    state = await _collect_health_state(None)
+    return describe(state['runtime_ready'])
+
+
 @app.get('/health', response_model=HealthResponse)
 async def health(container: str | None = None) -> HealthResponse:
     state = await _collect_health_state(container)
@@ -1591,7 +1602,7 @@ def _run_single_search(
             vector = embed_text(query, mode='query')
 
         cleaned: list[dict[str, object]] = []
-        for row in table.search(vector).limit(topk).to_list():
+        for row in table.search(vector).metric('l2').limit(topk).to_list():
             item = dict(row)
             distance = item.pop('_distance', None)
             item.pop('vector', None)
@@ -1688,23 +1699,27 @@ def _apply_search_rerank(
         return []
     docs = [hit.text or hit.title or hit.source or '' for hit in hits]
     reranked = _asyncio.run(rerank_func(query, docs, top_n=topk))
-    ranked: list[SearchHit] = []
+    validated: list[tuple[int, float]] = []
     used: set[int] = set()
     for item in reranked:
         if not isinstance(item, dict):
-            continue
+            raise ValueError('invalid reranker item')
         try:
-            idx = int(item['index'])
+            raw_index = item['index']
+            idx = int(raw_index)
             score = float(item['relevance_score'])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if idx < 0 or idx >= len(hits) or idx in used:
-            continue
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('invalid reranker result') from exc
+        if isinstance(raw_index, bool) or idx != raw_index or idx < 0 or idx >= len(hits) or idx in used or not math.isfinite(score):
+            raise ValueError('invalid reranker index or non-finite score')
+        validated.append((idx, score))
+        used.add(idx)
+    ranked: list[SearchHit] = []
+    for idx, score in validated:
         hit = hits[idx]
         hit.vectorScore = hit.score
         hit.rerankScore = score
         ranked.append(hit)
-        used.add(idx)
     return ranked
 
 
@@ -1894,7 +1909,8 @@ def search(req: SearchReq) -> SearchResponse:
         deduped.append(hit)
 
     rerank_applied = False
-    rerank_warning: str | None = None
+    rerank_warning: str | None = ('rerank unavailable: no configured profile'
+                                     if req.rerank is True and not rerank_enabled else None)
     if rerank_enabled and rerank_func is not None and deduped:
         try:
             merged = _apply_search_rerank(req.query, deduped, rerank_func, req.topk)
@@ -2295,17 +2311,20 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
     # duplicate enqueues for the same container, so even posting many objects
     # in a tight loop only yields one pending embed job. The queue worker will
     # drain it later at a stable, host-friendly pace.
+    index_job_id = None
+    index_status = 'not_requested'
     if req.auto_embed:
         # 把 per-request 的 embedding 覆盖也带到 auto-embed payload，保持与显式 /embed 一致
         embed_payload: dict = {}
         if req.embedding_model:
             embed_payload['embedding_model'] = req.embedding_model
         try:
-            get_job_queue().enqueue(
+            index_job_id = get_job_queue().enqueue(
                 op='embed', container=canonical, payload=embed_payload, label='auto-embed',
                 max_pending=_env_int('TM_QUEUE_MAX_PENDING', 1000),
             )
         except QueueFullError as exc:
+            index_status = 'unavailable'
             # Don't fail the ingest — the objects ARE persisted. Just inform
             # the caller they need to /embed manually later.
             logger.warning('auto_embed dropped (queue full): %s', exc)
@@ -2313,7 +2332,12 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
                 'Memories persisted but queue is saturated; auto-embed skipped. '
                 'Run /embed manually for this container later.'
             )
+        except Exception as exc:
+            index_status = 'unavailable'
+            logger.warning('auto_embed unavailable: %s', type(exc).__name__)
+            index_hint = 'Memories persisted but indexing unavailable; check receipt before retrying.'
         else:
+            index_status = 'queued'
             index_hint = 'Embed job queued; the background worker will index this container shortly.'
     else:
         index_hint = 'Run /embed for this container to refresh LanceDB after storing new objects.'
@@ -2323,6 +2347,8 @@ def ingest_objects(req: ClientIngestReq) -> ClientIngestResponse:
     return ClientIngestResponse(
         container=req.container,
         accepted=len(lines),
+        index_job_id=index_job_id, index_status=index_status,
+        object_ids=[obj.id for obj in req.objects],
         stored_path=str(path),
         stored_paths=[str(path)],
         index_hint=index_hint,
@@ -3342,6 +3368,11 @@ async def admin_profiles() -> dict:
                 'name': p.name,
                 'provider': p.provider,
                 'model': p.model,
+                'request_model': p.model,
+                'resolved_model': p.resolved_model,
+                'model_revision': p.model_revision,
+                'identity_source': 'operator_declared' if p.resolved_model else 'unknown',
+                'input_processing': {'max_chars': os.environ.get('TM_EMBEDDING_MAX_INPUT_CHARS', '0'), 'aggregation': 'length_weighted_mean_v1'},
                 'dim': p.dim,
                 'base_url': p.base_url,
                 'api_key_configured': bool(p.api_key),

@@ -35,7 +35,7 @@ def _isolated_home(tmp_path, monkeypatch):
     ``tm_cli.config`` (reloading would break ``isinstance`` checks downstream).
     """
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path,"home",classmethod(lambda cls:tmp_path))
     import tm_cli.config as cfg
 
     new_dir = tmp_path / ".transcendence-memory"

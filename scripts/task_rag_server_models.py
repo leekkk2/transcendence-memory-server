@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 DEFAULT_CONTAINER = 'default'
@@ -74,6 +74,7 @@ class SearchReq(_WithModelOverride):
         ),
     )
     score_threshold: float | None = Field(
+        allow_inf_nan=False,
         default=None,
         description=(
             'score-gate：丢弃 score（L2 距离，越小越相关）> 该上界或 None 的 hit。'
@@ -128,14 +129,14 @@ class CommandResponse(BaseModel):
 
 
 class SearchHit(BaseModel):
-    score: float | None = None
+    score: float | None = Field(default=None, allow_inf_nan=False, description='Legacy squared L2 vector distance; lower is better. Never reranker relevance or confidence.')
     vectorScore: float | None = Field(
         default=None,
-        description='Original LanceDB vector distance before rerank. Smaller is better.',
+        allow_inf_nan=False, description='Original LanceDB squared L2 distance before rerank. Smaller is better.',
     )
     rerankScore: float | None = Field(
         default=None,
-        description='Reranker relevance score when /search rerank is applied. Larger is better.',
+        allow_inf_nan=False, description='Reranker relevance score when /search rerank is applied. Larger is better; not a calibrated probability.',
     )
     container: str | None = None
     taskId: str | None = None
@@ -151,6 +152,21 @@ class SearchHit(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
     # P4: 行号（lineStart/lineEnd）存于 metadata JSON（无新 LanceDB 列），由 server 的
     # _meta_line 从 metadata 投影到 Citation.lineStart/lineEnd —— 故 SearchHit 不设顶层行号字段。
+
+    @computed_field(description='Explicit alias of the legacy squared L2 distance; lower is better.')
+    @property
+    def vector_distance(self) -> float | None:
+        return self.score
+
+    @computed_field(description='Explicit alias of rerankScore; null when reranking is unavailable.')
+    @property
+    def rerank_score(self) -> float | None:
+        return self.rerankScore
+
+    @computed_field
+    @property
+    def distance_metric(self) -> Literal['l2_squared']:
+        return 'l2_squared'
 
 
 class Citation(BaseModel):
@@ -276,6 +292,9 @@ class ClientIngestResponse(BaseModel):
     stored_path: str
     stored_paths: list[str]
     index_hint: str
+    index_job_id: int | None = None
+    index_status: Literal['queued', 'not_requested', 'unavailable'] = 'not_requested'
+    object_ids: list[str] = Field(default_factory=list)
 
 
 # --- 多模态 RAG 集成新增模型 ---
@@ -520,6 +539,7 @@ class QueryReq(_WithModelOverride):
         ),
     )
     score_threshold: float | None = Field(
+        allow_inf_nan=False,
         default=None,
         description=(
             'score-gate：top1 chunk 的 score（L2 距离）> 该上界或未初始化时直接返回 '

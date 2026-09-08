@@ -192,6 +192,7 @@ class JobQueue:
         next_run = now + max(0, delay_sec)
         payload_json = json.dumps(payload or {}, ensure_ascii=False)
         with self._conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             if coalesce:
                 row = conn.execute(
                     """SELECT id FROM jobs
@@ -206,6 +207,7 @@ class JobQueue:
                            WHERE id=?""",
                         (next_run, row["id"]),
                     )
+                    conn.commit()
                     return int(row["id"])
             if max_pending is not None and max_pending > 0:
                 row = conn.execute(
@@ -222,6 +224,7 @@ class JobQueue:
                    VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
                 (op, container, payload_json, max_attempts, now, next_run, label),
             )
+            conn.commit()
             return int(cursor.lastrowid or 0)
 
     # ---------- claim / mark ----------

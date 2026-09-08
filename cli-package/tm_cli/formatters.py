@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 from rich.console import Console
 from rich.table import Table
+from .redaction import redact_text
 
 
 @dataclass
@@ -47,6 +49,7 @@ def emit_json(payload: Any) -> None:
 def emit_error(message: str, *, mode: OutputMode | None = None) -> None:
     """Write an error message to stderr (always — even in --quiet)."""
 
+    message=redact_text(message)
     if mode and mode.json:
         sys.stderr.write(json.dumps({"error": message}, ensure_ascii=False) + "\n")
     else:
@@ -54,21 +57,27 @@ def emit_error(message: str, *, mode: OutputMode | None = None) -> None:
     sys.stderr.flush()
 
 
-def render_search_hits(hits: Sequence[dict[str, Any]], *, console: Console, query: str, container: str, topk: int) -> None:
+def render_search_hits(hits: Sequence[dict[str, Any]], *, console: Console, query: str, container: str, topk: int, full: bool = False) -> None:
     """Render search hits as a rich table."""
 
     title = f"Search · container: {container} · query: {query} · topk: {topk}"
     table = Table(title=title, show_lines=False)
     table.add_column("Rank", justify="right", style="cyan", no_wrap=True)
-    table.add_column("Score", justify="right", style="magenta")
+    table.add_column("Vector distance ↓", justify="right", style="magenta")
+    table.add_column("Rerank relevance ↑", justify="right")
     table.add_column("Snippet", overflow="fold")
     for idx, hit in enumerate(hits, start=1):
-        score = hit.get("score")
-        score_str = f"{score:.3f}" if isinstance(score, (int, float)) else "—"
+        score = hit.get("vector_distance")
+        if score is None: score = hit.get("vectorScore")
+        if score is None: score = hit.get("score")
+        rerank = hit.get("rerank_score")
+        if rerank is None: rerank = hit.get("rerankScore")
+        rerank_str = f"{rerank:.3f}" if isinstance(rerank,(int,float)) and math.isfinite(rerank) else "—"
+        score_str = f"{score:.3f}" if isinstance(score, (int, float)) and math.isfinite(score) else "—"
         snippet = (hit.get("text") or hit.get("title") or "").strip().replace("\n", " ")
-        if len(snippet) > 240:
+        if not full and len(snippet) > 240:
             snippet = snippet[:237] + "…"
-        table.add_row(str(idx), score_str, snippet or "(empty)")
+        table.add_row(str(idx), score_str, rerank_str, snippet or "(empty)")
     console.print(table)
 
 

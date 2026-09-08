@@ -80,7 +80,10 @@
     "noContainers": "没有可用的容器",
     "untitled": "(无标题)",
     "noText": "(无内容)",
-    "score": "相关度"
+    "score": "平方L2距离，越小越相关",
+    "vectorDistance": "向量距离",
+    "rerankRelevance": "重排相关性",
+    "degradedStatus": "降级"
   },
   "containers": {
     "title": "容器",
