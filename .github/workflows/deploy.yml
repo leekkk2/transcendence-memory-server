@@ -34,16 +34,6 @@ name: Deploy
 #   DEPLOY_SMOKE         — "true" or "false" — run smoke test post-deploy (default: true)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'scripts/**'
-      - 'src/**'
-      - 'deploy/**'
-      - 'Dockerfile'
-      - 'pyproject.toml'
-      - 'docker-compose*.yml'
-      - '.github/workflows/deploy.yml'
   workflow_run:
     workflows: ["CI/CD"]
     types: [completed]
@@ -82,11 +72,6 @@ jobs:
           should_deploy=false
           ref="main"
           case "$EVENT_NAME" in
-            push)
-              should_deploy=true
-              ref="main"
-              echo "::notice::Auto-deploy triggered by push to main"
-              ;;
             workflow_run)
               # Only deploy when the upstream CI/CD succeeded on a tag push.
               if [ "$WORKFLOW_RUN_CONCLUSION" = "success" ] \
