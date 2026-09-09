@@ -36,11 +36,12 @@ jobs:
             if [ -z "${!required}" ]; then echo "::error::Missing secret: $required"; exit 1; fi
           done
           umask 077
+          export DOCKER_CONFIG="$RUNNER_TEMP/tm-preflight-registry"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$HUB_TOKEN" | docker login --username "$HUB_USER" --password-stdin
           mkdir -p "$RUNNER_TEMP/tm-ssh"
           printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/tm-ssh/key"
           cp deploy/aws-eva.known_hosts "$RUNNER_TEMP/tm-ssh/known_hosts"
-          public_key="$(ssh-keygen -y -f "$RUNNER_TEMP/tm-ssh/key")"
-          echo "::notice title=Deployment public key::$public_key"
           ssh -i "$RUNNER_TEMP/tm-ssh/key" -p "$DEPLOY_PORT" \
             -o BatchMode=yes -o ConnectTimeout=20 -o HostKeyAlias=aws-eva-deploy \
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/tm-ssh/known_hosts" \
@@ -52,7 +53,7 @@ jobs:
             }
       - name: Remove temporary SSH key
         if: always()
-        run: rm -rf "$RUNNER_TEMP/tm-ssh"
+        run: rm -rf "$RUNNER_TEMP/tm-ssh" "$RUNNER_TEMP/tm-preflight-registry"
   publish-and-deploy:
     needs: preflight
     if: github.event_name != 'push'
