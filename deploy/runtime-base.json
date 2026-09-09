@@ -1,0 +1,6 @@
+{
+  "image": "zweiteng/transcendence-memory-server@sha256:e2e352ffe90e91a01c7fc381ffd538d5a2e432b58c26f17f22c52c9cae716edb",
+  "platform": "linux/arm64",
+  "dependency_sha256": "aa1ea822ba756ac91a80fc5ee192dc6a636f6ea381727d3cb9313c8f2755fa45",
+  "approved_runtime_revision": "14df47bc6b67c5bf9807a0062f0445ceb32ef6a8"
+}

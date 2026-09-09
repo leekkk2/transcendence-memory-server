@@ -18,6 +18,8 @@ files=[(root/p,'app/'+p) for p in tracked if p]
 files.append((root/'pyproject.toml','app/pyproject.toml'))
 files += [(p,'app/static/admin/'+p.relative_to(root/'dashboard/dist').as_posix()) for p in sorted((root/'dashboard/dist').rglob('*')) if p.is_file()]
 with tarfile.open(out,'w') as archive:
+ for directory in ['app/scripts','app/src','app/static/admin']:
+  marker=tarfile.TarInfo(directory+'/.wh..wh..opq');marker.size=0;marker.mode=0o644;marker.uid=marker.gid=10001;archive.addfile(marker,io.BytesIO(b''))
  for path,name in files:
   entry=archive.gettarinfo(str(path),name);entry.uid=entry.gid=10001;entry.uname=entry.gname='tm';entry.mtime=0
   if path.suffix in ('.sh','.py'):entry.mode=0o755
@@ -28,3 +30,9 @@ PY
 "$CRANE" append --platform "${TM_PLATFORM:-linux/arm64}" --base "$TM_BASE_IMAGE" \
   --new_layer .local/runtime-layer/app.tar --new_tag "$TM_TARGET_IMAGE" \
   --set-base-image-annotations
+
+# Keep OCI metadata aligned with the code identity exposed by /capabilities.
+rev="$(git rev-parse HEAD)"
+"$CRANE" mutate "$TM_TARGET_IMAGE" --label "org.opencontainers.image.revision=$rev" \
+  --label "org.opencontainers.image.source=https://github.com/leekkk2/transcendence-memory-server" \
+  --tag "$TM_TARGET_IMAGE"
