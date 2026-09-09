@@ -50,6 +50,7 @@ jobs:
       fail-fast: false
       matrix:
         flavor: [lite, full]
+        arch: [amd64, arm64]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -184,6 +185,7 @@ jobs:
       # publish hits a 6h job timeout (v0.17.0 evidence).
       matrix:
         flavor: [lite, full]
+        arch: [amd64, arm64]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
