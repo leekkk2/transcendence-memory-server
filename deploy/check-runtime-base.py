@@ -12,6 +12,6 @@ def fingerprint(root=ROOT):
 if __name__=='__main__':
  config=json.loads((ROOT/'deploy/runtime-base.json').read_text())
  if fingerprint()!=config['dependency_sha256']:
-  raise SystemExit('Runtime dependencies changed. Build and validate a new full runtime, then update deploy/runtime-base.json.')
+  raise SystemExit('Runtime dependencies changed. Use the full Dockerfile build; the workflow will build a new native full runtime.')
  if '@sha256:' not in config['image']:raise SystemExit('Runtime base must use a digest')
  print(config['image'])
