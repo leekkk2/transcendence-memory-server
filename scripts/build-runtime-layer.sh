@@ -6,7 +6,7 @@ set -euo pipefail
 : "${TM_TARGET_IMAGE:?Set a unique output image tag}"
 : "${CRANE:=crane}"
 [[ "$TM_BASE_IMAGE" == *@sha256:* ]] || { echo 'Base must be pinned by digest' >&2; exit 1; }
-git diff --quiet && git diff --cached --quiet
+[[ -z "$(git status --porcelain)" ]] || { echo "Commit tracked changes and resolve untracked files before building" >&2; exit 1; }
 [[ -f dashboard/dist/index.html ]] || { echo 'Build dashboard first' >&2; exit 1; }
 mkdir -p .local/runtime-layer
 python3 - <<'PY'
