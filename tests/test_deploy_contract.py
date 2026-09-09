@@ -48,3 +48,4 @@ def test_application_layer_replaces_directories_and_sets_revision(tmp_path):
   assert archive.extractfile('app/.tm-source-rev').read().decode().strip()==sha
   assert archive.getmember('app/scripts/app.py').mode==0o755
  assert 'org.opencontainers.image.revision='+sha in log.read_text()
+ assert 'org.opencontainers.image.version=1' in log.read_text()

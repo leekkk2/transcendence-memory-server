@@ -33,6 +33,7 @@ PY
 
 # Keep OCI metadata aligned with the code identity exposed by /capabilities.
 rev="$(git rev-parse HEAD)"
-"$CRANE" mutate "$TM_TARGET_IMAGE" --label "org.opencontainers.image.revision=$rev" \
+version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+"$CRANE" mutate "$TM_TARGET_IMAGE" --label "org.opencontainers.image.revision=$rev" --label "org.opencontainers.image.version=$version" \
   --label "org.opencontainers.image.source=https://github.com/leekkk2/transcendence-memory-server" \
   --tag "$TM_TARGET_IMAGE"
