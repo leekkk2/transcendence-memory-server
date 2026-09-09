@@ -3,5 +3,5 @@
 See ``tm_cli.main`` for the typer entrypoint exposed as ``tm``.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = ["__version__"]

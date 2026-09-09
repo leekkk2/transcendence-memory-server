@@ -33,3 +33,11 @@ def test_verification_requires_original_source():
         def post(self,path,json_body):return {'results':[{'taskId':'another'}]}
     with pytest.raises(CLIError,match='original source'):
         verify_receipt(Fake(),{'index_job_id':1},'main',{'id':'original','text':'test'},5)
+
+
+def test_socks_proxy_environment_can_construct_client(monkeypatch):
+    monkeypatch.setenv('ALL_PROXY','socks5://127.0.0.1:19090')
+    monkeypatch.delenv('HTTP_PROXY',raising=False)
+    monkeypatch.delenv('HTTPS_PROXY',raising=False)
+    with Client(Settings(endpoint='https://example.invalid')):
+        pass
