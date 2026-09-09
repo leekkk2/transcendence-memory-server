@@ -284,10 +284,10 @@ COPY --from=deps-full --chown=tm:tm /root/.cache/mineru /home/tm/.cache/mineru
 #   官方 mineru-models-download 下载后本会调 configure_model 写 $HOME/mineru.json，但 bake 以 root 跑
 #   写到 /root/mineru.json，未被上面的 COPY（只搬 .cache/mineru）带走、且路径是 /root 而非 /home/tm，
 #   故必须在此按运行时真实路径重新生成。
-#   FINAL repo root 取 OpenDataLab/PDF-Extract-Kit*（**排除 modelscope 下载暂存空壳 ._____temp/**——
-#   实测它是 0 字节空目录，误指会让 unimernet config 缺失而解析失败）；强校验 unimernet config 存在，
-#   缺失即 build 失败（杜绝指向空目录的隐性 regression）。
-RUN PIPE_ROOT="$(find /home/tm/.cache/mineru/modelscope -type d -name 'PDF-Extract-Kit*' -not -path '*._____temp*' | head -n1)" \
+#   下载器可能走 ModelScope 或 HuggingFace fallback。以有效模型文件定位根目录，
+#   不选下载暂存空壳，也不假定缓存一定来自 ModelScope。
+RUN MODEL_CONFIG="$(find -L /home/tm/.cache/mineru -path '*/models/MFR/unimernet_hf_small_2503/config.json' -type f -not -path '*._____temp*' | head -n1)" \
+    && PIPE_ROOT="${MODEL_CONFIG%/models/MFR/unimernet_hf_small_2503/config.json}" \
     && if [ -z "$PIPE_ROOT" ] || [ ! -f "$PIPE_ROOT/models/MFR/unimernet_hf_small_2503/config.json" ]; then \
            echo "MINERU_LOCAL_ROOT_NOT_FOUND: pipeline 模型根或 unimernet config 缺失（PIPE_ROOT='$PIPE_ROOT'）— failing build"; \
            exit 1; \
