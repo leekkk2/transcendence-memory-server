@@ -4369,8 +4369,8 @@ async def admin_tools_list() -> ToolsListResponse:
 )
 async def admin_tools_invoke(tool: str, req: ToolInvokeRequest, request: Request = None) -> ToolInvokeResponse:
     """调用一个治理工具（蓝图 P6 §A8）。dry_run 默认 true = plan 预览不改数据。
-    安全工具恒真执行（manage_token_quotas / analyze_retrieval_latency 只读；
-    update_container_routing 经 config_store 加性写 routing_rules）；LLM/破坏性
+    manage_token_quotas / analyze_retrieval_latency 只读；
+    update_container_routing 在 dry_run=false 时才加性写 routing_rules；LLM/破坏性
     工具显式 dry_run=false 才真执行（可逆快照隔离 / 附加式索引卡 / 护栏调参，
     LLM 经 rag_engine 网关）；工具被禁用返回 disabled。全程降级安全，不 raise。"""
     container = req.container
