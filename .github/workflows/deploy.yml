@@ -76,10 +76,10 @@ jobs:
         with:
           node-version: '22'
       - name: Build dashboard
+        working-directory: dashboard
         run: |
-          corepack enable
-          pnpm --dir dashboard install --frozen-lockfile
-          pnpm --dir dashboard build
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm build
       - uses: docker/setup-buildx-action@v3
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/tm-registry
