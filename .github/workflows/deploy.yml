@@ -24,7 +24,7 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - name: Validate deployment credentials and SSH target
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_HOST: ${{ vars.AWS_EVA_HOST || secrets.DEPLOY_HOST }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -39,11 +39,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/tm-ssh"
           printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/tm-ssh/key"
           cp deploy/aws-eva.known_hosts "$RUNNER_TEMP/tm-ssh/known_hosts"
+          public_key="$(ssh-keygen -y -f "$RUNNER_TEMP/tm-ssh/key")"
+          echo "::notice title=Deployment public key::$public_key"
           ssh -i "$RUNNER_TEMP/tm-ssh/key" -p "$DEPLOY_PORT" \
             -o BatchMode=yes -o ConnectTimeout=20 -o HostKeyAlias=aws-eva-deploy \
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/tm-ssh/known_hosts" \
             "$DEPLOY_USER@$DEPLOY_HOST" \
-            "docker inspect tm-eva-restored-20260718-rag-server-1 --format '{{.State.Health.Status}}'; python3 -c 'import yaml'"
+            "docker inspect tm-eva-restored-20260718-rag-server-1 --format '{{.State.Health.Status}}'; python3 -c 'import yaml'" 2> "$RUNNER_TEMP/tm-ssh/error" || {
+              detail="$(tail -n 6 "$RUNNER_TEMP/tm-ssh/error" | tr '\n' ' ')"
+              echo "::error title=SSH preflight failed::$detail"
+              exit 1
+            }
       - name: Remove temporary SSH key
         if: always()
         run: rm -rf "$RUNNER_TEMP/tm-ssh"
@@ -95,7 +101,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
           IMAGE: ${{ steps.image.outputs.ref }}
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_HOST: ${{ vars.AWS_EVA_HOST || secrets.DEPLOY_HOST }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
