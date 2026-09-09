@@ -1,7 +1,7 @@
 name: Feedback contract
 on:
   push:
-    branches: ['codex/tm-feedback-fixes-*']
+    branches: ['codex/tm-*']
   pull_request:
     paths: ['cli-package/**', 'tests/test_cli/**', 'scripts/**']
   workflow_dispatch:
