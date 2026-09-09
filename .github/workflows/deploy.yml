@@ -17,7 +17,6 @@ jobs:
   preflight:
     if: github.repository == 'leekkk2/transcendence-memory-server' && (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
-    environment: production
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,6 +81,8 @@ jobs:
           pnpm --dir dashboard install --frozen-lockfile
           pnpm --dir dashboard build
       - uses: docker/setup-buildx-action@v3
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/tm-registry
       - name: Validate runtime dependencies and publish immutable application image
         id: image
         env:
@@ -90,7 +91,8 @@ jobs:
         run: |
           set -euo pipefail
           export DOCKER_CONFIG="$RUNNER_TEMP/tm-registry"
-          mkdir -m 700 "$DOCKER_CONFIG"
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
           printf '%s' "$HUB_TOKEN" | crane auth login index.docker.io --username "$HUB_USER" --password-stdin
           export TM_TARGET_IMAGE="$HUB_USER/transcendence-memory-server:main-$(git rev-parse HEAD)-full"
           export TM_PLATFORM=linux/arm64
@@ -132,4 +134,6 @@ jobs:
         run: python3 deploy/verify-public.py https://rags.zweiteng.tk "$EXPECTED_SHA"
       - name: Remove temporary credentials
         if: always()
-        run: rm -rf "$RUNNER_TEMP/tm-ssh" "$RUNNER_TEMP/tm-registry"
+        run: |
+          rm -rf "$RUNNER_TEMP/tm-ssh"
+          rm -f "$RUNNER_TEMP/tm-registry/config.json"
