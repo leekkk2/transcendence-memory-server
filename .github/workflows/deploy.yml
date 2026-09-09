@@ -1,377 +1,117 @@
-name: Deploy
-
-# Auto-deploy after a successful CI/CD release publish.
-#
-# Trigger model:
-#   1. The CI/CD workflow completes (any tag-push run that publishes images).
-#   2. We re-check that the run was on a tag and that it succeeded.
-#   3. If DEPLOY_HOST + DEPLOY_SSH_KEY secrets exist, SSH to the host and run
-#      `git fetch && git checkout <tag> && docker compose pull && systemctl reload`.
-#   4. Smoke-test the result (deploy/smoke-test.sh) and fail the workflow if it
-#      doesn't pass.
-#
-# Designed to be fork-safe: forks without deploy secrets configured will see
-# this workflow no-op (skip the deploy step) instead of failing.
-#
-# Required configuration on the deploy host (one-time):
-#   * Repo cloned at $DEPLOY_PATH (default /opt/transcendence-memory-server)
-#   * deploy/install.sh has been run (installs systemd unit)
-#   * The SSH user has NOPASSWD sudo for: docker, systemctl reload rag-everything
-#     (or run the workflow as root if you accept that posture)
-#
-# Required GitHub secrets:
-#   DEPLOY_HOST          — hostname or IP of the deploy target
-#   DEPLOY_SSH_KEY       — PEM-formatted private key (matching an authorized_keys
-#                          entry on the host); generate with `ssh-keygen -t ed25519`
-#   DEPLOY_KNOWN_HOSTS   — output of `ssh-keyscan <host>` to pin the host fingerprint
-#                          (skip with caveat — see "Trust on first use" below)
-#
-# Required GitHub variables (vars.*; not secrets — non-sensitive):
-#   DEPLOY_USER          — SSH user (default: ubuntu)
-#   DEPLOY_PORT          — SSH port (default: 22)
-#   DEPLOY_PATH          — repo path on host (default: /opt/transcendence-memory-server)
-#   DEPLOY_SUDO          — "sudo" or empty (default: sudo)
-#   DEPLOY_SMOKE         — "true" or "false" — run smoke test post-deploy (default: true)
-
+name: Deploy AWS EVA
 on:
+  push:
+    branches: ['codex/tm-autodeploy-*']
   workflow_run:
-    workflows: ["CI/CD"]
+    workflows: ['CI/CD']
     types: [completed]
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "Branch, tag or commit to deploy (default: main)"
-        required: false
-        default: "main"
-
 permissions:
   contents: read
-
+  actions: read
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: deploy-aws-eva
   cancel-in-progress: false
-
 jobs:
   preflight:
+    if: github.repository == 'leekkk2/transcendence-memory-server' && (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
-    outputs:
-      should_deploy: ${{ steps.gate.outputs.should_deploy }}
-      ref: ${{ steps.gate.outputs.ref }}
+    environment: production
     steps:
-      - name: Resolve trigger and gate the deploy
-        id: gate
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
-          DISPATCH_REF: ${{ inputs.ref }}
-          AUTO_DEPLOY: ${{ vars.TM_AUTO_DEPLOY }}
-        run: |
-          set -euo pipefail
-          should_deploy=false
-          ref="main"
-          case "$EVENT_NAME" in
-            workflow_run)
-              # Only deploy when the upstream CI/CD succeeded on a tag push.
-              if [ "$WORKFLOW_RUN_CONCLUSION" = "success" ] \
-                 && [ "$WORKFLOW_RUN_EVENT" = "push" ] \
-                 && [[ "$WORKFLOW_RUN_HEAD_BRANCH" == v* ]]; then
-                should_deploy=true
-                ref="$WORKFLOW_RUN_HEAD_BRANCH"
-              else
-                echo "::notice::CI/CD run was not a successful tag push — skipping deploy."
-              fi
-              ;;
-            workflow_dispatch)
-              should_deploy=true
-              ref="${DISPATCH_REF:-main}"
-              ;;
-          esac
-          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$AUTO_DEPLOY" != "true" ]; then
-            should_deploy=false
-            echo "::notice::Automatic deployment requires TM_AUTO_DEPLOY=true; use pinned per-environment rollout."
-          fi
-          echo "should_deploy=${should_deploy}" >> "$GITHUB_OUTPUT"
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
-          echo "decision: should_deploy=${should_deploy} ref='${ref}'"
-
-  deploy:
-    needs: preflight
-    if: needs.preflight.outputs.should_deploy == 'true'
-    runs-on: ubuntu-latest
-    # Optional: bind to a "production" environment so you can add manual approval,
-    # branch restrictions, and per-env secrets. Configure in repo settings.
-    environment:
-      name: production
-    steps:
-      - name: Detect required secrets (fork-safe)
-        id: detect
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Validate deployment credentials and SSH target
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_SSH_KEY_PRESENT: ${{ secrets.DEPLOY_SSH_KEY != '' }}
-        run: |
-          if [ -z "${DEPLOY_HOST:-}" ] || [ "${DEPLOY_SSH_KEY_PRESENT}" != "true" ]; then
-            echo "::warning::DEPLOY_HOST or DEPLOY_SSH_KEY not configured — skipping auto-deploy."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Configure SSH
-        if: steps.detect.outputs.configured == 'true'
-        env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
         run: |
           set -euo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          for required in DEPLOY_HOST DEPLOY_SSH_KEY HUB_USER HUB_TOKEN; do
+            if [ -z "${!required}" ]; then echo "::error::Missing secret: $required"; exit 1; fi
+          done
           umask 077
-          # Don't append our own newline — gh secret retains the original
-          # trailing newline from ssh-keygen output. Stricter ssh-keygen builds
-          # reject keys with double-trailing-newline as "invalid format".
-          printf '%s' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
-          # Ensure exactly one trailing newline (idempotent: appends only if missing).
-          [ -n "$(tail -c1 ~/.ssh/deploy_key)" ] && printf '\n' >> ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
-            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" >> ~/.ssh/known_hosts
-            chmod 644 ~/.ssh/known_hosts
-            echo "::notice::Pinned host fingerprint from DEPLOY_KNOWN_HOSTS secret."
-          else
-            # Fallback: trust-on-first-use via ssh-keyscan. Less safe (MITM
-            # window on first deploy) but unblocks fork users without an
-            # extra setup step. To upgrade: run `ssh-keyscan <host>` locally
-            # and store its output as the DEPLOY_KNOWN_HOSTS secret.
-            echo "::warning::DEPLOY_KNOWN_HOSTS not set — using ssh-keyscan (TOFU)."
-            ssh-keyscan -p "$DEPLOY_PORT" -T 10 "$DEPLOY_HOST" \
-              >> ~/.ssh/known_hosts 2>/dev/null
-            chmod 644 ~/.ssh/known_hosts
-          fi
-
-      - name: Deploy
-        if: steps.detect.outputs.configured == 'true'
+          mkdir -p "$RUNNER_TEMP/tm-ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/tm-ssh/key"
+          cp deploy/aws-eva.known_hosts "$RUNNER_TEMP/tm-ssh/known_hosts"
+          ssh -i "$RUNNER_TEMP/tm-ssh/key" -p "$DEPLOY_PORT" \
+            -o BatchMode=yes -o ConnectTimeout=20 -o HostKeyAlias=aws-eva-deploy \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/tm-ssh/known_hosts" \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker inspect tm-eva-restored-20260718-rag-server-1 --format '{{.State.Health.Status}}'; python3 -c 'import yaml'"
+      - name: Remove temporary SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/tm-ssh"
+  publish-and-deploy:
+    needs: preflight
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Reject stale or unverified commits
         env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: python3 deploy/check-release.py "$EXPECTED_SHA"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Install pinned image tooling
+        run: go install github.com/google/go-containerregistry/cmd/crane@v0.22.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build dashboard
+        run: |
+          corepack enable
+          pnpm --dir dashboard install --frozen-lockfile
+          pnpm --dir dashboard build
+      - name: Validate runtime dependencies and publish immutable application image
+        id: image
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/tm-registry"
+          mkdir -m 700 "$DOCKER_CONFIG"
+          printf '%s' "$HUB_TOKEN" | crane auth login index.docker.io --username "$HUB_USER" --password-stdin
+          export TM_BASE_IMAGE="$(python3 deploy/check-runtime-base.py)"
+          export TM_TARGET_IMAGE="$HUB_USER/transcendence-memory-server:main-$(git rev-parse HEAD)-full"
+          export TM_PLATFORM=linux/arm64
+          bash scripts/build-runtime-layer.sh
+          digest="$(crane digest "$TM_TARGET_IMAGE")"
+          printf 'ref=%s@%s\n' "$HUB_USER/transcendence-memory-server" "$digest" >> "$GITHUB_OUTPUT"
+      - name: Deploy verified image to AWS EVA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          IMAGE: ${{ steps.image.outputs.ref }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/home/ubuntu/services/transcendence-memory-server' }}
-          DEPLOY_SUDO: ${{ vars.DEPLOY_SUDO || '' }}
-          DEPLOY_REF: ${{ needs.preflight.outputs.ref }}
         run: |
           set -euo pipefail
-          ssh_opts=(
-            -i ~/.ssh/deploy_key
-            -p "$DEPLOY_PORT"
-            -o BatchMode=yes
-            -o ConnectTimeout=20
-            -o ServerAliveInterval=15
-            -o ServerAliveCountMax=4
-            -o StrictHostKeyChecking=accept-new
-          )
-          # Stream the remote script so we see progress live in the Actions UI.
-          ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            DEPLOY_PATH="$DEPLOY_PATH" \
-            DEPLOY_SUDO="$DEPLOY_SUDO" \
-            DEPLOY_REF="$DEPLOY_REF" \
-            'bash -se' <<'REMOTE'
-          set -euo pipefail
-          : "${DEPLOY_PATH:?}"
-          : "${DEPLOY_SUDO:=}"
-          : "${DEPLOY_REF:=main}"
-          cd "$DEPLOY_PATH"
-          git fetch --tags --prune --force origin
-          if [ "$DEPLOY_REF" = "main" ] || [ -z "$DEPLOY_REF" ]; then
-            git checkout -B main origin/main
-            git pull origin main
-          else
-            git checkout --detach "$DEPLOY_REF"
-          fi
-
-          if [ -f .env ]; then
-            env_image=$(grep -E '^TM_IMAGE=' .env | tail -n1 | cut -d= -f2- || true)
-          else
-            env_image=""
-          fi
-
-          if [ -n "$env_image" ] && [[ "$DEPLOY_REF" == v* ]]; then
-            image_base=$(printf '%s' "$env_image" | sed -E 's/:[^:]+$//')
-            env_tag=$(printf '%s' "$env_image" | awk -F: '{print $NF}')
-            case "$env_tag" in
-              lite|full) flavor="$env_tag" ;;
-              *-lite)    flavor=lite ;;
-              *-full)    flavor=full ;;
-              *)         flavor=lite ;;
-            esac
-            version="${DEPLOY_REF#v}"
-            export TM_IMAGE="${image_base}:${version}-${flavor}"
-            echo "::notice::Deploying ref=${DEPLOY_REF} as TM_IMAGE=${TM_IMAGE} on $(hostname)"
-          fi
-
-          run_compose() {
-            if [ -n "$DEPLOY_SUDO" ]; then
-              $DEPLOY_SUDO "$@"
-            else
-              "$@"
-            fi
-          }
-
-          echo "Recreating transcendence-memory-server containers..."
-          run_compose docker compose up -d --remove-orphans
-          #   * without sudo (root deploys): plain `env TM_IMAGE=... docker ...`
-          #     because --preserve-env is a sudo flag and would become the
-          #     literal command name.
-          # `--quiet` suppresses per-layer KB-progress lines (download progress
-          # still surfaces at MB granularity to stderr).
-          run_compose() {
-            if [ -n "$DEPLOY_SUDO" ]; then
-              $DEPLOY_SUDO --preserve-env=TM_IMAGE "$@"
-            else
-              env TM_IMAGE="$TM_IMAGE" "$@"
-            fi
-          }
-          export TM_IMAGE
-          # Pre-pull cleanup phase 0: kill non-compose-managed ad-hoc containers
-          # older than 24h. Root cause of 2026-05-26 disk surge: a random-name
-          # container left behind by an interactive `docker run` (no --rm) held
-          # a reference to the previous release's 6.58 GB image, preventing
-          # `docker image prune` and the explicit `docker rmi` pass below from
-          # reclaiming it. Result: two 6.58 GB images coexisted on disk and
-          # consumed all free space. We never touch compose-managed containers
-          # (filter on the com.docker.compose.project label) so production
-          # services are untouched. < 24h grace period leaves room for the
-          # operator's in-progress interactive debugging session.
-          cutoff_epoch=$(( $(date +%s) - 86400 ))
-          for cid in $($DEPLOY_SUDO docker ps -a \
-              --filter "label!=com.docker.compose.project" -q 2>/dev/null); do
-            created_iso=$($DEPLOY_SUDO docker inspect -f '{{.Created}}' "$cid" 2>/dev/null) || continue
-            created_epoch=$(date -d "$created_iso" +%s 2>/dev/null) || continue
-            if [ "$created_epoch" -lt "$cutoff_epoch" ]; then
-              name=$($DEPLOY_SUDO docker inspect -f '{{.Name}}' "$cid" | sed 's|^/||')
-              echo "[cleanup] removing non-compose ad-hoc container > 24h: $name ($cid)"
-              $DEPLOY_SUDO docker stop "$cid" >/dev/null 2>&1 || true
-              $DEPLOY_SUDO docker rm "$cid" >/dev/null 2>&1 || true
-            fi
-          done
-          # Pre-pull cleanup phase 1: drop untagged dangling images and old transcendence
-          # tags that are not currently in use. Without this, every release
-          # accretes a 6+ GB layer set on disk and we eventually hit ENOSPC
-          # mid-pull. Errors are tolerated (doesn't block the deploy).
-          $DEPLOY_SUDO docker image prune -f >/dev/null 2>&1 || true
-          # Keep at most the in-use image tag + the new pinned tag we are
-          # about to fetch. `image_base` is parsed from .env above.
-          # Single awk pass (instead of `grep -v` chain) so a 0-match step
-          # never returns non-zero and trips `set -euo pipefail`.
-          if [ -n "${image_base:-}" ]; then
-            ( $DEPLOY_SUDO docker images --format '{{.Repository}}:{{.Tag}}' \
-                | awk -v base="$image_base" -v keep="$TM_IMAGE" '
-                    index($0, base) == 1 \
-                    && $0 != keep \
-                    && $0 !~ /:(latest|lite|full)$/ { print }
-                  ' \
-                | while read -r old; do
-                    echo "[prune] removing old image: $old"
-                    $DEPLOY_SUDO docker rmi "$old" 2>/dev/null || true
-                  done
-            ) || true
-          fi
-          run_compose docker compose pull --quiet
-          run_compose docker compose up -d
-          # Wait for the container healthcheck to flip green. Budget 180s
-          # (90 ticks × 2s) — covers full-flavor cold start where mineru
-          # imports + lightrag init can push first /health past 60s.
-          for i in $(seq 1 90); do
-            status=$($DEPLOY_SUDO docker compose ps --format json 2>/dev/null \
-              | python3 -c "import sys,json; \
-                  data=[json.loads(l) for l in sys.stdin if l.strip()]; \
-                  print(next((d.get('Health') or d.get('State','') for d in data \
-                              if d.get('Service')=='rag-server'), 'missing'))" 2>/dev/null \
-              || echo "unknown")
-            echo "[wait $i/90] rag-server: $status"
-            case "$status" in
-              healthy) break ;;
-            esac
-            sleep 2
-          done
-          # Hard-fail the deploy if we never reached healthy (vs just running).
-          if [ "$status" != "healthy" ]; then
-            echo "::error::container did not flip to healthy within 180s (last status: $status)"
-            $DEPLOY_SUDO docker compose logs --tail=80 rag-server || true
-            exit 1
-          fi
-          # Confirm the redis governance dep is healthy too. compose
-          # `depends_on: redis {condition: service_healthy}` already gates
-          # rag-server start on redis, so by here it is almost always green —
-          # this is an explicit assertion + clear log line, not a long wait.
-          redis_status=$($DEPLOY_SUDO docker compose ps --format json 2>/dev/null \
-            | python3 -c "import sys,json; \
-                data=[json.loads(l) for l in sys.stdin if l.strip()]; \
-                print(next((d.get('Health') or d.get('State','') for d in data \
-                            if d.get('Service')=='redis'), 'missing'))" 2>/dev/null \
-            || echo "unknown")
-          echo "[wait] redis: $redis_status"
-          # Redis is a SOFT dependency (the app degrades gracefully when it is
-          # down) — a non-healthy redis warns but does NOT fail the deploy.
-          if [ "$redis_status" != "healthy" ]; then
-            echo "::warning::redis not healthy (status: $redis_status) — app runs degraded; governance falls back to defaults"
-            $DEPLOY_SUDO docker compose logs --tail=40 redis || true
-          fi
-          # Post-deploy cleanup: the new image is confirmed healthy and
-          # serving, so every other image of this repo is a superseded
-          # release — reclaim it now. The pre-pull prune keeps rolling
-          # :full/:lite tags (the running container may be on one), so only
-          # this post-deploy pass can drop a stale rolling tag an earlier
-          # release left behind — that accretion is what eventually fills
-          # the disk and ENOSPCs a future pull.
-          #
-          # Compare image IDs, not tags: a rolling tag still pointing at the
-          # live image is kept; one pointing at an old image is dropped — and
-          # ID comparison sidesteps the docker.io/ prefix mismatch (docker
-          # displays Hub repos without the registry prefix). `docker rmi`
-          # without -f is a safety net: it refuses anything a container holds.
-          # We filter with `docker images <repo>` on the Hub-normalized repo
-          # (docker.io/ prefix stripped) so it matches regardless of how the
-          # daemon prints the registry; non-Hub registries keep their prefix.
-          repo_match=${image_base#docker.io/}
-          repo_match=${repo_match#index.docker.io/}
-          keep_id=$($DEPLOY_SUDO docker image inspect \
-            --format '{{.Id}}' "$TM_IMAGE" 2>/dev/null || true)
-          ( $DEPLOY_SUDO docker images "$repo_match" \
-              --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-              | while read -r ref; do
-                  case "$ref" in *'<none>'*) continue ;; esac
-                  ref_id=$($DEPLOY_SUDO docker image inspect \
-                    --format '{{.Id}}' "$ref" 2>/dev/null || true)
-                  [ -n "$ref_id" ] && [ "$ref_id" != "$keep_id" ] || continue
-                  echo "[prune] removing superseded image: $ref"
-                  $DEPLOY_SUDO docker rmi "$ref" 2>/dev/null || true
-                done
-          ) || true
-          # Sweep any now-untagged layers the tag removals left dangling.
-          $DEPLOY_SUDO docker image prune -f >/dev/null 2>&1 || true
-          REMOTE
-
-      - name: Smoke test
-        if: |
-          steps.detect.outputs.configured == 'true' &&
-          (vars.DEPLOY_SMOKE == '' || vars.DEPLOY_SMOKE == 'true')
+          python3 deploy/check-release.py "$EXPECTED_SHA"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/tm-ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/tm-ssh/key"
+          ssh_opts=(-i "$RUNNER_TEMP/tm-ssh/key" -p "$DEPLOY_PORT" -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o HostKeyAlias=aws-eva-deploy -o StrictHostKeyChecking=yes -o UserKnownHostsFile=deploy/aws-eva.known_hosts)
+          ssh "${ssh_opts[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "python3 - --image '$IMAGE' --revision '$EXPECTED_SHA' --container tm-eva-restored-20260718-rag-server-1 --project tm-eva-restored-20260718 --service-dir /home/ubuntu/services/transcendence-memory-restore-20260718 --public-url https://rags.zweiteng.tk" < deploy/deploy-image.py
+      - name: Verify public revision
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
-          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/transcendence-memory-server' }}
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
-              -o BatchMode=yes -o ConnectTimeout=20 \
-              -o StrictHostKeyChecking=accept-new \
-              "${DEPLOY_USER}@${DEPLOY_HOST}" \
-              "cd '${DEPLOY_PATH}' && bash deploy/smoke-test.sh"
-
-      - name: Cleanup SSH artifacts
-        if: always() && steps.detect.outputs.configured == 'true'
-        run: |
-          rm -f ~/.ssh/deploy_key ~/.ssh/known_hosts || true
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: python3 deploy/verify-public.py https://rags.zweiteng.tk "$EXPECTED_SHA"
+      - name: Remove temporary credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/tm-ssh" "$RUNNER_TEMP/tm-registry"
