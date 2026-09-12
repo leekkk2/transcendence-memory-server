@@ -127,11 +127,11 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/tm-ssh/key"
           ssh_opts=(-i "$RUNNER_TEMP/tm-ssh/key" -p "$DEPLOY_PORT" -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o HostKeyAlias=aws-eva-deploy -o StrictHostKeyChecking=yes -o UserKnownHostsFile=deploy/aws-eva.known_hosts)
           ssh "${ssh_opts[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "python3 - --image '$IMAGE' --revision '$EXPECTED_SHA' --container tm-eva-restored-20260718-rag-server-1 --project tm-eva-restored-20260718 --service-dir /home/ubuntu/services/transcendence-memory-restore-20260718 --public-url https://rags.zweiteng.tk" < deploy/deploy-image.py
+            "python3 - --image '$IMAGE' --revision '$EXPECTED_SHA' --container tm-eva-restored-20260718-rag-server-1 --project tm-eva-restored-20260718 --service-dir /home/ubuntu/services/transcendence-memory-restore-20260718 --public-url https://rags.sanva.top" < deploy/deploy-image.py
       - name: Verify public revision
         env:
           EXPECTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-        run: python3 deploy/verify-public.py https://rags.zweiteng.tk "$EXPECTED_SHA"
+        run: python3 deploy/verify-public.py https://rags.sanva.top "$EXPECTED_SHA"
       - name: Remove temporary credentials
         if: always()
         run: |
