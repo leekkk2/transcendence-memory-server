@@ -9,8 +9,10 @@ import lancedb
 
 try:
     from task_rag_runtime import embed_text, lancedb_dir
+    from search_candidates import search_candidates
 except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.task_rag_runtime import embed_text, lancedb_dir
+    from scripts.search_candidates import search_candidates
 
 
 def _table_names(db) -> list[str]:
@@ -51,7 +53,7 @@ def search_lancedb(query: str, topk: int, container: str) -> dict[str, object]:
         table = db.open_table('chunks')
     vector = embed_text(query)
     cleaned: list[dict[str, object]] = []
-    for row in table.search(vector).metric('l2').limit(topk).to_list():
+    for row in search_candidates(table, vector, query, topk):
         item = dict(row)
         distance = item.pop('_distance', None)
         item.pop('vector', None)

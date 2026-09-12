@@ -1546,8 +1546,10 @@ def _run_single_search(
         import lancedb
         try:
             from task_rag_runtime import embed_text, lancedb_dir
+            from search_candidates import search_candidates
         except ModuleNotFoundError:
             from scripts.task_rag_runtime import embed_text, lancedb_dir
+            from scripts.search_candidates import search_candidates
 
         db_path = str(lancedb_dir(container))
         db = lancedb.connect(db_path)
@@ -1602,7 +1604,7 @@ def _run_single_search(
             vector = embed_text(query, mode='query')
 
         cleaned: list[dict[str, object]] = []
-        for row in table.search(vector).metric('l2').limit(topk).to_list():
+        for row in search_candidates(table, vector, query, topk):
             item = dict(row)
             distance = item.pop('_distance', None)
             item.pop('vector', None)
@@ -1697,7 +1699,9 @@ def _apply_search_rerank(
     """
     if not hits:
         return []
-    docs = [hit.text or hit.title or hit.source or '' for hit in hits]
+    # Put titles first: long operational notes can otherwise lose the strongest
+    # query signal when the reranker truncates the document body.
+    docs = ['\n\n'.join(part for part in (hit.title, hit.text or hit.source) if part) for hit in hits]
     reranked = _asyncio.run(rerank_func(query, docs, top_n=topk))
     validated: list[tuple[int, float]] = []
     used: set[int] = set()
@@ -1715,7 +1719,7 @@ def _apply_search_rerank(
         validated.append((idx, score))
         used.add(idx)
     ranked: list[SearchHit] = []
-    for idx, score in validated:
+    for idx, score in sorted(validated, key=lambda item: item[1], reverse=True)[:topk]:
         hit = hits[idx]
         hit.vectorScore = hit.score
         hit.rerankScore = score
