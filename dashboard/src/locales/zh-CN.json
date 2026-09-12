@@ -83,6 +83,8 @@
     "score": "平方L2距离，越小越相关",
     "vectorDistance": "向量距离",
     "rerankRelevance": "重排相关性",
+    "rerankApplied": "已按重排相关性从高到低排序",
+    "rerankUnavailable": "重排暂不可用，当前按向量距离排序",
     "degradedStatus": "降级"
   },
   "containers": {

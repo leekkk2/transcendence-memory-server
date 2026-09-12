@@ -34,18 +34,21 @@ export function MemoryCard({ row }: { row: MemoryRow }) {
   const distance = row.vector_distance ?? row.vectorScore ?? row.score;
   const rerank = row.rerank_score ?? row.rerankScore;
   const hasScore = typeof distance === 'number' && Number.isFinite(distance);
+  const hasRerank = typeof rerank === 'number' && Number.isFinite(rerank);
 
   return (
     <div className="panel fade-in flex flex-col gap-2 p-3.5">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 flex-1 text-sm font-semibold leading-snug line-clamp-2">{title}</div>
-        {hasScore ? (
-          <span className="badge badge-cyan shrink-0" title={t('memory.score')}>
-            {t('memory.vectorDistance')} ↓ {distance!.toFixed(4)}
-          </span>
-        ) : null}
-        {typeof rerank === 'number' && Number.isFinite(rerank) ? <span className="badge badge-dim">{t('memory.rerankRelevance')} ↑ {rerank.toFixed(4)}</span> : null}
-      </div>
+      <div className="text-sm font-semibold leading-snug line-clamp-2">{title}</div>
+      {hasRerank || hasScore ? (
+        <div className="flex flex-wrap gap-2">
+          {hasRerank ? <span className="badge badge-cyan">{t('memory.rerankRelevance')} ↑ {rerank.toFixed(4)}</span> : null}
+          {hasScore ? (
+            <span className={`badge ${hasRerank ? 'badge-dim' : 'badge-cyan'}`} title={t('memory.score')}>
+              {t('memory.vectorDistance')} ↓ {distance!.toFixed(4)}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="text-dim line-clamp-4 text-xs leading-relaxed">{row.text ?? t('memory.noText')}</div>
 

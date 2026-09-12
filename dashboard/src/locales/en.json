@@ -83,6 +83,8 @@
     "score": "Squared L2 distance; lower is better",
     "vectorDistance": "Vector distance",
     "rerankRelevance": "Rerank relevance",
+    "rerankApplied": "Sorted by rerank relevance, highest first",
+    "rerankUnavailable": "Reranking unavailable; sorted by vector distance",
     "degradedStatus": "Degraded"
   },
   "containers": {

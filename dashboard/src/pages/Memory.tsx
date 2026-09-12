@@ -118,7 +118,7 @@ export default function Memory() {
   // Search path: only fires once a non-empty query is submitted.
   const search = useQuery<SearchResponse>({
     queryKey: ['memory-search', container, submittedQuery, topk],
-    queryFn: () => api.post<SearchResponse>('/search', { query: submittedQuery, topk, container }),
+    queryFn: () => api.post<SearchResponse>('/search', { query: submittedQuery, topk, container, rerank: true }),
     enabled: !!container && !isBrowse,
     staleTime: 10_000,
   });
@@ -158,7 +158,12 @@ export default function Memory() {
         ) : null}
       </div>
 
-      {!isBrowse && resp ? <p className="text-dim text-xs">{t('memory.rerankRelevance')}: {resp.rerank_applied ? '✓' : '—'} · {t('memory.degradedStatus')}: {isDegraded ? '✓' : '—'}</p> : null}
+      {!isBrowse && resp && !searchError && rows.length > 0 ? (
+        <p role="status" className="text-dim text-xs">
+          {resp.rerank_applied ? t('memory.rerankApplied') : t('memory.rerankUnavailable')}
+          {isDegraded ? ` · ${t('memory.degradedStatus')}` : ''}
+        </p>
+      ) : null}
       <div className="panel space-y-3 p-4">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           <label className="text-dim mono w-20 shrink-0 text-xs uppercase">{t('memory.container')}</label>
