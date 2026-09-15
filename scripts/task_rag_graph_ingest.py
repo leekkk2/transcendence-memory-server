@@ -47,14 +47,36 @@ def _cleanup_parsed(input_path: Path) -> None:
         shutil.rmtree(parsed, ignore_errors=True)
 
 
+async def _close_lightrag(rag) -> None:
+    # Stop LightRAG's priority workers before asyncio.run cancels all tasks.
+    # Their health monitor may restart cancelled workers until shutdown is set.
+    callbacks = [
+        getattr(getattr(rag, "llm_model_func", None), "shutdown", None),
+        getattr(getattr(getattr(rag, "embedding_func", None), "func", None), "shutdown", None),
+        getattr(getattr(rag, "rerank_model_func", None), "shutdown", None),
+        *(getattr(func, "shutdown", None)
+          for func in getattr(rag, "role_llm_funcs", {}).values()),
+        getattr(rag, "finalize_storages", None),
+    ]
+    for close in callbacks:
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                _logger.warning("graph resource cleanup failed", exc_info=True)
+
+
 async def _ingest_text(container: str, input_path: Path) -> dict:
     """text 模式：读 inbox 文件正文 → LightRAG 建图。"""
     text = input_path.read_text(encoding="utf-8", errors="ignore")
     if not text.strip():
         raise ValueError(f"input file is empty: {input_path}")
     lightrag = await get_lightrag(container)
-    await lightrag.ainsert(text)
-    return {"mode": "text", "chars": len(text)}
+    try:
+        await lightrag.ainsert(text)
+        return {"mode": "text", "chars": len(text)}
+    finally:
+        await _close_lightrag(lightrag)
 
 
 async def _ingest_file(container: str, input_path: Path, parse_method: str | None) -> dict:
@@ -74,13 +96,16 @@ async def _ingest_file(container: str, input_path: Path, parse_method: str | Non
     lang = os.environ.get("RAG_PARSER_LANG")
     if lang:
         parser_kwargs["lang"] = lang
-    await rag.process_document_complete(
-        file_path=str(input_path),
-        output_dir=str(parse_output),
-        parse_method=parse_method or os.environ.get("RAG_PARSE_METHOD", "auto"),
-        **parser_kwargs,
-    )
-    return {"mode": "file", "filename": input_path.name}
+    try:
+        await rag.process_document_complete(
+            file_path=str(input_path),
+            output_dir=str(parse_output),
+            parse_method=parse_method or os.environ.get("RAG_PARSE_METHOD", "auto"),
+            **parser_kwargs,
+        )
+        return {"mode": "file", "filename": input_path.name}
+    finally:
+        await _close_lightrag(rag.lightrag)
 
 
 def main() -> int:
