@@ -533,7 +533,7 @@ def _resolve_route_and_embedding(container: str) -> tuple[Any, str, Any]:
     return route, emb_sig, embedding_func
 
 
-def _cached_instance_if_fresh(
+async def _cached_instance_if_fresh(
     cache_key: tuple[str, str, str], container: str,
 ) -> Any:
     """缓存命中时核对磁盘存储指纹：子进程摄取直接改写 working_dir 后，
@@ -552,6 +552,22 @@ def _cached_instance_if_fresh(
     )
     _lightrag_instances.pop(cache_key, None)
     _lightrag_fingerprints.pop(cache_key, None)
+    # Retire workers and per-instance shared data before loading another graph.
+    try:
+        from task_rag_graph_ingest import _close_lightrag
+    except ImportError:
+        from scripts.task_rag_graph_ingest import _close_lightrag
+    await _close_lightrag(instance)
+    from lightrag.kg import shared_storage
+    namespace = getattr(instance, "workspace", "")
+    if namespace.startswith("tm-"):
+        prefix = namespace + ":"
+        for name in ("_shared_dicts", "_init_flags", "_update_flags", "_async_locks"):
+            values = getattr(shared_storage, name, None)
+            if isinstance(values, dict):
+                for key in list(values):
+                    if isinstance(key, str) and key.startswith(prefix):
+                        values.pop(key, None)
     return None
 
 
@@ -568,7 +584,7 @@ async def get_lightrag(container: str) -> Any:
         _resolve_route_emb_rrk(container)
     cache_key = (container, emb_sig, rrk_sig)
 
-    instance = _cached_instance_if_fresh(cache_key, container)
+    instance = await _cached_instance_if_fresh(cache_key, container)
     if instance is not None:
         return instance
 

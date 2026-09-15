@@ -182,3 +182,18 @@ def test_storage_rebuild_has_fresh_shared_namespace(engine_env):
         second = await rag_engine.get_lightrag(CONTAINER)
         assert first.workspace != second.workspace
     asyncio.run(run())
+
+
+def test_rebuild_releases_previous_instance_before_loading(engine_env, monkeypatch):
+    built, directory = engine_env
+    released = []
+    async def run():
+        first = await rag_engine.get_lightrag(CONTAINER)
+        async def close():
+            released.append(first)
+        first.finalize_storages = close
+        (directory / "kv_store_full_docs.json").write_text("{}")
+        second = await rag_engine.get_lightrag(CONTAINER)
+        assert second is not first
+        assert released == [first]
+    asyncio.run(run())
