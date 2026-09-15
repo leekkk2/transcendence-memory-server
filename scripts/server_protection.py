@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import threading
@@ -59,6 +60,8 @@ class SystemHealthSnapshot:
     # cgroup-scoped values (set when running in a memory-limited container)
     cgroup_mem_limit_mb: int | None = None
     cgroup_mem_current_mb: int | None = None
+    memory_psi_some_avg10: float | None = None
+    memory_psi_some_avg60: float | None = None
 
     @property
     def swap_used_pct(self) -> float | None:
@@ -93,6 +96,18 @@ class SystemHealthSnapshot:
         candidates = [m for m in (self.mem_available_mb, self.cgroup_mem_available_mb) if m is not None]
         return min(candidates) if candidates else None
 
+    def has_swap_pressure(self, config) -> bool:
+        if self.swap_used_pct is None or self.swap_used_pct <= config.max_swap_used_pct:
+            return False
+        # Cold pages can remain swapped after a workload is removed. Require
+        # both physical headroom and measured low stalls before admitting work.
+        ample_memory = (self.effective_mem_available_mb or 0) >= max(
+            2048, 2 * config.min_available_mem_mb
+        )
+        psi = (self.memory_psi_some_avg10, self.memory_psi_some_avg60)
+        idle_reclaim = all(v is not None and math.isfinite(v) and 0 <= v < 1.0 for v in psi)
+        return not (ample_memory and idle_reclaim)
+
     def as_dict(self) -> dict:
         return {
             "mem_total_mb": self.mem_total_mb,
@@ -104,6 +119,8 @@ class SystemHealthSnapshot:
             "swap_total_mb": self.swap_total_mb,
             "swap_used_mb": self.swap_used_mb,
             "swap_used_pct": self.swap_used_pct,
+            "memory_psi_some_avg10": self.memory_psi_some_avg10,
+            "memory_psi_some_avg60": self.memory_psi_some_avg60,
             "load_1min": self.load_1min,
             "cpu_count": self.cpu_count,
             "load_per_cpu": self.load_per_cpu,
@@ -171,6 +188,18 @@ def _read_cgroup_memory() -> tuple[int | None, int | None]:
     return limit, current
 
 
+def _read_memory_psi() -> tuple[float | None, float | None]:
+    try:
+        with open("/proc/pressure/memory", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("some "):
+                    values = dict(item.split("=", 1) for item in line.split()[1:])
+                    return float(values["avg10"]), float(values["avg60"])
+    except (OSError, ValueError, KeyError):
+        pass
+    return None, None
+
+
 def read_system_health() -> SystemHealthSnapshot:
     """非阻塞读取系统健康，失败安全（任何字段允许 None）。
 
@@ -190,6 +219,7 @@ def read_system_health() -> SystemHealthSnapshot:
     swap_free = mem.get("SwapFree")
     swap_used = (swap_total - swap_free) if (swap_total and swap_free is not None) else None
     cgroup_limit, cgroup_current = _read_cgroup_memory()
+    psi_avg10, psi_avg60 = _read_memory_psi()
     return SystemHealthSnapshot(
         mem_total_mb=mem.get("MemTotal"),
         mem_available_mb=mem.get("MemAvailable"),
@@ -199,6 +229,8 @@ def read_system_health() -> SystemHealthSnapshot:
         cpu_count=cpu_count,
         cgroup_mem_limit_mb=cgroup_limit,
         cgroup_mem_current_mb=cgroup_current,
+        memory_psi_some_avg10=psi_avg10,
+        memory_psi_some_avg60=psi_avg60,
     )
 
 
@@ -272,7 +304,7 @@ class IngestGate:
                 f"system load high: load_per_cpu={snap.load_per_cpu} "
                 f"> threshold {self.config.max_load_per_cpu}",
             )
-        if snap.swap_used_pct is not None and snap.swap_used_pct > self.config.max_swap_used_pct:
+        if snap.has_swap_pressure(self.config):
             return (
                 False,
                 f"swap pressure: swap_used_pct={snap.swap_used_pct}% "

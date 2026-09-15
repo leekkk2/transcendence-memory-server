@@ -1063,7 +1063,7 @@ def _gate_status_labels(snap, config) -> dict[str, str]:
     if snap.load_per_cpu is not None:
         out['load'] = 'pressure' if snap.load_per_cpu > config.max_load_per_cpu else 'ok'
     if snap.swap_used_pct is not None:
-        out['swap'] = 'pressure' if snap.swap_used_pct > config.max_swap_used_pct else 'ok'
+        out['swap'] = 'pressure' if snap.has_swap_pressure(config) else 'ok'
     return out
 
 

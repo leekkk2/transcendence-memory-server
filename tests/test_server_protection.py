@@ -231,3 +231,43 @@ def test_bg_tracker_unregister(protection):
     # On Windows count_active() short-circuits to current dict size (no prune)
     # On POSIX prune runs but pid 12345 is already removed
     assert tr.count_active() == 0
+
+
+def test_resident_headroom_with_idle_psi_does_not_block_on_cold_swap(protection):
+    snap = _snap(protection, mem_available_mb=12000, swap_total_mb=8000, swap_used_mb=8000)
+    object.__setattr__(snap, "memory_psi_some_avg10", 0.0)
+    object.__setattr__(snap, "memory_psi_some_avg60", 0.0)
+    gate = protection.IngestGate(protection.GateConfig(max_swap_used_pct=95.0))
+    assert gate.check_admit(snap)[0]
+
+
+@pytest.mark.parametrize("available,avg10,avg60", [(1000, 0.0, 0.0), (12000, 2.0, 0.0), (12000, 0.0, 2.0)])
+def test_full_swap_still_blocks_low_headroom_or_active_reclaim(protection, available, avg10, avg60):
+    snap = _snap(protection, mem_available_mb=available, swap_total_mb=8000, swap_used_mb=8000)
+    object.__setattr__(snap, "memory_psi_some_avg10", avg10)
+    object.__setattr__(snap, "memory_psi_some_avg60", avg60)
+    gate = protection.IngestGate(protection.GateConfig(max_swap_used_pct=95.0))
+    assert not gate.check_admit(snap)[0]
+
+
+def test_cgroup_headroom_is_required_for_cold_swap_exemption(protection):
+    snap = _snap(protection, mem_available_mb=12000, swap_total_mb=8000, swap_used_mb=8000,
+                 cgroup_mem_limit_mb=4096, cgroup_mem_current_mb=3000)
+    object.__setattr__(snap, "memory_psi_some_avg10", 0.0)
+    object.__setattr__(snap, "memory_psi_some_avg60", 0.0)
+    gate = protection.IngestGate(protection.GateConfig(max_swap_used_pct=95.0))
+    assert not gate.check_admit(snap)[0]
+
+
+def test_memory_psi_reader_parses_linux_stall_measurements(protection, monkeypatch):
+    import io
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: io.StringIO(
+        "some avg10=0.25 avg60=0.50 avg300=1.23 total=1234\nfull avg10=0.00 avg60=0.00 total=567\n"))
+    assert protection._read_memory_psi() == (0.25, 0.50)
+
+
+def test_memory_psi_reader_unavailable_is_conservative(protection, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise OSError("PSI unavailable")
+    monkeypatch.setattr("builtins.open", unavailable)
+    assert protection._read_memory_psi() == (None, None)
