@@ -74,6 +74,14 @@ async def _ingest_text(container: str, input_path: Path) -> dict:
     lightrag = await get_lightrag(container)
     try:
         await lightrag.ainsert(text)
+        status_store = getattr(lightrag, "doc_status", None)
+        if status_store is not None:
+            from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding
+            doc_id = compute_mdhash_id(sanitize_text_for_encoding(text), prefix="doc-")
+            row = await status_store.get_by_id(doc_id)
+            if not row or row.get("status") != "processed":
+                detail = (row or {}).get("error_msg") or (row or {}).get("status") or "missing"
+                raise RuntimeError(f"document not processed: {doc_id}: {detail}")
         return {"mode": "text", "chars": len(text)}
     finally:
         await _close_lightrag(lightrag)

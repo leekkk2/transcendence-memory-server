@@ -116,3 +116,27 @@ def test_ingestion_closes_role_queues_on_current_lightrag(tmp_path, monkeypatch)
     source.write_text("Cedar sensor")
     asyncio.run(mod._ingest_text("test", source))
     assert events == ["role", "role", "storage"]
+
+
+@pytest.mark.parametrize("status", ["failed", "processing", None])
+def test_text_job_rejects_uncommitted_lightrag_document(tmp_path, monkeypatch, status):
+    mod = importlib.import_module("scripts.task_rag_graph_ingest")
+
+    class Status:
+        async def get_by_id(self, doc_id):
+            return {"status": status, "error_msg": "upstream timed out"} if status else None
+
+    class Rag:
+        doc_status = Status()
+        async def ainsert(self, text):
+            return "track-test"
+        async def finalize_storages(self):
+            pass
+
+    async def get_rag(container): return Rag()
+    monkeypatch.setattr(mod, "get_lightrag", get_rag)
+    source = tmp_path / "test.txt"
+    source.write_text("Cedar test")
+    with pytest.raises(RuntimeError, match="not processed"):
+        asyncio.run(mod._ingest_text("test", source))
+    assert source.exists()

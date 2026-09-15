@@ -931,7 +931,10 @@ async def start_config_subscriber() -> Any:
 
     async def _loop() -> None:
         try:
-            async for message in pubsub.listen():
+            while True:
+                # Poll below Redis's socket timeout; listen() times out on an
+                # idle config channel and permanently kills the subscriber.
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                 if not isinstance(message, dict):
                     continue
                 if message.get("type") != "message":

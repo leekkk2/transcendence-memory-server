@@ -378,3 +378,37 @@ routes:
     r3 = get_reranker_registry()
     assert r3 is not r1
     clear_reranker_registry()
+
+
+def test_rerank_batches_without_dropping_text_or_losing_indexes(monkeypatch):
+    monkeypatch.setenv("TM_RERANK_BATCH_SIZE", "2")
+    docs = ["long document " * 400, "second", "third", "fourth", "fifth"]
+    bodies = [
+        {"results": [{"index": 1, "relevance_score": 0.9}, {"index": 0, "relevance_score": 0.3}]},
+        {"results": [{"index": 0, "relevance_score": 0.95}, {"index": 1, "relevance_score": 0.6}]},
+        {"results": [{"index": 0, "relevance_score": 0.8}]},
+    ]
+    calls = []
+    client = _FakeAsyncClient([_MockResponse(200, b) for b in bodies], calls)
+    monkeypatch.setattr(rrk_mod.httpx, "AsyncClient", lambda *a, **kw: client)
+    func, _ = _make_registry().build_rerank_func(_make_profile())
+    result = asyncio.run(func("query", docs, top_n=3))
+    assert [x["index"] for x in result] == [2, 1, 4]
+    assert [doc for c in calls for doc in c["json"]["documents"]] == docs
+    assert [len(c["json"]["documents"]) for c in calls] == [2, 2, 1]
+
+
+def test_rerank_batch_failure_never_returns_partial_ranking(monkeypatch):
+    monkeypatch.setenv("TM_RERANK_BATCH_SIZE", "2")
+    monkeypatch.setattr(rrk_mod, "_DEFAULT_RERANK_MAX_RETRIES", 1)
+    calls = []
+    client = _FakeAsyncClient([
+        _MockResponse(200, {"results": [{"index": 0, "relevance_score": 0.9}]}),
+        _MockResponse(503),
+    ], calls)
+    monkeypatch.setattr(rrk_mod.httpx, "AsyncClient", lambda *a, **kw: client)
+    func, _ = _make_registry().build_rerank_func(_make_profile())
+    from scripts.model_fallback import NoUpstreamAvailable
+    with pytest.raises(NoUpstreamAvailable):
+        asyncio.run(func("query", ["a", "b", "c"], top_n=2))
+    assert len(calls) == 2

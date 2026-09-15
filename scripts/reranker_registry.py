@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import random
 import sys
 from email.utils import parsedate_to_datetime
@@ -111,6 +112,26 @@ _DEFAULT_RERANK_MAX_RETRIES = 3
 
 
 async def _http_rerank(
+    profile: RerankerProfile,
+    query: str,
+    documents: list[str],
+    top_n: int | None,
+) -> list[tuple[int, float]]:
+    batch_size = int(os.environ.get("TM_RERANK_BATCH_SIZE", "0"))
+    if batch_size <= 0 or len(documents) <= batch_size:
+        return await _http_rerank_batch(profile, query, documents, top_n)
+    combined = []
+    for offset in range(0, len(documents), batch_size):
+        batch = documents[offset:offset + batch_size]
+        scores = await _http_rerank_batch(profile, query, batch, len(batch))
+        indexes = [idx for idx, _ in scores]
+        if len(indexes) != len(set(indexes)) or any(idx >= len(batch) for idx in indexes):
+            raise ValueError("invalid reranker batch indexes")
+        combined.extend((offset + idx, score) for idx, score in scores)
+    return combined
+
+
+async def _http_rerank_batch(
     profile: RerankerProfile,
     query: str,
     documents: list[str],
