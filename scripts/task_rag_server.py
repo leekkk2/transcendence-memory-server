@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -567,6 +567,8 @@ def verify_auth(
         if session is not None and session.api_key_hash:
             from auth_session import hash_api_key
             if session.api_key_hash == hash_api_key(RAG_API_KEY):
+                if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+                    _require_csrf_header(request)
                 return
 
     # 2) header — what the CLI / curl / SDK clients have always used.
@@ -1188,6 +1190,7 @@ async def _collect_health_state(container: str | None) -> dict:
         'ingest_structured': scripts_present['structured_ingest'] and embedding_configured and lancedb_available,
         'query': documents_text_ready,
         'documents_text': documents_text_ready,
+        'documents_file': documents_text_ready and arch.multimodal_capable and arch.modules['multimodal'].ready,
     }
     avail_containers = sorted(p.name for p in containers.iterdir() if p.is_dir()) if containers.exists() else []
 
@@ -3512,8 +3515,12 @@ def list_jobs(
         raise HTTPException(status_code=400, detail=str(e))
     stats = get_job_queue().stats()
     worker_running = bool(JOB_WORKER and JOB_WORKER.is_running)
+    try:
+        from secret_redaction import redact
+    except ImportError:
+        from scripts.secret_redaction import redact
     return {
-        'jobs': [j.to_dict() for j in jobs],
+        'jobs': [redact(j.to_dict()) for j in jobs],
         'stats': stats,
         'worker_running': worker_running,
     }
@@ -3582,6 +3589,75 @@ def _stage_inbox_text(container: str, text: str) -> Path:
     return path.resolve()
 
 
+def _admin_document_store(container: str):
+    try:
+        from admin_document_store import DocumentStore
+    except ImportError:
+        from scripts.admin_document_store import DocumentStore
+    validate_container_name(container)
+    canonical, _ = resolve_container_or_raise(container)
+    validate_container_name(canonical)
+    containers = WS / 'tasks' / 'rag' / 'containers'
+    root = containers / canonical
+    if root.is_symlink() or root.resolve().parent != containers.resolve():
+        raise HTTPException(status_code=400, detail='Invalid container path.')
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail='Container not found.')
+    return DocumentStore(root)
+
+
+def _admin_snapshot_read(reader, **kwargs):
+    try:
+        from admin_document_store import SnapshotUnavailable
+    except ImportError:
+        from scripts.admin_document_store import SnapshotUnavailable
+    try:
+        return reader(**kwargs)
+    except (SnapshotUnavailable, OSError) as exc:
+        raise HTTPException(status_code=503, detail='Document or graph snapshot is temporarily unavailable. Refresh shortly.') from exc
+
+
+@app.get('/admin/documents/config', dependencies=[Depends(verify_auth)])
+def admin_documents_config() -> dict:
+    return {'max_upload_bytes': _MAX_UPLOAD_BYTES, 'text_page_chars': 12000}
+
+
+@app.get('/admin/containers/{container}/documents', dependencies=[Depends(verify_auth)])
+def admin_documents(
+    container: str, status: str = Query('', max_length=32),
+    kind: str = Query('', max_length=16), q: str = Query('', max_length=200),
+    offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100),
+    include_duplicates: bool = False,
+) -> dict:
+    store = _admin_document_store(container)
+    return _admin_snapshot_read(store.list_documents, status=status, kind=kind, q=q,
+                                offset=offset, limit=limit, include_duplicates=include_duplicates)
+
+
+@app.get('/admin/containers/{container}/documents/{document_id}', dependencies=[Depends(verify_auth)])
+def admin_document_detail(
+    container: str, document_id: str,
+    text_offset: int = Query(0, ge=0), text_limit: int = Query(12000, ge=1, le=30000),
+    chunk_offset: int = Query(0, ge=0), chunk_limit: int = Query(10, ge=1, le=50),
+) -> dict:
+    store = _admin_document_store(container)
+    result = _admin_snapshot_read(store.document, doc_id=document_id,
+                                 text_offset=text_offset, text_limit=text_limit,
+                                 chunk_offset=chunk_offset, chunk_limit=chunk_limit)
+    if result is None:
+        raise HTTPException(status_code=404, detail='Document not found.')
+    return result
+
+
+@app.get('/admin/containers/{container}/graph', dependencies=[Depends(verify_auth)])
+def admin_graph(
+    container: str, q: str = Query('', max_length=200),
+    node_limit: int = Query(60, ge=1, le=150), edge_limit: int = Query(120, ge=1, le=300),
+) -> dict:
+    store = _admin_document_store(container)
+    return _admin_snapshot_read(store.graph, q=q, node_limit=node_limit, edge_limit=edge_limit)
+
+
 @app.post('/documents/text', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
 def ingest_document_text(req: DocumentTextReq) -> CommandResponse:
     """把纯文本异步入库到 container 知识图谱。
@@ -3610,7 +3686,7 @@ def ingest_document_text(req: DocumentTextReq) -> CommandResponse:
         payload=payload,
         timeout_s=300,
         wait=False,
-        label='ingest-document-text',
+        label=req.description or 'ingest-document-text',
         embedding_override=req.embedding_model,
         coalesce=False,
     )
@@ -3664,6 +3740,7 @@ async def _ingest_uploaded_document(
     file: UploadFile,
     parse_method: str | None,
     embedding_model: str | None,
+    description: str | None = None,
 ) -> CommandResponse:
     """/documents/file 与 /documents/upload 的共享异步入库逻辑。
 
@@ -3692,7 +3769,7 @@ async def _ingest_uploaded_document(
         payload=payload,
         timeout_s=600,
         wait=False,
-        label='ingest-document-file',
+        label=description or filename,
         embedding_override=embedding_model,
         coalesce=False,
     )
@@ -3704,13 +3781,14 @@ async def ingest_document_file(
     file: UploadFile = File(...),
     parse_method: str | None = Form(default=None),
     embedding_model: str | None = Form(default=None),
+    description: str | None = Form(default=None),
 ) -> CommandResponse:
     """多模态文档异步入库：PDF / Office / 图片 / HTML / Markdown 等。
 
     底层走 RAGAnything.process_document_complete → mineru parser → LightRAG，
     与 /documents/text 写入同一容器知识图谱。轮询 GET /jobs/{pid} 查进度。
     """
-    return await _ingest_uploaded_document(container, file, parse_method, embedding_model)
+    return await _ingest_uploaded_document(container, file, parse_method, embedding_model, description)
 
 
 @app.post('/documents/upload', response_model=CommandResponse, dependencies=[Depends(verify_auth)])
@@ -3719,9 +3797,10 @@ async def upload_document(
     file: UploadFile = File(...),
     parse_method: str | None = Form(default=None),
     embedding_model: str | None = Form(default=None),
+    description: str | None = Form(default=None),
 ) -> CommandResponse:
     """/documents/file 的别名路由，行为完全一致（异步入队多模态文档）。"""
-    return await _ingest_uploaded_document(container, file, parse_method, embedding_model)
+    return await _ingest_uploaded_document(container, file, parse_method, embedding_model, description)
 
 
 _EMBED_MM_MAX_BYTES = int(os.environ.get('EMBED_MM_MAX_BYTES', str(20 * 1024 * 1024)))

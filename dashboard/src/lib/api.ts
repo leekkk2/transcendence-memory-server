@@ -30,12 +30,12 @@ async function request<T>(method: Method, path: string, body?: unknown): Promise
     method,
     credentials: 'same-origin',
     headers: {
-      'Content-Type': 'application/json',
+      ...(body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
       'X-Requested-With': 'XMLHttpRequest',
     },
   };
   if (body !== undefined) {
-    init.body = JSON.stringify(body);
+    init.body = body instanceof FormData ? body : JSON.stringify(body);
   }
 
   const res = await fetch(`${BASE}${path}`, init);
@@ -62,6 +62,7 @@ async function request<T>(method: Method, path: string, body?: unknown): Promise
 }
 
 export const api = {
+  upload: <T = unknown>(path: string, body: FormData) => request<T>('POST', path, body),
   get: <T = unknown>(path: string) => request<T>('GET', path),
   post: <T = unknown>(path: string, body?: unknown) => request<T>('POST', path, body),
   put: <T = unknown>(path: string, body?: unknown) => request<T>('PUT', path, body),

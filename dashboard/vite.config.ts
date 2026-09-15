@@ -53,6 +53,7 @@ export default defineConfig({
     // shadow Vite's static/source middleware.
     proxy: Object.fromEntries(
       [
+        '/admin/documents', '/admin/containers', '/documents', '/capabilities',
         '/admin/usage',
         '/admin/profiles',
         '/admin/system-health',

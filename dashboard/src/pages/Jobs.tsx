@@ -1,3 +1,6 @@
+import { useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { api } from '../lib/api';
 import { useTranslation } from 'react-i18next';
 import { useJobs } from '../lib/queries';
 import { formatNumber, formatRelative } from '../lib/format';
@@ -27,7 +30,13 @@ function statusBadgeClass(status: string): string {
 
 export default function Jobs() {
   const { t } = useTranslation();
-  const { data, isLoading } = useJobs();
+  const { data, isLoading, error } = useJobs();
+  const cache = useQueryClient();
+  const [confirmId, setConfirmId] = useState<number | null>(null);
+  const cancel = useMutation({
+    mutationFn: (id: number) => api.del('/jobs/' + id),
+    onSuccess: () => { setConfirmId(null); void cache.invalidateQueries({ queryKey: ['jobs'] }); },
+  });
 
   const rows = data?.jobs ?? [];
   // Prefer server-wide stats; fall back to counting the visible page.
@@ -57,6 +66,9 @@ export default function Jobs() {
         ))}
       </div>
 
+      {error && <p role="alert" className="text-sm text-red">{error.message}</p>}
+      {cancel.isError && <p role="alert" className="text-sm text-red">{cancel.error.message}</p>}
+      <p className="text-dim text-xs">{t('jobs.cancelHint')}</p>
       <div className="panel overflow-x-auto">
         <table className="tbl">
           <thead>
@@ -67,18 +79,19 @@ export default function Jobs() {
               <th>{t('jobs.colStatus')}</th>
               <th className="text-right">{t('jobs.colAttempts')}</th>
               <th className="text-right">{t('jobs.colCreated')}</th>
+              <th>{t('jobs.actions')}</th>
             </tr>
           </thead>
           <tbody>
             {isLoading ? (
               <tr>
-                <td colSpan={6} className="text-dim py-8 text-center text-sm">
+                <td colSpan={7} className="text-dim py-8 text-center text-sm">
                   {t('common.loading')}
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td colSpan={6} className="text-dim py-8 text-center text-sm">
+                <td colSpan={7} className="text-dim py-8 text-center text-sm">
                   {t('jobs.noJobs')}
                 </td>
               </tr>
@@ -86,7 +99,7 @@ export default function Jobs() {
               rows.map((j) => (
                 <tr key={j.id}>
                   <td className="mono text-xs">{j.id}</td>
-                  <td className="mono text-xs">{j.label || j.op}</td>
+                  <td className="text-xs">{j.label || j.op}{j.last_error && <details className="mt-2 max-w-md"><summary className="cursor-pointer text-red">{t('jobs.errorDetail')}</summary><pre className="mt-2 whitespace-pre-wrap break-words font-sans text-xs text-red">{j.last_error}</pre></details>}</td>
                   <td className="mono text-xs">{j.container}</td>
                   <td>
                     <span className={statusBadgeClass(j.status)}>
@@ -98,6 +111,7 @@ export default function Jobs() {
                     {j.attempts ?? 0}/{j.max_attempts ?? '—'}
                   </td>
                   <td className="mono text-dim text-right text-xs">{formatRelative(j.enqueued_at)}</td>
+                  <td>{j.status === 'pending' && (confirmId === j.id ? <div className="flex gap-2"><button className="btn text-red" disabled={cancel.isPending} onClick={() => cancel.mutate(j.id)}>{t('jobs.confirmCancel')}</button><button className="btn" disabled={cancel.isPending} onClick={() => setConfirmId(null)}>{t('jobs.keepJob')}</button></div> : <button className="btn whitespace-nowrap" onClick={() => setConfirmId(j.id)}>{t('jobs.cancelJob')}</button>)}</td>
                 </tr>
               ))
             )}

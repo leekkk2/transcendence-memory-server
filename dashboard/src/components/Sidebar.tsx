@@ -4,6 +4,8 @@ import {
   Activity,
   Boxes,
   Brain,
+  Files,
+  Network,
   Coins,
   LineChart,
   ListChecks,
@@ -32,6 +34,8 @@ const ITEMS: NavItem[] = [
   { to: '/overview', key: 'nav.overview', icon: Activity },
   { to: '/containers', key: 'nav.containers', icon: Boxes },
   { to: '/memory', key: 'nav.memory', icon: Brain },
+  { to: '/documents', key: 'nav.documents', icon: Files },
+  { to: '/knowledge', key: 'nav.knowledge', icon: Network },
   { to: '/usage', key: 'nav.usage', icon: LineChart, badge: '7d' },
   { to: '/tokens', key: 'nav.tokens', icon: Coins, badge: '7d' },
   { to: '/jobs', key: 'nav.jobs', icon: ListChecks },
@@ -52,7 +56,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         <span className="text-dim mr-1">tm</span>
         <span className="accent">admin</span>
       </div>
-      <nav className="flex flex-col gap-0.5 px-3">
+      <nav className="flex min-h-0 flex-col gap-0.5 overflow-y-auto px-3 pb-4">
         {ITEMS.map(({ to, key, icon: Icon, badge }) => (
           <NavLink
             key={to}

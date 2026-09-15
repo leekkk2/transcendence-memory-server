@@ -15,6 +15,8 @@ export interface HealthResponse {
   architecture: string;
   build_flavor: 'lite' | 'full';
   multimodal_capable: boolean;
+  runtime_ready: Record<string, boolean>;
+  degraded_reasons: string[];
   uptime_seconds: number;
   worker_running: boolean;
   accepting_ingest: boolean;
@@ -39,6 +41,7 @@ export interface UsageSummary {
 // index_state) — an earlier guess at memory_count / last_active silently
 // rendered every row as "—". Keep these aligned with the server contract.
 export interface ContainerListItem {
+  id?: string;
   name: string;
   objects?: number;
   indexed?: boolean;

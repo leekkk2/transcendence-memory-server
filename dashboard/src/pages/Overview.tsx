@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
+import { FullCapabilities } from '../components/FullCapabilities';
 import { MetricCard } from '../components/MetricCard';
 import { ProfileList } from '../components/ProfileList';
 import { formatNumber, formatUptime } from '../lib/format';
@@ -43,6 +44,8 @@ export default function Overview() {
           sub={t('overview.p50Sub', { value: formatNumber(summary.data?.p50_latency_ms ?? 0) })}
         />
       </div>
+
+      <FullCapabilities />
 
       <p className="text-dim text-xs">{t('usage.breakdown', { api: summary.data?.authenticated_errors ?? 0, noise: summary.data?.unauthenticated_not_found ?? 0 })}</p>
 

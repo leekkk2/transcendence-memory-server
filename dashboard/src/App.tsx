@@ -2,6 +2,8 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { Shell } from './components/Shell';
 import Login from './pages/Login';
+import Documents from './pages/Documents';
+import Knowledge from './pages/Knowledge';
 import Overview from './pages/Overview';
 import Containers from './pages/Containers';
 import ContainerDetail from './pages/ContainerDetail';
@@ -37,6 +39,8 @@ export default function App() {
         <Route path="/containers" element={<Containers />} />
         <Route path="/containers/:name" element={<ContainerDetail />} />
         <Route path="/memory" element={<Memory />} />
+        <Route path="/documents" element={<Documents />} />
+        <Route path="/knowledge" element={<Knowledge />} />
         <Route path="/usage" element={<Usage />} />
         <Route path="/tokens" element={<TokenCost />} />
         <Route path="/jobs" element={<Jobs />} />
