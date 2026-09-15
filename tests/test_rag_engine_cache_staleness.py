@@ -29,12 +29,15 @@ def _install_fake_lightrag(monkeypatch, built: list) -> None:
     class FakeLightRAG:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.workspace = kwargs.get("workspace", "")
+            self.full_docs = SimpleNamespace(workspace=self.workspace)
+            self.doc_status = SimpleNamespace(workspace=self.workspace)
             built.append(self)
 
         async def initialize_storages(self):
             pass
 
-    async def initialize_pipeline_status():
+    async def initialize_pipeline_status(**kwargs):
         pass
 
     lightrag_mod = types.ModuleType("lightrag")
@@ -160,3 +163,22 @@ def test_storage_fingerprint_is_stat_based(tmp_path):
     # 排除清单内的文件不影响指纹
     (tmp_path / "kv_store_llm_response_cache.json").write_text("{}")
     assert rag_engine._storage_fingerprint(tmp_path) == fp3
+
+
+def test_distinct_containers_do_not_share_in_memory_namespace(engine_env):
+    built, _ = engine_env
+    asyncio.run(rag_engine.get_lightrag("first"))
+    asyncio.run(rag_engine.get_lightrag("second"))
+    assert built[0].workspace != built[1].workspace
+    assert built[0].full_docs.workspace == built[0].workspace
+    assert built[1].doc_status.workspace == built[1].workspace
+
+
+def test_storage_rebuild_has_fresh_shared_namespace(engine_env):
+    built, directory = engine_env
+    async def run():
+        first = await rag_engine.get_lightrag(CONTAINER)
+        (directory / "kv_store_full_docs.json").write_text("{}")
+        second = await rag_engine.get_lightrag(CONTAINER)
+        assert first.workspace != second.workspace
+    asyncio.run(run())

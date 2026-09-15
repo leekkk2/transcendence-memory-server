@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 import os
 import sys
 from pathlib import Path
@@ -608,8 +609,22 @@ async def get_lightrag(container: str) -> Any:
                 lightrag_kwargs["min_rerank_score"] = min_score
 
         instance = LightRAG(**lightrag_kwargs)
+        # Storage filenames are fixed during construction. A private runtime
+        # namespace isolates LightRAG's process-global KV/locks without moving
+        # existing files or re-embedding persisted data.
+        namespace = f"tm-{container}-{uuid.uuid4().hex}"
+        instance.workspace = namespace
+        for name in (
+            "full_docs", "text_chunks", "full_entities", "full_relations",
+            "entity_chunks", "relation_chunks", "entities_vdb",
+            "relationships_vdb", "chunks_vdb", "chunk_entity_relation_graph",
+            "llm_response_cache", "doc_status",
+        ):
+            storage = getattr(instance, name, None)
+            if storage is not None:
+                storage.workspace = namespace
         await instance.initialize_storages()
-        await initialize_pipeline_status()
+        await initialize_pipeline_status(workspace=namespace)
 
         _lightrag_instances[cache_key] = instance
         # 指纹必须在 initialize_storages 之后取 —— 初始化可能落盘新文件
