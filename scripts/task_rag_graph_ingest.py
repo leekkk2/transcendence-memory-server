@@ -51,12 +51,12 @@ async def _close_lightrag(rag) -> None:
     # Stop LightRAG's priority workers before asyncio.run cancels all tasks.
     # Their health monitor may restart cancelled workers until shutdown is set.
     callbacks = [
+        getattr(rag, "finalize_storages", None),
         getattr(getattr(rag, "llm_model_func", None), "shutdown", None),
         getattr(getattr(getattr(rag, "embedding_func", None), "func", None), "shutdown", None),
         getattr(getattr(rag, "rerank_model_func", None), "shutdown", None),
         *(getattr(func, "shutdown", None)
           for func in getattr(rag, "role_llm_funcs", {}).values()),
-        getattr(rag, "finalize_storages", None),
     ]
     for close in callbacks:
         if close is not None:

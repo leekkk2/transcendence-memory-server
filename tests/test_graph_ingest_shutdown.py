@@ -54,7 +54,7 @@ def test_ingestion_shuts_down_all_model_workers(tmp_path, monkeypatch, mode, fai
             asyncio.run(call)
     else:
         asyncio.run(call)
-    assert events == ["insert", "llm", "embedding", "rerank", "storage"]
+    assert events == ["insert", "storage", "llm", "embedding", "rerank"]
 
 
 def test_ingestion_cleanup_closes_remaining_resources_on_error(tmp_path, monkeypatch):
@@ -85,7 +85,7 @@ def test_ingestion_cleanup_closes_remaining_resources_on_error(tmp_path, monkeyp
     source.write_text("Cedar sensor")
     with pytest.raises(ValueError, match="original ingest failure"):
         asyncio.run(mod._ingest_text("test", source))
-    assert events == ["llm", "storage"]
+    assert events == ["storage", "llm"]
 
 
 def test_ingestion_closes_role_queues_on_current_lightrag(tmp_path, monkeypatch):
@@ -115,7 +115,7 @@ def test_ingestion_closes_role_queues_on_current_lightrag(tmp_path, monkeypatch)
     source = tmp_path / "test.txt"
     source.write_text("Cedar sensor")
     asyncio.run(mod._ingest_text("test", source))
-    assert events == ["role", "role", "storage"]
+    assert events == ["storage", "role", "role"]
 
 
 @pytest.mark.parametrize("status", ["failed", "processing", None])
@@ -140,3 +140,23 @@ def test_text_job_rejects_uncommitted_lightrag_document(tmp_path, monkeypatch, s
     with pytest.raises(RuntimeError, match="not processed"):
         asyncio.run(mod._ingest_text("test", source))
     assert source.exists()
+
+
+def test_storages_flush_while_embedding_worker_is_still_open():
+    mod = importlib.import_module("scripts.task_rag_graph_ingest")
+    events = []
+
+    class Worker:
+        closed = False
+        async def shutdown(self):
+            self.closed = True
+
+    worker = Worker()
+    class Rag:
+        embedding_func = SimpleNamespace(func=worker)
+        async def finalize_storages(self):
+            assert not worker.closed, "storage cannot flush after embedding shutdown"
+            events.append("flushed")
+    asyncio.run(mod._close_lightrag(Rag()))
+    assert events == ["flushed"]
+    assert worker.closed
