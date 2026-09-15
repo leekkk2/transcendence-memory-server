@@ -41,6 +41,11 @@ test('desktop full status, queued text/PDF/image, document details and graph', a
   await page.goto(base + '/admin/ui/documents?container=admin-ui-test');
   await page.locator('main').evaluate(element => { element.scrollTop = 0; });
   await page.screenshot({ path: '.local/screens/documents-desktop.png', fullPage: true });
+  const jobsResponse = await page.request.get(base + '/jobs');
+  const jobs = await jobsResponse.json();
+  await page.route('**/jobs**', async route => route.fulfill({ json: { ...jobs, jobs: [...jobs.jobs, { id: 999999, op: 'ingest-document-text', container: 'admin-ui-test', status: 'done', last_error: 'successful output must not be an error' }] } }));
+  await page.goto(base + '/admin/ui/documents?container=admin-ui-test');
+  await expect(page.getByText('successful output must not be an error')).toHaveCount(0);
   await page.getByRole('link', { name: 'Knowledge graph', exact: true }).first().click();
   await expect(page.getByTestId('graph-canvas').locator('canvas').first()).toBeVisible();
   await page.getByRole('button', { name: 'Aurora telescope' }).click();

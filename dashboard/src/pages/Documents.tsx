@@ -121,7 +121,7 @@ export default function Documents() {
         <div className="mb-3 flex justify-between gap-3"><h2 id="document-jobs-title" className="text-sm font-semibold">{t('documents.recentJobs')}</h2><Link to="/jobs" className="accent text-xs">{t('documents.viewJobs')}</Link></div>
         <div className="space-y-2">{currentJobs.map(job => <div key={job.id} className="rounded border border-border p-3 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-2"><span className="mono">#{job.id} · {t(job.op === 'ingest-document-text' ? 'documents.textMode' : 'documents.fileMode')}</span><span className={documentStatusClass(job.status)}>{t(`jobs.${job.status}`, job.status)}</span></div>
-          {job.last_error && <p className="mt-2 whitespace-pre-wrap break-words text-red">{job.last_error}</p>}
+          {job.last_error && !['done', 'cancelled'].includes(job.status) && <p className="mt-2 whitespace-pre-wrap break-words text-red">{job.last_error}</p>}
         </div>)}</div><p className="text-dim mt-3 text-xs">{t('documents.jobsHint')}</p>
       </section>}
       <section className="space-y-4" aria-labelledby="documents-title">

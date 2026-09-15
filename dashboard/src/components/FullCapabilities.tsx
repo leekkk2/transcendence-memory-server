@@ -9,7 +9,7 @@ export function FullCapabilities() {
   const data = health.data;
   const keys = ['search', 'documents_text', 'documents_file', 'query', 'embed'];
   const ready = !!data && data.build_flavor === 'full' && keys.every(key => data.runtime_ready?.[key] === true)
-    && !data.degraded_reasons?.length && !data.warnings?.length && data.accepting_ingest;
+    && !data.degraded_reasons?.length && !data.warnings?.length && data.accepting_ingest && data.worker_running;
   return (
     <section className="panel p-4 sm:p-5" aria-labelledby="full-capabilities">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">

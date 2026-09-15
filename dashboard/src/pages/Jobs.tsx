@@ -99,7 +99,7 @@ export default function Jobs() {
               rows.map((j) => (
                 <tr key={j.id}>
                   <td className="mono text-xs">{j.id}</td>
-                  <td className="text-xs">{j.label || j.op}{j.last_error && <details className="mt-2 max-w-md"><summary className="cursor-pointer text-red">{t('jobs.errorDetail')}</summary><pre className="mt-2 whitespace-pre-wrap break-words font-sans text-xs text-red">{j.last_error}</pre></details>}</td>
+                  <td className="text-xs">{j.label || j.op}{j.last_error && !['done', 'cancelled'].includes(j.status) && <details className="mt-2 max-w-md"><summary className="cursor-pointer text-red">{t('jobs.errorDetail')}</summary><pre className="mt-2 whitespace-pre-wrap break-words font-sans text-xs text-red">{j.last_error}</pre></details>}</td>
                   <td className="mono text-xs">{j.container}</td>
                   <td>
                     <span className={statusBadgeClass(j.status)}>
