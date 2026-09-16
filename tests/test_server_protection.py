@@ -288,4 +288,4 @@ def test_native_systemd_reads_own_cgroup(protection, monkeypatch):
         return 4096 if str(path).endswith('memory.max') else 512
     monkeypatch.setattr(protection, '_read_cgroup_int', read)
     assert protection._read_cgroup_memory()==(4096,512)
-    assert seen[0]=='/sys/fs/cgroup/system.slice/example.service/memory.max'
+    assert os.path.normpath(seen[0]) == os.path.normpath('/sys/fs/cgroup/system.slice/example.service/memory.max')
