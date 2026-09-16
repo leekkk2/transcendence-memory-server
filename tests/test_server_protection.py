@@ -271,3 +271,21 @@ def test_memory_psi_reader_unavailable_is_conservative(protection, monkeypatch):
         raise OSError("PSI unavailable")
     monkeypatch.setattr("builtins.open", unavailable)
     assert protection._read_memory_psi() == (None, None)
+
+
+def test_native_systemd_reads_own_cgroup(protection, monkeypatch):
+    import io
+    import builtins
+    original = builtins.open
+    def opened(path, *args, **kwargs):
+        if str(path) == '/proc/self/cgroup':
+            return io.StringIO('0::/system.slice/example.service\n')
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(builtins, 'open', opened)
+    seen=[]
+    def read(path):
+        seen.append(str(path))
+        return 4096 if str(path).endswith('memory.max') else 512
+    monkeypatch.setattr(protection, '_read_cgroup_int', read)
+    assert protection._read_cgroup_memory()==(4096,512)
+    assert seen[0]=='/sys/fs/cgroup/system.slice/example.service/memory.max'

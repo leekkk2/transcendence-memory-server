@@ -5,6 +5,11 @@ import importlib.util
 import os
 from dataclasses import dataclass, field
 
+try:
+    from multimodal_readiness import parser_readiness
+except ImportError:
+    from scripts.multimodal_readiness import parser_readiness
+
 
 @dataclass
 class ModuleInfo:
@@ -83,12 +88,15 @@ def detect_architecture(*, use_cache: bool = True) -> ArchitectureInfo:
         required_keys=['LLM_API_KEY', 'EMBEDDING_API_KEY'],
         missing_keys=[k for k, v in [('LLM_API_KEY', llm_key), ('EMBEDDING_API_KEY', embedding_key)] if not v],
     )
-    # 多模态依赖 LightRAG（raganything 基于 lightrag）
+    # Package presence is configuration, not a working parser.
+    parser_ok, parser_reason = (False, '')
+    if has_raganything and vlm_key and lightrag_mod.enabled:
+        parser_ok, parser_reason = parser_readiness()
     multimodal_mod = ModuleInfo(
         name='multimodal',
         package_available=has_raganything,
         enabled=has_raganything and vlm_key and lightrag_mod.enabled,
-        ready=has_raganything and vlm_key and lightrag_mod.enabled,
+        ready=has_raganything and vlm_key and lightrag_mod.enabled and parser_ok,
         required_keys=['VLM_API_KEY', 'LLM_API_KEY', 'EMBEDDING_API_KEY'],
         missing_keys=[k for k, v in [('VLM_API_KEY', vlm_key), ('LLM_API_KEY', llm_key), ('EMBEDDING_API_KEY', embedding_key)] if not v],
     )
@@ -102,6 +110,8 @@ def detect_architecture(*, use_cache: bool = True) -> ArchitectureInfo:
         arch_name = 'lancedb-only'
 
     degraded_reasons: list[str] = []
+    if parser_reason:
+        degraded_reasons.append(parser_reason)
     if build_flavor == 'lite' and vlm_key:
         degraded_reasons.append('multimodal configured while running lite build')
     if build_flavor == 'full' and not has_raganything:
@@ -136,4 +146,3 @@ def reset_cache() -> None:
     """清除缓存（用于测试）。"""
     global _cached
     _cached = None
-

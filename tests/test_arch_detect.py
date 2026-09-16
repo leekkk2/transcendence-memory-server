@@ -120,6 +120,7 @@ def test_full_build_capable_when_multimodal_installed(monkeypatch):
         'VLM_API_KEY': 'test-vlm-key',
         'TM_BUILD_FLAVOR': 'full',
     })
+    monkeypatch.setattr(mod, 'parser_readiness', lambda: (True, ''))
     arch = mod.detect_architecture(use_cache=False)
     assert arch.build_flavor == 'full'
     if arch.modules['multimodal'].package_available:
@@ -128,3 +129,16 @@ def test_full_build_capable_when_multimodal_installed(monkeypatch):
     else:
         assert arch.multimodal_capable is False
         assert any('full build' in reason for reason in arch.degraded_reasons)
+
+
+def test_full_package_presence_does_not_imply_parser_ready(monkeypatch):
+    mod = _load_arch_detect(monkeypatch, {
+        'EMBEDDING_API_KEY': 'test-key', 'LLM_API_KEY': 'test-key',
+        'VLM_API_KEY': 'test-key', 'TM_BUILD_FLAVOR': 'full',
+    })
+    monkeypatch.setattr(mod.importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(mod, 'parser_readiness', lambda: (False, 'multimodal parser unavailable'), raising=False)
+    arch = mod.detect_architecture(use_cache=False)
+    assert arch.modules['multimodal'].enabled
+    assert not arch.modules['multimodal'].ready
+    assert 'multimodal parser unavailable' in arch.degraded_reasons

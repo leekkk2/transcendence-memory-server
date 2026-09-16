@@ -174,8 +174,19 @@ def _read_cgroup_memory() -> tuple[int | None, int | None]:
     fall back to host /proc/meminfo only.
     """
     # cgroup v2 (unified hierarchy — modern Docker, systemd-managed)
-    limit = _read_cgroup_int("/sys/fs/cgroup/memory.max")
-    current = _read_cgroup_int("/sys/fs/cgroup/memory.current")
+    base = "/sys/fs/cgroup"
+    try:
+        with open('/proc/self/cgroup', encoding='utf-8') as fh:
+            for line in fh:
+                if line.startswith('0::'):
+                    relative = line.strip().split('::', 1)[1].lstrip('/')
+                    if relative and '..' not in relative.split('/'):
+                        base = os.path.join(base, relative)
+                    break
+    except OSError:
+        pass
+    limit = _read_cgroup_int(base + "/memory.max")
+    current = _read_cgroup_int(base + "/memory.current")
     if limit is not None or current is not None:
         return limit, current
     # cgroup v1 (older kernels / hosts running cgroupfs=legacy)
