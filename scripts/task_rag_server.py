@@ -3667,6 +3667,8 @@ def ingest_document_text(req: DocumentTextReq) -> CommandResponse:
     驱动 task_rag_graph_ingest.py 子进程完成建图。轮询 GET /jobs/{pid} 查进度。
     """
     validate_container_name(req.container)
+    canonical, _ = resolve_container_or_raise(req.container)
+    validate_container_name(canonical)
     _require_lightrag_ready()
     # embedding_model override 在建图路径暂不生效（需 registry-based cache key
     # 才能切换 instance）。接受字段以保持 API 兼容，指定时记一行 warning。
@@ -3676,13 +3678,13 @@ def ingest_document_text(req: DocumentTextReq) -> CommandResponse:
             'does not honor per-request override yet; using route default.',
             req.embedding_model,
         )
-    input_path = _stage_inbox_text(req.container, req.text)
+    input_path = _stage_inbox_text(canonical, req.text)
     payload: dict[str, Any] = {'input_path': str(input_path)}
     if req.description:
         payload['description'] = req.description
     return _enqueue_or_run(
         op='ingest-document-text',
-        container=req.container,
+        container=canonical,
         payload=payload,
         timeout_s=300,
         wait=False,
@@ -3749,6 +3751,8 @@ async def _ingest_uploaded_document(
     避免同步等待数十秒到数分钟撞边缘代理 100s 超时。
     """
     validate_container_name(container)
+    canonical, _ = resolve_container_or_raise(container)
+    validate_container_name(canonical)
     _require_lightrag_ready()
     if get_raganything is None:
         raise HTTPException(status_code=503, detail='raganything package not installed; rebuild with multimodal flavor.')
@@ -3759,17 +3763,22 @@ async def _ingest_uploaded_document(
             'does not honor per-request override yet; using route default.',
             embedding_model,
         )
-    saved = await _stage_inbox_upload(container, filename, file)
-    payload: dict[str, Any] = {'input_path': str(saved)}
+    input_path = await _stage_inbox_upload(canonical, filename, file)
+    payload: dict[str, Any] = {
+        'input_path': str(input_path),
+        'filename': filename,
+    }
     if parse_method:
         payload['parse_method'] = parse_method
+    if description:
+        payload['description'] = description
     return _enqueue_or_run(
         op='ingest-document-file',
-        container=container,
+        container=canonical,
         payload=payload,
         timeout_s=600,
         wait=False,
-        label=description or filename,
+        label=description or f'ingest-document-file:{filename}',
         embedding_override=embedding_model,
         coalesce=False,
     )

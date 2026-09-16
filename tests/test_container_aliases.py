@@ -432,3 +432,24 @@ def test_container_index_status_via_alias(tmp_path: Path, monkeypatch):
     body = resp.json()
     # canonical 名出现在 container 字段（响应直接由 _compute_container_index_status 构造）
     assert body["container"] == "personal-notes"
+
+
+def test_documents_text_stages_under_canonical_inbox(tmp_path: Path, monkeypatch):
+    workspace, client = _build_client(tmp_path, monkeypatch)
+    import scripts.task_rag_server as server
+    monkeypatch.setattr(server, "_require_lightrag_ready", lambda: None)
+    (workspace / "tasks" / "rag" / "containers" / "personal-notes").mkdir(parents=True)
+    _seed_alias(client, alias="personal", canonical="personal-notes")
+
+    resp = client.post(
+        "/documents/text",
+        headers=auth_headers(),
+        json={"container": "personal", "text": "inbox alias resolution check"},
+    )
+    assert resp.status_code == 200, resp.text
+    inbox = workspace / "tasks" / "rag" / "containers" / "personal-notes" / "_inbox"
+    staged = list(inbox.glob("text-*.txt"))
+    assert len(staged) == 1
+    assert staged[0].read_text(encoding="utf-8") == "inbox alias resolution check"
+    assert not (workspace / "tasks" / "rag" / "containers" / "personal").exists()
+
