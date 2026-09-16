@@ -59,6 +59,22 @@ except ModuleNotFoundError:  # pragma: no cover - package import path
     from scripts.rag_citation import chunk_lines_with_ranges  # type: ignore[import-not-found]
 
 
+def ordered_bounded_map(fn, values, workers):
+    """At most workers outstanding requests; preserve input order and clean up."""
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque
+    iterator = iter(values)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='tm-embed') as pool:
+        pending = deque()
+        for _ in range(workers):
+            try: pending.append(pool.submit(fn, next(iterator)))
+            except StopIteration: break
+        while pending:
+            yield pending.popleft().result()
+            try: pending.append(pool.submit(fn, next(iterator)))
+            except StopIteration: pass
+
+
 REBUILD_DOC_TYPES = {'task_card', 'memory', 'client_ingest'}
 SECTION_RE = re.compile(r'^##\s+(.+)$', re.M)
 
@@ -729,18 +745,33 @@ def rebuild_rows(
     aborted_early = False
     remaining_after_abort: list[dict[str, Any]] = []
 
-    for idx, row in enumerate(fresh_rows):
+    workers = max(1, min(4, int(os.environ.get('TM_EMBED_WORKERS', '1'))))
+    batch_size = max(1, min(batch_size, int(os.environ.get('TM_EMBED_FLUSH_SIZE', str(batch_size)))))
+
+    def prepare(pair):
+        idx, row = pair
         item = _normalize_row(row, container)
         text_hash = _compute_content_hash(item['text'])
         item['content_hash'] = text_hash
-        if _should_skip(row, text_hash):
+        skip = _should_skip(row, text_hash)
+        error = None
+        if not skip:
+            try:
+                item['vector'] = embed_text(
+                    item['text'], mode='document', title=item.get('title'),
+                ).tolist()
+            except Exception as exc:
+                error = exc
+        return idx, row, item, text_hash, skip, error
+
+    prepared = ordered_bounded_map(prepare, enumerate(fresh_rows), workers)
+    for idx, row, item, text_hash, skip, error in prepared:
+        if skip:
             skipped_unchanged += 1
             continue
         try:
-            # P0：文本文档摄取走 document 侧 asymmetric 前缀（title 一并带入）。
-            item['vector'] = embed_text(
-                item['text'], mode='document', title=item.get('title'),
-            ).tolist()
+            if error is not None:
+                raise error
             item['embedded_at'] = int(time.time())
             _annotate_embedding_meta(item, embedding_meta)
             pacer.on_success()
@@ -779,6 +810,8 @@ def rebuild_rows(
     # 4c. Pass 2 / backlog 落账
     skipped: list[dict[str, str]] = []
     backlog_recorded = 0
+    prepared.close()
+
     last_error_class: str | None = None
 
     def _to_backlog(chunk_id: str, exc: BaseException, content_hash: str) -> None:
