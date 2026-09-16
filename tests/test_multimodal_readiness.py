@@ -37,3 +37,17 @@ def test_parser_success_and_configuration_change(monkeypatch):
     monkeypatch.setenv('RAG_PARSER', 'docling')
     assert probe.parser_readiness() == (True, '')
     assert len(calls) == 2
+
+
+def test_probe_uses_selected_parser_dependencies(monkeypatch):
+    from scripts import multimodal_readiness as probe
+    probe.reset_cache()
+    monkeypatch.setenv('RAG_PARSER_BACKEND','pipeline')
+    seen=[]
+    def run(*args,**kwargs):
+        seen.append(args[0])
+        return SimpleNamespace(returncode=0,stdout='',stderr='')
+    monkeypatch.setattr(probe.subprocess,'run',run)
+    probe.parser_readiness()
+    assert 'importlib.metadata' in seen[0][2]
+    assert seen[0][-1]=='pipeline'
