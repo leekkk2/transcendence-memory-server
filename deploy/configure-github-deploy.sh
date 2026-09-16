@@ -23,10 +23,10 @@
 
 set -euo pipefail
 
-HOST="${DEPLOY_HOST:-192.0.2.11}"
+HOST="${DEPLOY_HOST:-}"
 USER_NAME="ubuntu"
 PORT="22"
-REMOTE_PATH="/home/service/services/transcendence-memory-server"
+REMOTE_PATH="/opt/transcendence-memory-server"
 SUDO=""
 SMOKE="true"
 KEY_DIR="${HOME}/.ssh/transcendence-memory-deploy"
@@ -92,7 +92,11 @@ PUB_KEY=$(cat "${KEY_PATH}.pub")
 cat <<EOF
 
 ──────────────────────────────────────────────────────────────────────
-✓ GitHub side configured.
+✓ Connection secrets configured.
+
+Set DEPLOY_CONTAINER, DEPLOY_PROJECT, DEPLOY_PUBLIC_URL, TM_DEPLOY_PLATFORM,
+and TM_DEPLOY_RUNNER for your target. After reviewing the target, explicitly
+enable deployments with: gh variable set TM_AUTODEPLOY_ENABLED --body true
 
 NEXT — host-side prerequisites (run these on YOUR workstation; ssh into
 the host as a user that already can sudo, just once):
@@ -128,7 +132,7 @@ sudo visudo -c -f /etc/sudoers.d/transcendence-memory-deploy"
 
 To test the workflow without waiting for a tag:
 
-  gh workflow run deploy.yml -f ref=<existing-tag>
+  gh workflow run deploy.yml
 
 ──────────────────────────────────────────────────────────────────────
 EOF

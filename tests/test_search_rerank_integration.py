@@ -142,7 +142,7 @@ def test_search_recalls_title_outside_dense_pool_and_reranks_it(server_module, t
     import lancedb
     import pyarrow as pa
 
-    query = 'primary-node 磁盘清理转存网盘与文件索引'
+    query = 'archive-node 磁盘清理转存网盘与文件索引'
     title = query + ' @ 2026-09-11 实战'
     data = pa.table({
         'taskId': [f'noise-{i}' for i in range(35)] + ['target'],

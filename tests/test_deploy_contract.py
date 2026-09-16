@@ -49,3 +49,15 @@ def test_application_layer_replaces_directories_and_sets_revision(tmp_path):
   assert archive.getmember('app/scripts/app.py').mode==0o755
  assert 'org.opencontainers.image.revision='+sha in log.read_text()
  assert 'org.opencontainers.image.version=1' in log.read_text()
+
+
+def test_deployment_requires_explicit_opt_in_and_private_target_config():
+ import yaml
+ workflow=yaml.safe_load((ROOT/'.github/workflows/deploy.yml').read_text())
+ assert "vars.TM_AUTODEPLOY_ENABLED == 'true'" in workflow['jobs']['preflight']['if']
+ text=(ROOT/'.github/workflows/deploy.yml').read_text()
+ assert 'secrets.DEPLOY_KNOWN_HOSTS' in text
+ for name in ['DEPLOY_CONTAINER','DEPLOY_PROJECT','DEPLOY_PATH','DEPLOY_PUBLIC_URL']:
+  assert 'vars.'+name in text
+ assert 'https://' + 'rags.' not in text
+ assert '/home/' + 'ubuntu/' not in text

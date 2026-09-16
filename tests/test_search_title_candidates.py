@@ -26,7 +26,7 @@ def _row(name, title, vector):
 
 
 def test_title_outside_dense_topk_enters_candidates_with_real_distance(tmp_path):
-    query = 'primary-node 磁盘清理转存网盘与文件索引'
+    query = 'archive-node 磁盘清理转存网盘与文件索引'
     table = _table(tmp_path, [
         *[_row(f'noise-{i}', '历史运维记录', [i / 100, 0.0]) for i in range(30)],
         _row('target', query + ' @ 2026-09-11 实战', [3.0, 4.0]),
@@ -55,7 +55,7 @@ def test_exact_title_is_reserved_before_many_substring_matches(tmp_path):
 
 
 @pytest.mark.parametrize('query,title', [
-    ('  PRIMARY-NODE 磁盘清理  ', 'primary-node 磁盘清理 实战'),
+    ('  ARCHIVE-NODE 磁盘清理  ', 'archive-node 磁盘清理 实战'),
     ("O'Brien 100%_backup\\node", "O'Brien 100%_backup\\node 实战"),
     ("' OR true --", "literal ' OR true -- title"),
 ])
